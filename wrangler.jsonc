@@ -1,0 +1,16 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "webapp",
+  "compatibility_date": "2025-05-01",
+  "pages_build_output_dir": "./dist",
+  "compatibility_flags": [
+    "nodejs_compat"
+  ],
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "webapp-production",
+      "database_id": "local-dev-placeholder"
+    }
+  ]
+}

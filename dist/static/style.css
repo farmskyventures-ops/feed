@@ -1,0 +1,15 @@
+:root { --brand:#0f766e; --brand-dark:#115e59; }
+body { font-family: 'Segoe UI', system-ui, -apple-system, sans-serif; }
+.brand-bg { background: linear-gradient(135deg, #0f766e 0%, #115e59 55%, #064e3b 100%); }
+.card { background:#fff; border:1px solid #e2e8f0; border-radius:14px; }
+.btn { transition: all .15s ease; }
+.btn:hover { transform: translateY(-1px); }
+.nav-link { cursor:pointer; }
+.nav-link.active { background: rgba(255,255,255,.16); border-left:3px solid #5eead4; }
+.fade-in { animation: fade .25s ease; }
+@keyframes fade { from {opacity:0; transform:translateY(6px);} to {opacity:1; transform:none;} }
+.badge { font-size:.7rem; padding:2px 8px; border-radius:999px; font-weight:600; }
+table tbody tr:hover { background:#f8fafc; }
+.modal-overlay { background: rgba(15,23,42,.55); backdrop-filter: blur(2px); }
+input,select,textarea { outline:none; }
+input:focus,select:focus,textarea:focus { border-color:#0f766e; box-shadow:0 0 0 3px rgba(15,118,110,.12); }
