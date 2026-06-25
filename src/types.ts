@@ -15,4 +15,6 @@ export type SessionUser = {
   phone: string
   role: string
   region?: string
+  custom_role?: string | null
+  permissions?: string[]
 }

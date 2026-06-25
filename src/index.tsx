@@ -24,13 +24,15 @@ async function getSessionUser(c: any): Promise<SessionUser | null> {
   const token = getCookie(c, 'session') || c.req.header('Authorization')?.replace('Bearer ', '')
   if (!token) return null
   const row = await c.env.DB.prepare(
-    `SELECT u.id, u.full_name, u.phone, u.role, u.region, u.status, s.expires_at
+    `SELECT u.id, u.full_name, u.phone, u.role, u.region, u.status, u.custom_role, u.permissions, s.expires_at
      FROM sessions s JOIN users u ON u.id = s.user_id WHERE s.token = ?`
   ).bind(token).first()
   if (!row) return null
   if (Number(row.expires_at) < Date.now()) return null
   if (row.status !== 'active') return null
-  return { id: row.id, full_name: row.full_name, phone: row.phone, role: row.role, region: row.region }
+  let permissions: string[] = []
+  try { permissions = row.permissions ? JSON.parse(row.permissions) : [] } catch { permissions = [] }
+  return { id: row.id, full_name: row.full_name, phone: row.phone, role: row.role, region: row.region, custom_role: row.custom_role, permissions }
 }
 async function requireAuth(c: any, next: any) {
   const user = await getSessionUser(c)
@@ -102,7 +104,9 @@ app.post('/api/login', async (c) => {
   if (user.status !== 'active') return c.json({ error: 'Account suspended' }, 403)
   const token = await createSession(c, user)
   await audit(c, user.id, 'login', 'user', `${user.role} logged in`)
-  return c.json({ token, user: { id: user.id, full_name: user.full_name, phone: user.phone, role: user.role, region: user.region } })
+  let permissions: string[] = []
+  try { permissions = user.permissions ? JSON.parse(user.permissions) : [] } catch { permissions = [] }
+  return c.json({ token, user: { id: user.id, full_name: user.full_name, phone: user.phone, role: user.role, region: user.region, custom_role: user.custom_role, permissions } })
 })
 app.post('/api/logout', async (c) => {
   const token = getCookie(c, 'session')
@@ -111,6 +115,61 @@ app.post('/api/logout', async (c) => {
   return c.json({ ok: true })
 })
 app.get('/api/me', requireAuth, (c) => c.json({ user: c.get('user') }))
+
+// ----------------------------------------------------------------------------
+// SELF-SERVICE PROFILE  (any authenticated user manages their OWN data)
+// Administrative attributes (permissions, credit approvals, custom groupings,
+// role) are intentionally NOT editable here to prevent privilege escalation.
+// ----------------------------------------------------------------------------
+app.get('/api/profile', requireAuth, async (c) => {
+  const u = c.get('user')
+  const row = await c.env.DB.prepare(
+    `SELECT id, full_name, phone, email, region, role, custom_role,
+            id_front_url, id_back_url, passport_selfie_url,
+            farming_profile, output_tonnage, herd_count, current_loan_amount, sacco_member
+     FROM users WHERE id=?`
+  ).bind(u.id).first<any>()
+  if (!row) return c.json({ error: 'Not found' }, 404)
+  const cust = await c.env.DB.prepare(`SELECT * FROM customers WHERE user_id=?`).bind(u.id).first<any>()
+  return c.json({ profile: row, customer: cust || null })
+})
+app.put('/api/profile', requireAuth, async (c) => {
+  const u = c.get('user')
+  const b = await c.req.json()
+  // Only personal identifiers + farming/financial data variables. No role,
+  // permissions, status, supervisor, or credit fields are accepted here.
+  const farmingProfile = b.farming_profile || null
+  const saccoMember = (b.sacco_member === true || b.sacco_member === 1 || String(b.sacco_member).toLowerCase() === 'yes') ? 1 : 0
+  await c.env.DB.prepare(
+    `UPDATE users SET full_name=COALESCE(?,full_name), email=COALESCE(?,email), region=COALESCE(?,region),
+       id_front_url=COALESCE(?,id_front_url), id_back_url=COALESCE(?,id_back_url), passport_selfie_url=COALESCE(?,passport_selfie_url),
+       farming_profile=?, output_tonnage=?, herd_count=?, current_loan_amount=?, sacco_member=?
+     WHERE id=?`
+  ).bind(b.full_name || null, b.email || null, b.region || null,
+    b.id_front_url || null, b.id_back_url || null, b.passport_selfie_url || null,
+    farmingProfile, b.output_tonnage ?? null, b.herd_count ?? null, Number(b.current_loan_amount || 0), saccoMember, u.id).run()
+  // Mirror to the linked customer profile if present.
+  await c.env.DB.prepare(
+    `UPDATE customers SET full_name=COALESCE(?,full_name), farming_profile=?, value_chain_type=?, output_tonnage=?, herd_count=?, herd_size=?, current_loan_amount=?, sacco_member=?,
+       id_front_url=COALESCE(?,id_front_url), id_back_url=COALESCE(?,id_back_url), selfie_url=COALESCE(?,selfie_url), passport_selfie_url=COALESCE(?,passport_selfie_url)
+     WHERE user_id=?`
+  ).bind(b.full_name || null, farmingProfile, farmingProfile, b.output_tonnage ?? null, b.herd_count ?? null, b.herd_count ?? null,
+    Number(b.current_loan_amount || 0), saccoMember,
+    b.id_front_url || null, b.id_back_url || null, b.passport_selfie_url || null, b.passport_selfie_url || null, u.id).run()
+  await audit(c, u.id, 'update', 'profile', 'self-service profile update')
+  return c.json({ ok: true })
+})
+// Change own password (requires current password).
+app.put('/api/profile/password', requireAuth, async (c) => {
+  const u = c.get('user')
+  const { current_password, new_password } = await c.req.json()
+  if (!new_password || String(new_password).length < 4) return c.json({ error: 'New password must be at least 4 characters' }, 400)
+  const row = await c.env.DB.prepare(`SELECT password FROM users WHERE id=?`).bind(u.id).first<any>()
+  if (!row || row.password !== String(current_password)) return c.json({ error: 'Current password is incorrect' }, 400)
+  await c.env.DB.prepare(`UPDATE users SET password=?, password_set=1 WHERE id=?`).bind(String(new_password), u.id).run()
+  await audit(c, u.id, 'update', 'profile', 'self-service password change')
+  return c.json({ ok: true })
+})
 
 // ---- Auth provider status (so the UI can show live vs demo) ----
 app.get('/api/auth/status', (c) => c.json({ sms_live: smsConfigured(c.env) }))
@@ -130,21 +189,34 @@ app.post('/api/signup/request-otp', async (c) => {
 })
 // Step 2: verify OTP + set password -> create account + auto sign-in.
 app.post('/api/signup/verify', async (c) => {
-  const { phone, full_name, code, password, region } = await c.req.json()
+  const b = await c.req.json()
+  const { phone, full_name, code, password, region } = b
   const p = normalizePhone(phone || '')
   if (!password || String(password).length < 4) return c.json({ error: 'Password must be at least 4 characters' }, 400)
   const v = await verifyOtp(c, p, code, 'signup')
   if (!v.ok) return c.json({ error: v.error }, 400)
   const existing = await c.env.DB.prepare(`SELECT id FROM users WHERE phone=?`).bind(p).first()
   if (existing) return c.json({ error: 'Account already exists. Please sign in.' }, 409)
+  // KYC images + dynamic agri metrics + pruned financial profile (optional at
+  // signup; can be completed later via the self-service profile).
+  const farmingProfile = b.farming_profile || null
+  const saccoMember = (b.sacco_member === true || b.sacco_member === 1 || String(b.sacco_member).toLowerCase() === 'yes') ? 1 : 0
   const r = await c.env.DB.prepare(
-    `INSERT INTO users (full_name, phone, password, role, status, region, password_set) VALUES (?,?,?, 'customer', 'active', ?, 1)`
-  ).bind(String(full_name).trim(), p, String(password), region || null).run()
+    `INSERT INTO users (full_name, phone, password, role, status, region, password_set, id_front_url, id_back_url, passport_selfie_url, farming_profile, output_tonnage, herd_count, current_loan_amount, sacco_member)
+     VALUES (?,?,?, 'customer', 'active', ?, 1, ?,?,?,?,?,?,?,?)`
+  ).bind(String(full_name).trim(), p, String(password), region || null,
+    b.id_front_url || null, b.id_back_url || null, b.passport_selfie_url || null,
+    farmingProfile, b.output_tonnage || null, b.herd_count || null,
+    Number(b.current_loan_amount || 0), saccoMember).run()
   const userId = r.meta.last_row_id
   // Create a linked customer profile (KYC pending until registration completed)
   await c.env.DB.prepare(
-    `INSERT INTO customers (user_id, full_name, mobile, kyc_status) VALUES (?,?,?, 'pending')`
-  ).bind(userId, String(full_name).trim(), p).run()
+    `INSERT INTO customers (user_id, full_name, mobile, farming_profile, value_chain_type, output_tonnage, herd_count, herd_size, current_loan_amount, sacco_member, id_front_url, id_back_url, selfie_url, passport_selfie_url, kyc_status)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?, 'pending')`
+  ).bind(userId, String(full_name).trim(), p, farmingProfile, farmingProfile,
+    b.output_tonnage || null, b.herd_count || null, b.herd_count || null,
+    Number(b.current_loan_amount || 0), saccoMember,
+    b.id_front_url || null, b.id_back_url || null, b.passport_selfie_url || null, b.passport_selfie_url || null).run()
   const user = { id: userId, full_name: String(full_name).trim(), phone: p, role: 'customer', region }
   await createSession(c, user)
   await audit(c, userId, 'signup', 'user', 'customer self-registered via SMS OTP')
@@ -188,12 +260,18 @@ app.get('/api/products', requireAuth, async (c) => {
 })
 app.post('/api/products', requireAuth, requireRole('admin', 'super_admin'), async (c) => {
   const b = await c.req.json()
-  const cash = Number(b.buying_price) * (1 + Number(b.cash_markup_pct) / 100)
-  const credit = Number(b.buying_price) * (1 + Number(b.credit_markup_pct) / 100)
+  // Payment eligibility: cash | finance | both. Markups default sensibly.
+  const eligibility = ['cash', 'finance', 'both'].includes(b.payment_eligibility) ? b.payment_eligibility : 'both'
+  const cashMk = Number(b.cash_markup_pct || 0)
+  const finMk = Number(b.finance_markup_pct ?? b.credit_markup_pct ?? 0)
+  const finDep = Number(b.finance_deposit_pct || 0)
+  const cash = Number(b.buying_price) * (1 + cashMk / 100)
+  const credit = Number(b.buying_price) * (1 + finMk / 100)
   const r = await c.env.DB.prepare(
-    `INSERT INTO products (sku,name,category,supplier_id,buying_price,cash_markup_pct,credit_markup_pct,cash_price,credit_price,quantity,unit,reorder_threshold,image)
-     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`
-  ).bind(b.sku, b.name, b.category, b.supplier_id || null, b.buying_price, b.cash_markup_pct, b.credit_markup_pct,
+    `INSERT INTO products (sku,name,category,supplier_id,buying_price,cash_markup_pct,credit_markup_pct,finance_markup_pct,finance_deposit_pct,payment_eligibility,cash_terms,finance_terms,cash_price,credit_price,quantity,unit,reorder_threshold,image)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
+  ).bind(b.sku, b.name, b.category, b.supplier_id || null, b.buying_price, cashMk, finMk, finMk, finDep, eligibility,
+    b.cash_terms || null, b.finance_terms || null,
     Math.round(cash), Math.round(credit), b.quantity || 0, b.unit || 'unit', b.reorder_threshold || 10, b.image || null).run()
   await audit(c, c.get('user').id, 'create', 'product', b.name)
   return c.json({ id: r.meta.last_row_id })
@@ -201,11 +279,16 @@ app.post('/api/products', requireAuth, requireRole('admin', 'super_admin'), asyn
 app.put('/api/products/:id', requireAuth, requireRole('admin', 'super_admin'), async (c) => {
   const id = c.req.param('id')
   const b = await c.req.json()
-  const cash = Number(b.buying_price) * (1 + Number(b.cash_markup_pct) / 100)
-  const credit = Number(b.buying_price) * (1 + Number(b.credit_markup_pct) / 100)
+  const eligibility = ['cash', 'finance', 'both'].includes(b.payment_eligibility) ? b.payment_eligibility : 'both'
+  const cashMk = Number(b.cash_markup_pct || 0)
+  const finMk = Number(b.finance_markup_pct ?? b.credit_markup_pct ?? 0)
+  const finDep = Number(b.finance_deposit_pct || 0)
+  const cash = Number(b.buying_price) * (1 + cashMk / 100)
+  const credit = Number(b.buying_price) * (1 + finMk / 100)
   await c.env.DB.prepare(
-    `UPDATE products SET sku=?, name=?, category=?, buying_price=?, cash_markup_pct=?, credit_markup_pct=?, cash_price=?, credit_price=?, quantity=?, unit=?, reorder_threshold=?, image=COALESCE(?, image) WHERE id=?`
-  ).bind(b.sku, b.name, b.category, b.buying_price, b.cash_markup_pct, b.credit_markup_pct,
+    `UPDATE products SET sku=?, name=?, category=?, buying_price=?, cash_markup_pct=?, credit_markup_pct=?, finance_markup_pct=?, finance_deposit_pct=?, payment_eligibility=?, cash_terms=?, finance_terms=?, cash_price=?, credit_price=?, quantity=?, unit=?, reorder_threshold=?, image=COALESCE(?, image) WHERE id=?`
+  ).bind(b.sku, b.name, b.category, b.buying_price, cashMk, finMk, finMk, finDep, eligibility,
+    b.cash_terms || null, b.finance_terms || null,
     Math.round(cash), Math.round(credit), b.quantity, b.unit, b.reorder_threshold, b.image || null, id).run()
   await audit(c, c.get('user').id, 'update', 'product', b.name)
   return c.json({ ok: true })
@@ -249,18 +332,46 @@ app.get('/api/customers/:id', requireAuth, async (c) => {
 app.post('/api/customers', requireAuth, requireRole('agent', 'admin', 'super_admin'), async (c) => {
   const b = await c.req.json()
   const user = c.get('user')
+  // farming_profile drives which agri metric is captured (output_tonnage for
+  // crop, herd_count/herd_size for livestock). Pruned financial profile keeps
+  // exactly two points: current_loan_amount + sacco_member (truth value).
+  const farmingProfile = b.farming_profile || b.value_chain_type || null
+  const saccoMember = (b.sacco_member === true || b.sacco_member === 1 || String(b.sacco_member).toLowerCase() === 'yes') ? 1 : 0
   const r = await c.env.DB.prepare(
-    `INSERT INTO customers (agent_id,full_name,national_id,date_of_birth,gender,mobile,alt_mobile,county,sub_county,ward,village,latitude,longitude,value_chain_type,value_chain,acreage,herd_size,farm_experience,mobile_money_usage,existing_loans,bank_account,sacco_membership,kyc_status)
-     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?, 'pending')`
+    `INSERT INTO customers (agent_id,full_name,national_id,date_of_birth,gender,mobile,alt_mobile,county,sub_county,ward,village,latitude,longitude,value_chain_type,value_chain,farming_profile,acreage,herd_size,herd_count,output_tonnage,farm_experience,current_loan_amount,sacco_member,id_front_url,id_back_url,selfie_url,passport_selfie_url,kyc_status)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?, 'pending')`
   ).bind(
     user.role === 'agent' ? user.id : (b.agent_id || user.id),
     b.full_name, b.national_id, b.date_of_birth, b.gender, b.mobile, b.alt_mobile, b.county, b.sub_county,
-    b.ward, b.village, b.latitude || null, b.longitude || null, b.value_chain_type, b.value_chain,
-    b.acreage || null, b.herd_size || null, b.farm_experience || null, b.mobile_money_usage, b.existing_loans,
-    b.bank_account, b.sacco_membership
+    b.ward, b.village, b.latitude || null, b.longitude || null, farmingProfile, b.value_chain, farmingProfile,
+    b.acreage || null, b.herd_size || b.herd_count || null, b.herd_count || b.herd_size || null,
+    b.output_tonnage || null, b.farm_experience || null,
+    Number(b.current_loan_amount || 0), saccoMember,
+    b.id_front_url || null, b.id_back_url || null, b.selfie_url || b.passport_selfie_url || null, b.passport_selfie_url || b.selfie_url || null
   ).run()
   await audit(c, user.id, 'onboard', 'customer', b.full_name)
   return c.json({ id: r.meta.last_row_id })
+})
+// Store the three KYC validation images (ID front, ID back, passport selfie)
+// captured during the sequential camera funnel. Accepts data-URL / path refs.
+app.post('/api/customers/:id/kyc-images', requireAuth, async (c) => {
+  const id = c.req.param('id')
+  const user = c.get('user')
+  const cust = await c.env.DB.prepare(`SELECT user_id FROM customers WHERE id=?`).bind(id).first<any>()
+  if (!cust) return c.json({ error: 'Not found' }, 404)
+  if (!['admin', 'super_admin', 'agent'].includes(user.role)) {
+    if (!(user.role === 'customer' && cust.user_id === user.id)) return c.json({ error: 'Forbidden' }, 403)
+  }
+  const b = await c.req.json()
+  await c.env.DB.prepare(
+    `UPDATE customers SET id_front_url=COALESCE(?,id_front_url), id_back_url=COALESCE(?,id_back_url), selfie_url=COALESCE(?,selfie_url), passport_selfie_url=COALESCE(?,passport_selfie_url) WHERE id=?`
+  ).bind(b.id_front_url || null, b.id_back_url || null, b.passport_selfie_url || b.selfie_url || null, b.passport_selfie_url || b.selfie_url || null, id).run()
+  if (cust.user_id) {
+    await c.env.DB.prepare(
+      `UPDATE users SET id_front_url=COALESCE(?,id_front_url), id_back_url=COALESCE(?,id_back_url), passport_selfie_url=COALESCE(?,passport_selfie_url) WHERE id=?`
+    ).bind(b.id_front_url || null, b.id_back_url || null, b.passport_selfie_url || b.selfie_url || null, cust.user_id).run()
+  }
+  return c.json({ ok: true })
 })
 // Verification engine (mocked) - agents/admins, or a customer verifying their own profile
 app.post('/api/customers/:id/verify', requireAuth, async (c) => {
@@ -291,22 +402,37 @@ app.post('/api/murabaha/quote', requireAuth, async (c) => {
   if (!p) return c.json({ error: 'Product not found' }, 404)
   const qty = Number(quantity) || 1
   const supplier_cost = p.buying_price * qty
-  const markup_pct = payment_type === 'cash' ? p.cash_markup_pct : p.credit_markup_pct
-  const unit_price = payment_type === 'cash' ? p.cash_price : p.credit_price
+  const isCash = payment_type === 'cash'
+  // Checkout calculations per configured rules:
+  //  Cash:     base * cash_markup%
+  //  Financed: base * finance_markup%  (total long-term debt)
+  //  Deposit:  finance_deposit% of the financed total
+  const markup_pct = isCash ? p.cash_markup_pct : (p.finance_markup_pct ?? p.credit_markup_pct)
+  const unit_price = isCash ? p.cash_price : p.credit_price
   const murabaha_price = unit_price * qty
+  const depositPct = isCash ? 0 : Number(p.finance_deposit_pct || 0)
+  const deposit_required = isCash ? murabaha_price : Math.round(murabaha_price * depositPct / 100)
   const term = payment_type === 'credit' ? (Number(term_months) || 6) : 0
-  const monthly = term > 0 ? Math.round(murabaha_price / term) : 0
+  const monthly = term > 0 ? Math.round(Math.max(0, murabaha_price - deposit_required) / term) : 0
   return c.json({
     product: p.name, quantity: qty, supplier_cost, markup_pct, murabaha_price, term_months: term, monthly_payment: monthly,
+    deposit_pct: depositPct, deposit_required,
+    payment_eligibility: p.payment_eligibility || 'both',
+    terms: isCash ? (p.cash_terms || '') : (p.finance_terms || ''),
     sharia_note: 'Price becomes FIXED once the contract is signed. No interest, penalties, or compounding.'
   })
 })
 app.post('/api/murabaha/apply', requireAuth, async (c) => {
   const user = c.get('user')
-  const { customer_id, product_id, quantity, payment_type, term_months, delivery_location, consent } = await c.req.json()
+  const { customer_id, product_id, quantity, payment_type, term_months, delivery_location, consent, terms_accepted } = await c.req.json()
   if (!consent) return c.json({ error: 'Customer consent is required (Sharia requirement)' }, 400)
+  if (!terms_accepted) return c.json({ error: 'You must accept the terms and conditions to proceed.' }, 400)
   const p = await c.env.DB.prepare(`SELECT * FROM products WHERE id=?`).bind(product_id).first<any>()
   if (!p) return c.json({ error: 'Product not found' }, 404)
+  // Enforce the product's payment-eligibility rule.
+  const eligibility = p.payment_eligibility || 'both'
+  if (eligibility === 'cash' && payment_type !== 'cash') return c.json({ error: 'This item is available for Cash purchase only.' }, 400)
+  if (eligibility === 'finance' && payment_type !== 'credit') return c.json({ error: 'This item is available for Financing only.' }, 400)
   const qty = Number(quantity) || 1
   if (p.quantity < qty) return c.json({ error: 'Insufficient stock' }, 400)
   let custId = customer_id
@@ -324,28 +450,32 @@ app.post('/api/murabaha/apply', requireAuth, async (c) => {
     }, 412)
   }
   const supplier_cost = p.buying_price * qty
-  const markup_pct = payment_type === 'cash' ? p.cash_markup_pct : p.credit_markup_pct
-  const unit_price = payment_type === 'cash' ? p.cash_price : p.credit_price
+  const isCash = payment_type === 'cash'
+  const markup_pct = isCash ? p.cash_markup_pct : (p.finance_markup_pct ?? p.credit_markup_pct)
+  const unit_price = isCash ? p.cash_price : p.credit_price
   const murabaha_price = unit_price * qty
+  const depositPct = isCash ? 0 : Number(p.finance_deposit_pct || 0)
+  const deposit_required = isCash ? murabaha_price : Math.round(murabaha_price * depositPct / 100)
   const term = payment_type === 'credit' ? (Number(term_months) || 6) : 0
-  const monthly = term > 0 ? Math.round(murabaha_price / term) : 0
+  const monthly = term > 0 ? Math.round(Math.max(0, murabaha_price - deposit_required) / term) : 0
+  const acceptedTerms = isCash ? (p.cash_terms || '') : (p.finance_terms || '')
   const contractRef = ref('MRB')
   // Cash purchases now go through an M-Pesa STK Push at checkout, so they
   // start as 'pending_payment' (stock reserved on successful payment, not
   // here). Credit (Pay Later) purchases start as 'pending' for approval.
   const status = payment_type === 'cash' ? 'pending_payment' : 'pending'
   const r = await c.env.DB.prepare(
-    `INSERT INTO murabaha_contracts (contract_ref,customer_id,agent_id,product_id,quantity,payment_type,supplier_cost,markup_pct,murabaha_price,term_months,monthly_payment,delivery_location,status,ownership_recorded,consent_given,amount_paid,outstanding)
-     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
+    `INSERT INTO murabaha_contracts (contract_ref,customer_id,agent_id,product_id,quantity,payment_type,supplier_cost,markup_pct,murabaha_price,term_months,monthly_payment,delivery_location,status,ownership_recorded,consent_given,amount_paid,outstanding,accepted_terms,terms_accepted,deposit_required)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
   ).bind(contractRef, custId, custRow?.agent_id || null, product_id, qty, payment_type, supplier_cost, markup_pct,
     murabaha_price, term, monthly, delivery_location || '', status,
-    0, 1, 0, murabaha_price).run()
+    0, 1, 0, murabaha_price, acceptedTerms, 1, deposit_required).run()
   const contractId = r.meta.last_row_id
   await audit(c, user.id, 'apply', 'murabaha', `${payment_type} ${contractRef}`)
   // For cash, tell the frontend to start the M-Pesa checkout immediately.
   return c.json({
     id: contractId, contract_ref: contractRef, status, murabaha_price, monthly_payment: monthly,
-    requires_payment: payment_type === 'cash', outstanding: murabaha_price, payment_type
+    deposit_required, requires_payment: payment_type === 'cash', outstanding: murabaha_price, payment_type
   })
 })
 app.get('/api/murabaha', requireAuth, async (c) => {
@@ -564,8 +694,16 @@ app.post('/api/agents', requireAuth, requireRole('admin', 'super_admin'), async 
   // Admin may set a password; otherwise one is auto-generated.
   const provided = b.password && String(b.password).length >= 4
   const pwd = provided ? String(b.password) : genPassword()
-  const r = await c.env.DB.prepare(`INSERT INTO users (full_name,phone,email,password,role,region,password_set) VALUES (?,?,?,?, 'agent', ?, ?)`).bind(b.full_name, p, b.email || null, pwd, b.region || null, provided ? 1 : 0).run()
-  await c.env.DB.prepare(`INSERT INTO agents (user_id,region,permissions) VALUES (?,?,?)`).bind(r.meta.last_row_id, b.region || null, JSON.stringify(b.permissions || {})).run()
+  // Granular governance: store the explicit permissions array + optional
+  // custom organizational role label on the user record.
+  const perms = Array.isArray(b.permissions) ? b.permissions : []
+  const permsJson = JSON.stringify(perms)
+  const r = await c.env.DB.prepare(
+    `INSERT INTO users (full_name,phone,email,password,role,region,password_set,custom_role,permissions,supervisor_id)
+     VALUES (?,?,?,?, 'agent', ?, ?, ?, ?, ?)`
+  ).bind(b.full_name, p, b.email || null, pwd, b.region || null, provided ? 1 : 0,
+    b.custom_role || null, permsJson, b.supervisor_id || null).run()
+  await c.env.DB.prepare(`INSERT INTO agents (user_id,region,permissions) VALUES (?,?,?)`).bind(r.meta.last_row_id, b.region || null, permsJson).run()
   await audit(c, c.get('user').id, 'create', 'agent', b.full_name)
   return c.json({ id: r.meta.last_row_id, password: pwd, password_was_set_by_admin: provided })
 })
@@ -600,17 +738,64 @@ app.put('/api/agents/:id', requireAuth, requireRole('admin', 'super_admin'), asy
 // USER ACCOUNTS (admin) - edit, activate/deactivate, delete
 // ----------------------------------------------------------------------------
 app.get('/api/users', requireAuth, requireRole('admin', 'super_admin'), async (c) => {
-  const { results } = await c.env.DB.prepare(`SELECT id, full_name, phone, email, role, status, region, created_at FROM users ORDER BY id`).all()
+  const { results } = await c.env.DB.prepare(
+    `SELECT u.id, u.full_name, u.phone, u.email, u.role, u.status, u.region, u.custom_role, u.permissions, u.supervisor_id,
+            s.full_name AS supervisor_name, u.created_at
+     FROM users u LEFT JOIN users s ON s.id = u.supervisor_id ORDER BY u.id`
+  ).all()
   return c.json({ users: results })
+})
+// Super Admin / Admin: create a system operator, field agent, farmer or
+// lender with an explicit permission grid + optional custom role label.
+app.post('/api/users', requireAuth, requireRole('admin', 'super_admin'), async (c) => {
+  const b = await c.req.json()
+  const p = normalizePhone(b.phone || '')
+  if (!b.full_name || !p) return c.json({ error: 'Name and phone are required' }, 400)
+  const role = ['admin', 'agent', 'customer', 'support', 'lender'].includes(b.role) ? b.role : 'agent'
+  const dup = await c.env.DB.prepare(`SELECT id FROM users WHERE phone=?`).bind(p).first()
+  if (dup) return c.json({ error: 'A user with this phone already exists' }, 409)
+  const provided = b.password && String(b.password).length >= 4
+  const pwd = provided ? String(b.password) : genPassword()
+  const perms = Array.isArray(b.permissions) ? b.permissions : []
+  const permsJson = JSON.stringify(perms)
+  const r = await c.env.DB.prepare(
+    `INSERT INTO users (full_name,phone,email,password,role,status,region,password_set,custom_role,permissions,supervisor_id)
+     VALUES (?,?,?,?,?, 'active', ?, ?, ?, ?, ?)`
+  ).bind(b.full_name, p, b.email || null, pwd, role, b.region || null, provided ? 1 : 0,
+    b.custom_role || null, permsJson, b.supervisor_id || null).run()
+  // Keep an agents row in sync when the role is agent (legacy expectations).
+  if (role === 'agent') {
+    await c.env.DB.prepare(`INSERT INTO agents (user_id,region,permissions) VALUES (?,?,?)`).bind(r.meta.last_row_id, b.region || null, permsJson).run()
+  }
+  // Farmers also get a linked customer profile.
+  if (role === 'customer') {
+    await c.env.DB.prepare(`INSERT INTO customers (user_id, full_name, mobile, kyc_status) VALUES (?,?,?, 'pending')`).bind(r.meta.last_row_id, b.full_name, p).run()
+  }
+  await audit(c, c.get('user').id, 'create', role, b.full_name)
+  return c.json({ id: r.meta.last_row_id, password: pwd, password_was_set_by_admin: provided })
+})
+// Super Admin: move a user to be supervised by a certain user.
+app.put('/api/users/:id/supervisor', requireAuth, requireRole('super_admin'), async (c) => {
+  const id = Number(c.req.param('id'))
+  const { supervisor_id } = await c.req.json()
+  if (supervisor_id && Number(supervisor_id) === id) return c.json({ error: 'A user cannot supervise themselves' }, 400)
+  await c.env.DB.prepare(`UPDATE users SET supervisor_id=? WHERE id=?`).bind(supervisor_id || null, id).run()
+  await audit(c, c.get('user').id, 'assign_supervisor', 'user', `user ${id} -> supervisor ${supervisor_id || 'none'}`)
+  return c.json({ ok: true })
 })
 app.put('/api/users/:id', requireAuth, requireRole('admin', 'super_admin'), async (c) => {
   const id = c.req.param('id')
   const b = await c.req.json()
+  const hasPerms = Array.isArray(b.permissions)
+  const permsJson = hasPerms ? JSON.stringify(b.permissions) : null
   if (b.password) {
-    await c.env.DB.prepare(`UPDATE users SET full_name=?, phone=?, email=?, role=?, region=?, password=? WHERE id=?`).bind(b.full_name, b.phone, b.email, b.role, b.region, String(b.password), id).run()
+    await c.env.DB.prepare(`UPDATE users SET full_name=?, phone=?, email=?, role=?, region=?, custom_role=?, permissions=COALESCE(?,permissions), password=? WHERE id=?`)
+      .bind(b.full_name, b.phone, b.email, b.role, b.region, b.custom_role || null, permsJson, String(b.password), id).run()
   } else {
-    await c.env.DB.prepare(`UPDATE users SET full_name=?, phone=?, email=?, role=?, region=? WHERE id=?`).bind(b.full_name, b.phone, b.email, b.role, b.region, id).run()
+    await c.env.DB.prepare(`UPDATE users SET full_name=?, phone=?, email=?, role=?, region=?, custom_role=?, permissions=COALESCE(?,permissions) WHERE id=?`)
+      .bind(b.full_name, b.phone, b.email, b.role, b.region, b.custom_role || null, permsJson, id).run()
   }
+  if (hasPerms) await c.env.DB.prepare(`UPDATE agents SET permissions=? WHERE user_id=?`).bind(permsJson, id).run()
   await audit(c, c.get('user').id, 'update', 'user', b.full_name)
   return c.json({ ok: true })
 })
@@ -647,11 +832,14 @@ app.get('/api/repayments', requireAuth, requireRole('admin', 'super_admin', 'sup
 app.get('/api/documents/:type/:id', requireAuth, async (c) => {
   const type = c.req.param('type'), id = c.req.param('id')
   const contract = await c.env.DB.prepare(
-    `SELECT mc.*, p.name product_name, cu.full_name customer_name, cu.national_id, cu.county
+    `SELECT mc.*, p.name product_name, p.cash_terms, p.finance_terms, cu.full_name customer_name, cu.national_id, cu.county
      FROM murabaha_contracts mc JOIN products p ON p.id=mc.product_id JOIN customers cu ON cu.id=mc.customer_id WHERE mc.id=?`
-  ).bind(id).first()
+  ).bind(id).first<any>()
   if (!contract) return c.json({ error: 'Not found' }, 404)
-  return c.json({ type, contract, txn_id: contract.contract_ref, qr: `https://api.qrserver.com/v1/create-qr-code/?size=120x120&data=${contract.contract_ref}` })
+  // Prefer the snapshot accepted at checkout; fall back to the product's
+  // current terms for the relevant payment type.
+  const terms = contract.accepted_terms || (contract.payment_type === 'cash' ? contract.cash_terms : contract.finance_terms) || ''
+  return c.json({ type, contract, terms, txn_id: contract.contract_ref, qr: `https://api.qrserver.com/v1/create-qr-code/?size=120x120&data=${contract.contract_ref}` })
 })
 
 // ----------------------------------------------------------------------------
