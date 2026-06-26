@@ -1,6 +1,6 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
-  "name": "webapp",
+  "name": "feed",
   "compatibility_date": "2025-05-01",
   "pages_build_output_dir": "./dist",
   "compatibility_flags": [
@@ -9,7 +9,7 @@
   "d1_databases": [
     {
       "binding": "DB",
-      "database_name": "webapp-production",
+      "database_name": "farmsky-db",
       "database_id": "3190e56b-5af2-4711-a381-ecff97beda75"
     }
   ]
