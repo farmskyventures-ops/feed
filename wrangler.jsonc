@@ -1,6 +1,7 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "feed",
+  // Farmsky feed platform
   "compatibility_date": "2025-05-01",
   "pages_build_output_dir": "./dist",
   "compatibility_flags": [
