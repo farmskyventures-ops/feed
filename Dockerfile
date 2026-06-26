@@ -1,11 +1,10 @@
 # =====================================================================
 # Farmsky — container image for AWS App Runner / ECS / any Docker host.
 # Builds the Node server and runs it on port 8080.
+# Requires a PostgreSQL database; configure via DATABASE_URL (or PG* env).
 # =====================================================================
 FROM node:20-bookworm-slim AS build
 WORKDIR /app
-# build tools for better-sqlite3 (native module)
-RUN apt-get update && apt-get install -y python3 make g++ && rm -rf /var/lib/apt/lists/*
 COPY package*.json ./
 RUN npm install
 COPY . .
@@ -19,8 +18,10 @@ ENV PORT=8080
 COPY --from=build /app/node_modules ./node_modules
 COPY --from=build /app/dist-node ./dist-node
 COPY --from=build /app/public ./public
-COPY --from=build /app/migrations ./migrations
-COPY --from=build /app/seed.sql ./seed.sql
+COPY --from=build /app/migrations-pg ./migrations-pg
+COPY --from=build /app/seed-pg.sql ./seed-pg.sql
+COPY --from=build /app/scripts ./scripts
 COPY --from=build /app/package.json ./package.json
 EXPOSE 8080
+# DATABASE_URL (or PGHOST/PGUSER/PGPASSWORD/PGDATABASE) must be provided at runtime.
 CMD ["node", "dist-node/server.js"]

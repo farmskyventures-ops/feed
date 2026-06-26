@@ -5,7 +5,8 @@ import "dotenv/config";
 import { serve } from "@hono/node-server";
 import { serveStatic } from "@hono/node-server/serve-static";
 import { fileURLToPath } from "node:url";
-import { dirname as dirname2, join as join2 } from "node:path";
+import { dirname, join as join2 } from "node:path";
+import { Hono as Hono2 } from "hono";
 
 // src/index.tsx
 import { Hono } from "hono";
@@ -323,9 +324,9 @@ async function verifyOtp(c, phone, code, purpose) {
 }
 app.post("/api/login", async (c) => {
   const { phone, password } = await c.req.json();
-  const raw2 = String(phone || "").trim();
-  const norm = normalizePhone(raw2);
-  let user = await c.env.DB.prepare(`SELECT * FROM users WHERE phone = ? OR phone = ?`).bind(raw2, norm).first();
+  const raw = String(phone || "").trim();
+  const norm = normalizePhone(raw);
+  let user = await c.env.DB.prepare(`SELECT * FROM users WHERE phone = ? OR phone = ?`).bind(raw, norm).first();
   if (!user || user.password !== String(password)) return c.json({ error: "Invalid phone number or password" }, 401);
   if (user.status !== "active") return c.json({ error: "Account suspended" }, 403);
   const token = await createSession(c, user);
@@ -1291,11 +1292,45 @@ var SHELL = `<!DOCTYPE html>
 </html>`;
 var index_default = app;
 
-// src/db-sqlite.ts
-import Database from "better-sqlite3";
-var SqliteStatement = class {
-  constructor(db, sql) {
-    this.db = db;
+// src/db-postgres.ts
+import pg from "pg";
+var { Pool } = pg;
+function toPgPlaceholders(sql) {
+  let out = "";
+  let i = 0;
+  let n = 0;
+  let inSingle = false;
+  while (i < sql.length) {
+    const ch = sql[i];
+    if (ch === "'") {
+      if (inSingle && sql[i + 1] === "'") {
+        out += "''";
+        i += 2;
+        continue;
+      }
+      inSingle = !inSingle;
+      out += ch;
+      i++;
+      continue;
+    }
+    if (ch === "?" && !inSingle) {
+      n++;
+      out += "$" + n;
+      i++;
+      continue;
+    }
+    out += ch;
+    i++;
+  }
+  return out;
+}
+function isInsertWithoutReturning(sql) {
+  const s = sql.trim().toLowerCase();
+  return s.startsWith("insert") && !s.includes("returning");
+}
+var PgStatement = class {
+  constructor(pool, sql) {
+    this.pool = pool;
     this.sql = sql;
   }
   params = [];
@@ -1303,73 +1338,99 @@ var SqliteStatement = class {
     this.params = args;
     return this;
   }
+  pgSql() {
+    return toPgPlaceholders(this.sql);
+  }
   async first() {
-    const stmt = this.db.prepare(this.sql);
-    const row = stmt.get(...this.params);
-    return row ?? null;
+    const res = await this.pool.query(this.pgSql(), this.params);
+    return res.rows[0] ?? null;
   }
   async all() {
-    const stmt = this.db.prepare(this.sql);
-    const rows = stmt.all(...this.params);
-    return { results: rows, success: true };
+    const res = await this.pool.query(this.pgSql(), this.params);
+    return { results: res.rows, success: true };
   }
   async run() {
-    const stmt = this.db.prepare(this.sql);
-    const info = stmt.run(...this.params);
+    let sql = this.pgSql();
+    let captureId = false;
+    if (isInsertWithoutReturning(this.sql)) {
+      sql = sql.replace(/;\s*$/, "") + " RETURNING id";
+      captureId = true;
+    }
+    let res;
+    try {
+      res = await this.pool.query(sql, this.params);
+    } catch (e) {
+      if (captureId && /column "id" does not exist|has no column named "id"/i.test(String(e.message))) {
+        res = await this.pool.query(this.pgSql(), this.params);
+        captureId = false;
+      } else {
+        throw e;
+      }
+    }
+    const lastId = captureId && res.rows[0] ? Number(res.rows[0].id) : 0;
     return {
       success: true,
-      meta: {
-        last_row_id: Number(info.lastInsertRowid),
-        changes: info.changes
-      }
+      meta: { last_row_id: lastId, changes: res.rowCount ?? 0 }
     };
   }
 };
-var SqliteD1 = class {
-  constructor(db) {
-    this.db = db;
+var PostgresD1 = class {
+  constructor(pool) {
+    this.pool = pool;
   }
   prepare(sql) {
-    return new SqliteStatement(this.db, sql);
+    return new PgStatement(this.pool, sql);
   }
-  exec(sql) {
-    return this.db.exec(sql);
+  async exec(sql) {
+    return this.pool.query(sql);
   }
 };
-function openDatabase(filePath) {
-  const raw2 = new Database(filePath);
-  raw2.pragma("journal_mode = WAL");
-  raw2.pragma("foreign_keys = ON");
-  return { d1: new SqliteD1(raw2), raw: raw2 };
+function openPostgres(connectionString) {
+  const pool = new Pool({
+    connectionString,
+    max: Number(process.env.PGPOOL_MAX || 10),
+    ssl: /sslmode=require|\bssl=true/i.test(connectionString) ? { rejectUnauthorized: false } : void 0
+  });
+  return { d1: new PostgresD1(pool), pool };
 }
 
-// src/db-init.ts
-import { readFileSync, readdirSync, existsSync, mkdirSync } from "node:fs";
-import { dirname, join } from "node:path";
-function applySqlFile(raw2, file) {
+// src/db-init-pg.ts
+import { readFileSync, readdirSync, existsSync } from "node:fs";
+import { join } from "node:path";
+async function applySqlFile(pool, file) {
   const sql = readFileSync(file, "utf8");
-  raw2.exec(sql);
+  await pool.query(sql);
 }
-function initializeDatabase(raw2, projectRoot) {
-  const hasUsers = raw2.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='users'").get();
-  const migrationsDir = join(projectRoot, "migrations");
+async function initializePostgres(pool, projectRoot) {
+  let hasUsers = false;
+  try {
+    const res = await pool.query(
+      `SELECT to_regclass('public.users') AS t`
+    );
+    hasUsers = !!res.rows[0]?.t;
+  } catch {
+    hasUsers = false;
+  }
+  let migrationsDir = join(projectRoot, "migrations-pg");
+  if (!existsSync(migrationsDir)) migrationsDir = join(projectRoot, "migrations");
   if (existsSync(migrationsDir)) {
     const files = readdirSync(migrationsDir).filter((f) => f.endsWith(".sql")).sort();
     for (const f of files) {
       try {
-        applySqlFile(raw2, join(migrationsDir, f));
+        await applySqlFile(pool, join(migrationsDir, f));
       } catch (e) {
-        if (!/already exists|duplicate column/i.test(String(e.message))) {
+        if (!/already exists|duplicate column|duplicate_object/i.test(String(e.message))) {
           console.error(`Migration ${f} error:`, e.message);
         }
       }
     }
   }
   if (!hasUsers) {
-    const seedFile = join(projectRoot, "seed.sql");
+    let seedFile = join(projectRoot, "seed-pg.sql");
+    if (!existsSync(seedFile)) seedFile = join(projectRoot, "seed.sql");
     if (existsSync(seedFile)) {
       try {
-        applySqlFile(raw2, seedFile);
+        await applySqlFile(pool, seedFile);
         console.log("Seed data loaded.");
       } catch (e) {
         console.error("Seed error:", e.message);
@@ -1377,49 +1438,59 @@ function initializeDatabase(raw2, projectRoot) {
     }
   }
 }
-function ensureDir(filePath) {
-  const dir = dirname(filePath);
-  if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
-}
 
 // src/server.ts
-import { Hono as Hono2 } from "hono";
-var __dirname = dirname2(fileURLToPath(import.meta.url));
+var __dirname = dirname(fileURLToPath(import.meta.url));
 var PROJECT_ROOT = join2(__dirname, "..");
-var DB_FILE = process.env.DATABASE_PATH || join2(PROJECT_ROOT, "data", "farmsky.db");
-ensureDir(DB_FILE);
-var { d1, raw } = openDatabase(DB_FILE);
-initializeDatabase(raw, PROJECT_ROOT);
-console.log(`Database ready at: ${DB_FILE}`);
-var ENV = {
-  DB: d1,
-  MPESA_CONSUMER_KEY: process.env.MPESA_CONSUMER_KEY,
-  MPESA_CONSUMER_SECRET: process.env.MPESA_CONSUMER_SECRET,
-  MPESA_SHORTCODE: process.env.MPESA_SHORTCODE,
-  MPESA_PASSKEY: process.env.MPESA_PASSKEY,
-  MPESA_ENV: process.env.MPESA_ENV,
-  MPESA_CALLBACK_URL: process.env.MPESA_CALLBACK_URL,
-  // SMS OTP provider (TalkSASA by default)
-  SMS_PROVIDER: process.env.SMS_PROVIDER,
-  SMS_API_URL: process.env.SMS_API_URL,
-  SMS_API_TOKEN: process.env.SMS_API_TOKEN,
-  SMS_SENDER_ID: process.env.SMS_SENDER_ID,
-  SMS_BODY_TEMPLATE: process.env.SMS_BODY_TEMPLATE,
-  SMS_PHONE_FIELD: process.env.SMS_PHONE_FIELD,
-  SMS_MESSAGE_FIELD: process.env.SMS_MESSAGE_FIELD,
-  // Email provider (export sharing) — Resend by default
-  EMAIL_PROVIDER: process.env.EMAIL_PROVIDER,
-  EMAIL_API_URL: process.env.EMAIL_API_URL,
-  EMAIL_API_TOKEN: process.env.EMAIL_API_TOKEN,
-  EMAIL_FROM: process.env.EMAIL_FROM
-};
-var root = new Hono2();
-root.use("/static/*", serveStatic({ root: "./public" }));
-root.all("*", (c) => index_default.fetch(c.req.raw, ENV));
-var PORT = Number(process.env.PORT || 8080);
-serve({ fetch: root.fetch, port: PORT }, (info) => {
-  console.log(`Farmsky server running on http://0.0.0.0:${info.port}`);
-  console.log(
-    process.env.MPESA_CONSUMER_KEY ? "M-Pesa: LIVE credentials detected (Daraja " + (process.env.MPESA_ENV || "sandbox") + ")" : "M-Pesa: SIMULATION mode (no Daraja credentials set). See .env.example."
-  );
+function resolveConnectionString() {
+  if (process.env.DATABASE_URL) return process.env.DATABASE_URL;
+  const host = process.env.PGHOST || "127.0.0.1";
+  const port = process.env.PGPORT || "5432";
+  const user = process.env.PGUSER || "farmsky";
+  const pass = process.env.PGPASSWORD || "farmsky";
+  const db = process.env.PGDATABASE || "farmsky";
+  return `postgresql://${user}:${pass}@${host}:${port}/${db}`;
+}
+async function main() {
+  const connectionString = resolveConnectionString();
+  const { d1, pool } = openPostgres(connectionString);
+  await initializePostgres(pool, PROJECT_ROOT);
+  const safeUrl = connectionString.replace(/:\/\/([^:]+):[^@]*@/, "://$1:****@");
+  console.log(`Database ready (PostgreSQL): ${safeUrl}`);
+  const ENV = {
+    DB: d1,
+    MPESA_CONSUMER_KEY: process.env.MPESA_CONSUMER_KEY,
+    MPESA_CONSUMER_SECRET: process.env.MPESA_CONSUMER_SECRET,
+    MPESA_SHORTCODE: process.env.MPESA_SHORTCODE,
+    MPESA_PASSKEY: process.env.MPESA_PASSKEY,
+    MPESA_ENV: process.env.MPESA_ENV,
+    MPESA_CALLBACK_URL: process.env.MPESA_CALLBACK_URL,
+    // SMS OTP provider (TalkSASA by default)
+    SMS_PROVIDER: process.env.SMS_PROVIDER,
+    SMS_API_URL: process.env.SMS_API_URL,
+    SMS_API_TOKEN: process.env.SMS_API_TOKEN,
+    SMS_SENDER_ID: process.env.SMS_SENDER_ID,
+    SMS_BODY_TEMPLATE: process.env.SMS_BODY_TEMPLATE,
+    SMS_PHONE_FIELD: process.env.SMS_PHONE_FIELD,
+    SMS_MESSAGE_FIELD: process.env.SMS_MESSAGE_FIELD,
+    // Email provider (export sharing) — Resend by default
+    EMAIL_PROVIDER: process.env.EMAIL_PROVIDER,
+    EMAIL_API_URL: process.env.EMAIL_API_URL,
+    EMAIL_API_TOKEN: process.env.EMAIL_API_TOKEN,
+    EMAIL_FROM: process.env.EMAIL_FROM
+  };
+  const root = new Hono2();
+  root.use("/static/*", serveStatic({ root: "./public" }));
+  root.all("*", (c) => index_default.fetch(c.req.raw, ENV));
+  const PORT = Number(process.env.PORT || 8080);
+  serve({ fetch: root.fetch, port: PORT }, (info) => {
+    console.log(`Farmsky server running on http://0.0.0.0:${info.port}`);
+    console.log(
+      process.env.MPESA_CONSUMER_KEY ? "M-Pesa: LIVE credentials detected (Daraja " + (process.env.MPESA_ENV || "sandbox") + ")" : "M-Pesa: SIMULATION mode (no Daraja credentials set). See .env.example."
+    );
+  });
+}
+main().catch((err) => {
+  console.error("Fatal startup error:", err);
+  process.exit(1);
 });

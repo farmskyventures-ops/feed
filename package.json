@@ -7,24 +7,23 @@
     "preview": "wrangler pages dev",
     "deploy": "npm run build && wrangler pages deploy dist --project-name webapp",
     "cf-typegen": "wrangler types --env-interface CloudflareBindings",
-    "db:migrate:local": "wrangler d1 migrations apply webapp-production --local",
-    "db:migrate:prod": "wrangler d1 migrations apply webapp-production",
-    "db:seed": "wrangler d1 execute webapp-production --local --file=./seed.sql",
-    "db:reset": "rm -rf .wrangler/state/v3/d1 && npm run db:migrate:local && npm run db:seed",
+    "db:migrate": "node scripts/pg.mjs migrate",
+    "db:seed": "node scripts/pg.mjs seed",
+    "db:reset": "node scripts/pg.mjs reset",
     "build:node": "esbuild src/server.ts --bundle --platform=node --format=esm --outfile=dist-node/server.js --packages=external --banner:js=\"import{createRequire}from'module';const require=createRequire(import.meta.url);\"",
     "start": "node dist-node/server.js",
     "start:dev": "node --import tsx src/server.ts"
   },
   "dependencies": {
-    "hono": "^4.12.23",
     "@hono/node-server": "^1.13.7",
-    "better-sqlite3": "^11.8.1",
-    "dotenv": "^16.4.7"
+    "dotenv": "^16.4.7",
+    "hono": "^4.12.23",
+    "pg": "^8.22.0"
   },
   "devDependencies": {
     "@hono/vite-build": "^1.2.0",
     "@hono/vite-dev-server": "^0.25.2",
-    "@types/better-sqlite3": "^7.6.12",
+    "@types/pg": "^8.20.0",
     "esbuild": "^0.24.2",
     "tsx": "^4.19.2",
     "vite": "^6.3.5",
