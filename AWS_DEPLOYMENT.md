@@ -2,14 +2,17 @@
 
 This guide is written like a tutorial for a student. Follow it top to bottom.
 
-Farmsky now ships in **two forms** from the same codebase:
+Farmsky runs as a **Node server backed by PostgreSQL**:
 
 | Build | Command | Runs on | Database |
 |-------|---------|---------|----------|
-| **Node server** (for AWS) | `npm run build:node` → `npm start` | Any Linux server (AWS EC2 / App Runner / VPS) | SQLite file (`data/farmsky.db`) |
-| **Cloudflare Pages** (original) | `npm run build` → `npm run deploy` | Cloudflare edge | Cloudflare D1 |
+| **Node server** | `npm run build:node` → `npm start` | Any Linux server (AWS EC2 / App Runner / ECS / VPS) | **PostgreSQL** (`DATABASE_URL` / `PG*` env) |
 
-Pick the section you need.
+Provision a PostgreSQL instance (e.g. **AWS RDS for PostgreSQL**, Supabase, or Neon),
+then point the app at it via `DATABASE_URL` (append `?sslmode=require` for managed
+SSL endpoints). On first boot the server auto-applies `migrations-pg/*.sql` and
+loads `seed-pg.sql`; you can also run `npm run db:migrate` / `npm run db:seed`
+manually. Pick the section you need.
 
 ---
 
@@ -54,15 +57,25 @@ ssh -i farmsky.pem ec2-user@<PUBLIC_IP>      # Amazon Linux
 # (Ubuntu uses: ssh -i farmsky.pem ubuntu@<PUBLIC_IP>)
 ```
 
-### Step 3 — Install Node.js, git, build tools, PM2
-`better-sqlite3` is a native module, so we need a compiler toolchain.
+### Step 3 — Install Node.js, git, PM2
 ```bash
 # Amazon Linux 2023:
-sudo dnf install -y nodejs npm git gcc-c++ make python3
-# Ubuntu:  sudo apt update && sudo apt install -y nodejs npm git build-essential python3
+sudo dnf install -y nodejs npm git
+# Ubuntu:  sudo apt update && sudo apt install -y nodejs npm git
 
 sudo npm install -g pm2
 ```
+
+### Step 3b — Provision PostgreSQL
+Use a managed database (**AWS RDS for PostgreSQL** recommended) or install
+PostgreSQL on the same box. Create a database + user, then note the connection
+string for `.env` (Step 6):
+```sql
+CREATE DATABASE farmsky;
+CREATE USER farmsky WITH PASSWORD 'change-me';
+GRANT ALL PRIVILEGES ON DATABASE farmsky TO farmsky;
+```
+`DATABASE_URL=postgresql://farmsky:change-me@<host>:5432/farmsky?sslmode=require`
 
 ### Step 4 — Get the code onto the server
 Pick ONE:
@@ -83,18 +96,25 @@ git clone https://github.com/<you>/farmsky.git && cd farmsky
 
 ### Step 5 — Install dependencies & build
 ```bash
-npm install            # compiles better-sqlite3 (takes ~1 min)
+npm install            # installs deps (incl. pg)
 npm run build:node     # bundles the server into dist-node/server.js
 ```
 
-### Step 6 — Configure M-Pesa (and other env vars)
+### Step 6 — Configure the database + M-Pesa (and other env vars)
 ```bash
 cp .env.example .env
-nano .env              # fill MPESA_* keys (see comments in the file)
+nano .env              # set DATABASE_URL (Step 3b), fill MPESA_* keys
 ```
+> Set `DATABASE_URL` (or the `PG*` variables) to your PostgreSQL instance.
 > Leave the M-Pesa keys blank to run in **simulation mode** first — everything
 > works, no real money moves. Add the keys when you're ready for live payments.
 > **Where to copy the credentials is fully explained inside `.env.example`.**
+
+Then initialise the database (first time only — the server also does this
+automatically on boot):
+```bash
+npm run db:migrate && npm run db:seed
+```
 
 ### Step 7 — Start the app with PM2 (auto-restarts on crash/reboot)
 ```bash
@@ -169,12 +189,15 @@ If you prefer not to manage a VM, use **App Runner** with the included `Dockerfi
 3. Source: your GitHub repo (or ECR image).
 4. Build settings: it auto-detects the `Dockerfile`.
 5. Port: **8080**.
-6. Add environment variables (the `MPESA_*` ones) under *Configure service → Environment variables*.
+6. Add environment variables under *Configure service → Environment variables*:
+   set **`DATABASE_URL`** (point it at your RDS/managed PostgreSQL instance with
+   `?sslmode=require`) plus the `MPESA_*` keys.
 7. Create & deploy. App Runner gives you an HTTPS URL automatically.
 
-> Note: App Runner instances have ephemeral disk. The SQLite file resets on
-> redeploy. That's fine for a demo. For persistent production data on AWS,
-> migrate to **Amazon RDS (PostgreSQL)** or **EFS** — ask and I can wire that up.
+> Note: App Runner instances have ephemeral disk, but Farmsky stores all data in
+> **PostgreSQL**, so data persists across redeploys as long as `DATABASE_URL`
+> points at a managed database (e.g. **Amazon RDS for PostgreSQL**). Make sure
+> the App Runner service can reach the database (VPC connector / security group).
 
 ---
 
