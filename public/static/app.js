@@ -354,7 +354,7 @@ async function viewShop() {
   </div>`
 }
 window.productDetail = (id) => {
-  const p = _products.find(x => x.id === id)
+  const p = _products.find(x => x.id == id)
   if (!p) return
   showModal(`
     ${prodImg(p, 'w-full h-56 rounded-xl mb-4')}
@@ -371,7 +371,7 @@ window.productDetail = (id) => {
 }
 window.buyModal = async (productId) => {
   if (!_products.length) { const { data } = await api.get('/products'); _products = data.products }
-  const p = _products.find(x => x.id === productId)
+  const p = _products.find(x => x.id == productId)
   const elig = p.payment_eligibility || 'both'
   // Build payment options based on the product's configured viability rule.
   let opts = ''
