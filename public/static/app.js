@@ -798,7 +798,7 @@ window.doAddProduct = async () => {
   } catch (err) { toast(err.response?.data?.error || 'Failed', false) }
 }
 window.editProductModal = (id) => {
-  const p = _products.find(x => x.id === id)
+  const p = _products.find(x => x.id == id)
   showModal(`<h3 class="font-bold mb-3">Edit Product</h3>
   <div class="flex items-center gap-3 mb-3">
     <div id="ep_preview">${prodImg(p, 'w-16 h-16 rounded-lg')}</div>
