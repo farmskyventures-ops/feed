@@ -53,6 +53,18 @@ async function main() {
     MPESA_PASSKEY: process.env.MPESA_PASSKEY,
     MPESA_ENV: process.env.MPESA_ENV,
     MPESA_CALLBACK_URL: process.env.MPESA_CALLBACK_URL,
+    // SasaPay (alternative payment provider)
+    SASAPAY_CLIENT_ID: process.env.SASAPAY_CLIENT_ID,
+    SASAPAY_CLIENT_SECRET: process.env.SASAPAY_CLIENT_SECRET,
+    SASAPAY_MERCHANT_CODE: process.env.SASAPAY_MERCHANT_CODE,
+    SASAPAY_ENV: process.env.SASAPAY_ENV,
+    SASAPAY_CALLBACK_URL: process.env.SASAPAY_CALLBACK_URL,
+    // KCB Buni (alternative payment provider)
+    KCB_CONSUMER_KEY: process.env.KCB_CONSUMER_KEY,
+    KCB_CONSUMER_SECRET: process.env.KCB_CONSUMER_SECRET,
+    KCB_TILL_NUMBER: process.env.KCB_TILL_NUMBER,
+    KCB_ENV: process.env.KCB_ENV,
+    KCB_CALLBACK_URL: process.env.KCB_CALLBACK_URL,
     // SMS OTP provider (TalkSASA by default)
     SMS_PROVIDER: process.env.SMS_PROVIDER,
     SMS_API_URL: process.env.SMS_API_URL,

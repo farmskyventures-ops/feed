@@ -502,40 +502,79 @@ window.contractDetail = async (id) => {
     <table class="w-full text-xs mb-4"><thead class="text-slate-400"><tr><th class="text-left">#</th><th class="text-left">Due</th><th class="text-right">Amount</th><th class="text-right">Paid</th><th>Status</th></tr></thead>
     <tbody>${data.repayments.map(r => `<tr class="border-t border-slate-100"><td>${r.installment_no}</td><td>${r.due_date}</td><td class="text-right">${fmt(r.amount_due)}</td><td class="text-right">${fmt(r.amount_paid)}</td><td class="text-center">${badge(r.status)}</td></tr>`).join('')}</tbody></table>` : ''}
     <div class="flex gap-2">
-      ${canPay ? `<button onclick="payModal(${c.id}, ${c.monthly_payment}, ${c.outstanding})" class="btn flex-1 brand-bg text-white py-2.5 rounded-lg text-sm"><i class="fas fa-mobile-alt mr-1"></i>Pay via M-Pesa</button>` : ''}
+      ${canPay ? `<button onclick="payModal(${c.id}, ${c.monthly_payment}, ${c.outstanding})" class="btn flex-1 brand-bg text-white py-2.5 rounded-lg text-sm"><i class="fas fa-money-bill-wave mr-1"></i>Make a Payment</button>` : ''}
       <button onclick="viewDoc(${c.id})" class="btn flex-1 bg-slate-800 text-white py-2.5 rounded-lg text-sm"><i class="fas fa-file-pdf mr-1"></i>Documents</button>
       <button onclick="closeModal()" class="btn px-4 bg-slate-100 rounded-lg text-sm">Close</button>
     </div>`)
 }
+// Brand colours / icons for each payment provider used in the selector.
+const PROVIDER_META = {
+  mpesa:   { label: 'M-Pesa',  icon: 'fa-mobile-screen-button', color: '#43b02a' },
+  sasapay: { label: 'SasaPay', icon: 'fa-wallet',               color: '#0a7d3e' },
+  kcb:     { label: 'KCB',     icon: 'fa-building-columns',      color: '#00a651' }
+}
+window.payState = { provider: 'mpesa', providers: [] }
+window.selectProvider = (pid) => {
+  window.payState.provider = pid
+  document.querySelectorAll('[data-prov]').forEach(el => {
+    const active = el.getAttribute('data-prov') === pid
+    el.classList.toggle('ring-2', active)
+    el.classList.toggle('ring-teal-500', active)
+    el.classList.toggle('border-teal-500', active)
+    el.classList.toggle('bg-teal-50', active)
+  })
+  const sel = (window.payState.providers || []).find(p => p.id === pid) || { mode: 'simulation', live: false }
+  const b = $('provBanner')
+  if (b) b.innerHTML = sel.live
+    ? `<div class="bg-emerald-50 border border-emerald-200 rounded-lg p-2 text-xs text-emerald-700"><i class="fas fa-circle-check mr-1"></i>Live ${esc(sel.label)} (${esc(sel.mode)}) — you will receive a real payment prompt.</div>`
+    : `<div class="bg-amber-50 border border-amber-200 rounded-lg p-2 text-xs text-amber-700"><i class="fas fa-flask mr-1"></i>${esc(sel.label)} simulation mode — no real money moves. Add ${esc(sel.label)} keys to go live.</div>`
+}
 window.payModal = async (id, amount, outstanding, kind) => {
   kind = kind || 'repay'
   const isCash = kind === 'cash'
-  let mode = { mode: 'simulation', live: false }
-  try { mode = (await api.get('/mpesa/status')).data } catch {}
-  const banner = mode.live
-    ? `<div class="bg-emerald-50 border border-emerald-200 rounded-lg p-2 text-xs text-emerald-700 mb-3"><i class="fas fa-circle-check mr-1"></i>Live M-Pesa Daraja (${esc(mode.mode)}) — you will receive a real STK prompt.</div>`
-    : `<div class="bg-amber-50 border border-amber-200 rounded-lg p-2 text-xs text-amber-700 mb-3"><i class="fas fa-flask mr-1"></i>Simulation mode — no real money moves. Add Daraja keys to go live.</div>`
-  showModal(`<h3 class="text-lg font-bold mb-1"><i class="fas fa-mobile-alt text-teal-600 mr-2"></i>${isCash ? 'Cash Checkout — Pay via M-Pesa' : 'Pay via M-Pesa'}</h3>
+  // Load the available providers (M-Pesa / SasaPay / KCB) and their live/sim mode.
+  let providers = [
+    { id: 'mpesa', label: 'M-Pesa', live: false, mode: 'simulation' },
+    { id: 'sasapay', label: 'SasaPay', live: false, mode: 'simulation' },
+    { id: 'kcb', label: 'KCB', live: false, mode: 'simulation' }
+  ]
+  try { providers = (await api.get('/payments/providers')).data.providers || providers } catch {}
+  window.payState = { provider: providers[0].id, providers }
+  const cards = providers.map(p => {
+    const m = PROVIDER_META[p.id] || { label: p.label, icon: 'fa-credit-card', color: '#0d9488' }
+    return `<button type="button" data-prov="${p.id}" onclick="selectProvider('${p.id}')"
+      class="btn flex-1 border border-slate-300 rounded-lg p-3 flex flex-col items-center gap-1 text-center transition">
+      <i class="fas ${m.icon} text-xl" style="color:${m.color}"></i>
+      <span class="text-xs font-semibold text-slate-700">${esc(m.label)}</span>
+      <span class="text-[10px] ${p.live ? 'text-emerald-600' : 'text-amber-600'}">${p.live ? 'Live' : 'Demo'}</span>
+    </button>`
+  }).join('')
+  showModal(`<h3 class="text-lg font-bold mb-1"><i class="fas fa-money-bill-wave text-teal-600 mr-2"></i>${isCash ? 'Cash Checkout — Make Payment' : 'Make a Payment'}</h3>
     <p class="text-xs text-slate-500 mb-3">${isCash ? 'Amount due' : 'Outstanding'}: ${fmt(outstanding)}</p>
-    ${banner}
-    <label class="text-sm font-medium">M-Pesa Phone</label><input id="mpphone" value="${esc(state.user.phone)}" class="w-full mt-1 mb-3 px-3 py-2 border border-slate-300 rounded-lg">
+    <label class="text-sm font-medium block mb-1">Choose payment method</label>
+    <div class="flex gap-2 mb-3">${cards}</div>
+    <div id="provBanner" class="mb-3"></div>
+    <label class="text-sm font-medium">Phone Number</label><input id="mpphone" value="${esc(state.user.phone)}" class="w-full mt-1 mb-3 px-3 py-2 border border-slate-300 rounded-lg" placeholder="07XXXXXXXX">
     <label class="text-sm font-medium">Amount (KES)</label><input id="mpamt" type="number" value="${amount}" ${isCash ? 'readonly' : ''} class="w-full mt-1 mb-4 px-3 py-2 border border-slate-300 rounded-lg ${isCash ? 'bg-slate-50' : ''}">
     <div id="payStatus"></div>
-    <div class="flex gap-2"><button id="payBtn" onclick="doPay(${id}, '${kind}')" class="btn flex-1 brand-bg text-white py-2.5 rounded-lg text-sm">Send STK Push</button>
+    <div class="flex gap-2"><button id="payBtn" onclick="doPay(${id}, '${kind}')" class="btn flex-1 brand-bg text-white py-2.5 rounded-lg text-sm"><i class="fas fa-paper-plane mr-1"></i>Send Payment Prompt</button>
     <button onclick="closeModal()" class="btn px-4 bg-slate-100 rounded-lg text-sm">Cancel</button></div>`)
+  selectProvider(window.payState.provider)
 }
 window.doPay = async (id, kind) => {
   const isCash = kind === 'cash'
+  const provider = (window.payState && window.payState.provider) || 'mpesa'
+  const provLabel = (PROVIDER_META[provider] || {}).label || provider
   const btn = $('payBtn'); btn.disabled = true; btn.classList.add('opacity-50')
-  $('payStatus').innerHTML = '<div class="text-xs text-slate-500 mb-3"><i class="fas fa-spinner fa-spin mr-1"></i>Sending STK push...</div>'
+  $('payStatus').innerHTML = `<div class="text-xs text-slate-500 mb-3"><i class="fas fa-spinner fa-spin mr-1"></i>Sending ${esc(provLabel)} prompt...</div>`
   try {
-    const { data } = await api.post('/mpesa/stkpush', { contract_id: id, amount: $('mpamt').value, phone: $('mpphone').value })
-    $('payStatus').innerHTML = `<div class="bg-teal-50 border border-teal-200 rounded-lg p-2 text-xs text-teal-700 mb-3"><i class="fas fa-mobile-alt mr-1"></i>${esc(data.customer_message || 'STK push sent. Confirm on your phone.')}</div><div class="text-xs text-slate-500 mb-3"><i class="fas fa-spinner fa-spin mr-1"></i>Waiting for confirmation...</div>`
+    const { data } = await api.post('/payments/initiate', { contract_id: id, amount: $('mpamt').value, phone: $('mpphone').value, provider })
+    $('payStatus').innerHTML = `<div class="bg-teal-50 border border-teal-200 rounded-lg p-2 text-xs text-teal-700 mb-3"><i class="fas fa-mobile-alt mr-1"></i>${esc(data.customer_message || 'Payment prompt sent. Confirm on your phone.')}</div><div class="text-xs text-slate-500 mb-3"><i class="fas fa-spinner fa-spin mr-1"></i>Waiting for confirmation...</div>`
     let tries = 0
     const poll = async () => {
       tries++
       try {
-        const { data: cd } = await api.post('/mpesa/confirm', { checkout_request_id: data.checkout_request_id })
+        const { data: cd } = await api.post('/payments/confirm', { checkout_request_id: data.checkout_request_id })
         if (cd.status === 'success') { closeModal(); toast((isCash ? 'Cash purchase complete! Receipt: ' : 'Payment received! Receipt: ') + cd.mpesa_receipt); state.route = 'contracts'; renderApp(); return }
         else if (cd.status === 'failed') { $('payStatus').innerHTML = `<div class="bg-red-50 border border-red-200 rounded-lg p-2 text-xs text-red-700 mb-3">${esc(cd.result_desc || 'Payment failed')}</div>`; btn.disabled = false; btn.classList.remove('opacity-50'); return }
       } catch (e) {}
@@ -551,28 +590,66 @@ window.doPay = async (id, kind) => {
 window.viewDoc = async (id) => {
   const { data } = await api.get('/documents/contract/' + id)
   const c = data.contract
-  const terms = data.terms || ''
-  const termsShort = terms.length > 200 ? esc(terms.slice(0, 200)) + '…' : esc(terms)
-  showModal(`<div class="text-center">
-    <h3 class="font-bold text-lg">Murabaha Agreement</h3>
-    <p class="text-xs text-slate-500 mb-3">${esc(c.contract_ref)}</p>
-    <img src="${data.qr}" class="mx-auto mb-3" alt="QR">
-    <div class="text-left text-sm bg-slate-50 p-4 rounded-lg space-y-1">
-      <p><b>Customer:</b> ${esc(c.customer_name)} (ID ${esc(c.national_id || '—')})</p>
-      <p><b>Product:</b> ${esc(c.product_name)} ×${c.quantity}</p>
-      <p><b>Supplier Cost:</b> ${fmt(c.supplier_cost)} · <b>Markup:</b> ${c.markup_pct}%</p>
-      <p><b>${c.payment_type === 'cash' ? 'Amount Payable' : 'Financed Price'} (fixed):</b> ${fmt(c.murabaha_price)}</p>
-      ${c.payment_type !== 'cash' && c.deposit_required ? `<p><b>Deposit Required:</b> ${fmt(c.deposit_required)}</p>` : ''}
-      <p class="text-xs italic text-slate-500 pt-2">Compliant with Murabaha principles. No interest, penalties, or compounding applied.</p>
+  const isCash = c.payment_type === 'cash'
+  const terms = (data.terms || '').trim()
+  // The document is the readable agreement itself: cash-purchase terms for a
+  // cash order, or finance terms for a financed (Murabaha) order. The QR code
+  // is demoted to a small verification stamp in the header — it is NOT the
+  // primary content any more.
+  const docTitle = isCash ? 'Cash Purchase Agreement' : 'Murabaha Financing Agreement'
+  const termsTitle = isCash ? 'Terms of Cash Purchase' : 'Finance Terms (Murabaha)'
+  const today = new Date().toISOString().slice(0, 10)
+  const termsHtml = terms
+    ? `<div class="text-sm text-slate-700 whitespace-pre-line leading-relaxed">${esc(terms)}</div>`
+    : `<p class="text-sm italic text-slate-400">No ${isCash ? 'cash purchase' : 'finance'} terms are recorded for this order.</p>`
+  showModal(`<div id="docContent" class="text-left">
+    <div class="flex justify-between items-start border-b border-slate-200 pb-3 mb-4">
+      <div>
+        <h3 class="font-bold text-lg text-slate-800">${docTitle}</h3>
+        <p class="text-xs text-slate-500 font-mono">${esc(c.contract_ref)}</p>
+        <p class="text-xs text-slate-400">Issued ${today} · ${isCash ? 'Cash Purchase' : 'Pay Later (Financing)'}</p>
+      </div>
+      <div class="text-center shrink-0 ml-3">
+        <img src="${data.qr}" class="w-16 h-16" alt="Verification QR" title="Scan to verify ${esc(c.contract_ref)}">
+        <p class="text-[9px] text-slate-400 mt-0.5">Verify</p>
+      </div>
     </div>
-    ${terms ? `<div class="text-left mt-3 border border-slate-200 rounded-lg p-3">
-      <p class="text-xs font-semibold text-slate-700 mb-1"><i class="fas fa-file-contract text-teal-600 mr-1"></i>Accepted Terms &amp; Conditions</p>
-      <p class="text-xs text-slate-600 whitespace-pre-line">${termsShort}</p>
-      ${terms.length > 200 ? `<button type="button" onclick="showTermsText(${JSON.stringify(terms).replace(/"/g,'&quot;')})" class="text-xs text-teal-600 hover:underline mt-1">Read more</button>` : ''}
-    </div>` : ''}
-    <button onclick="window.print()" class="btn mt-4 bg-slate-800 text-white px-5 py-2 rounded-lg text-sm"><i class="fas fa-print mr-1"></i>Print / Save PDF</button>
-    <button onclick="closeModal()" class="btn mt-4 ml-2 bg-slate-100 px-5 py-2 rounded-lg text-sm">Close</button>
+
+    <div class="grid grid-cols-2 gap-2 text-sm bg-slate-50 p-4 rounded-lg mb-4">
+      <p><span class="text-slate-500">Customer:</span> <b>${esc(c.customer_name)}</b></p>
+      <p><span class="text-slate-500">National ID:</span> <b>${esc(c.national_id || '—')}</b></p>
+      <p><span class="text-slate-500">Product:</span> <b>${esc(c.product_name)} ×${c.quantity}</b></p>
+      <p><span class="text-slate-500">County:</span> <b>${esc(c.county || '—')}</b></p>
+      <p><span class="text-slate-500">Supplier Cost:</span> <b>${fmt(c.supplier_cost)}</b></p>
+      <p><span class="text-slate-500">Markup:</span> <b>${c.markup_pct}%</b></p>
+      <p class="col-span-2 pt-1 border-t border-slate-200 mt-1"><span class="text-slate-500">${isCash ? 'Amount Payable' : 'Financed Price'} (fixed):</span> <b class="text-teal-700">${fmt(c.murabaha_price)}</b></p>
+      ${!isCash && c.deposit_required ? `<p><span class="text-slate-500">Deposit Required:</span> <b>${fmt(c.deposit_required)}</b></p>` : ''}
+      ${!isCash ? `<p><span class="text-slate-500">Outstanding:</span> <b>${fmt(c.outstanding)}</b></p>` : ''}
+    </div>
+
+    <div class="border border-slate-200 rounded-lg overflow-hidden mb-2">
+      <div class="bg-teal-600 text-white px-4 py-2 text-sm font-semibold"><i class="fas fa-file-contract mr-2"></i>${termsTitle}</div>
+      <div class="p-4 max-h-72 overflow-y-auto">${termsHtml}</div>
+    </div>
+    <p class="text-xs italic text-slate-500 mb-4">Sharia-compliant Murabaha agreement. The price is fixed at sale — no interest, penalties, or compounding are ever applied. This document constitutes your record of the agreed ${isCash ? 'cash purchase' : 'finance'} terms.</p>
+  </div>
+  <div class="flex gap-2">
+    <button onclick="printDoc()" class="btn flex-1 bg-slate-800 text-white py-2.5 rounded-lg text-sm"><i class="fas fa-print mr-1"></i>Print / Save PDF</button>
+    <button onclick="closeModal()" class="btn px-5 bg-slate-100 rounded-lg text-sm">Close</button>
   </div>`)
+}
+// Print just the document (terms agreement) cleanly.
+window.printDoc = () => {
+  const el = $('docContent')
+  if (!el) { window.print(); return }
+  const w = window.open('', '_blank')
+  w.document.write(`<html><head><title>Agreement</title>
+    <style>body{font-family:system-ui,Arial,sans-serif;color:#1e293b;padding:32px;line-height:1.5}
+    h3{margin:0 0 4px}img{width:80px;height:80px}.muted{color:#64748b;font-size:12px}
+    .box{border:1px solid #cbd5e1;border-radius:8px;padding:16px;margin-top:12px;white-space:pre-line;font-size:13px}
+    .grid{font-size:13px;background:#f8fafc;padding:12px;border-radius:8px;margin:12px 0}</style></head>
+    <body>${el.innerHTML}</body></html>`)
+  w.document.close(); w.focus(); setTimeout(() => { w.print(); w.close() }, 300)
 }
 
 // ---------------------------------------------------------------------------

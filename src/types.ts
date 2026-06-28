@@ -1,11 +1,13 @@
 import type { MpesaEnv } from './mpesa'
+import type { SasaPayEnv } from './sasapay'
+import type { KcbEnv } from './kcb'
 import type { SmsEnv } from './sms'
 import type { EmailEnv } from './email'
 
 // DB is Cloudflare D1 in the Workers build, and a D1-compatible SQLite
 // adapter (see db-sqlite.ts) in the Node server build. Typed loosely so
 // the same app code compiles in both environments.
-export type Bindings = MpesaEnv & SmsEnv & EmailEnv & {
+export type Bindings = MpesaEnv & SasaPayEnv & KcbEnv & SmsEnv & EmailEnv & {
   DB: any
 }
 

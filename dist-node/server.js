@@ -107,6 +107,185 @@ async function stkQuery(env, checkoutRequestId) {
   return await res.json();
 }
 
+// src/sasapay.ts
+var SANDBOX_BASE2 = "https://sandbox.sasapay.app/api/v1";
+var PROD_BASE2 = "https://api.sasapay.app/api/v1";
+function sasapayConfigured(env) {
+  return !!(env.SASAPAY_CLIENT_ID && env.SASAPAY_CLIENT_SECRET && env.SASAPAY_MERCHANT_CODE);
+}
+function baseUrl2(env) {
+  return env.SASAPAY_ENV === "production" ? PROD_BASE2 : SANDBOX_BASE2;
+}
+function b642(s) {
+  return btoa(s);
+}
+function normalizePhone2(phone) {
+  let p = String(phone || "").replace(/[^0-9]/g, "");
+  if (p.startsWith("0")) p = "254" + p.slice(1);
+  if (p.startsWith("7") && p.length === 9) p = "254" + p;
+  if (p.startsWith("1") && p.length === 9) p = "254" + p;
+  if (p.startsWith("2540")) p = "254" + p.slice(4);
+  return p;
+}
+async function getToken2(env) {
+  const auth = b642(`${env.SASAPAY_CLIENT_ID}:${env.SASAPAY_CLIENT_SECRET}`);
+  const res = await fetch(`${baseUrl2(env)}/auth/token/?grant_type=client_credentials`, {
+    headers: { Authorization: `Basic ${auth}` }
+  });
+  if (!res.ok) throw new Error("Failed to obtain SasaPay token: " + res.status);
+  const data = await res.json();
+  return data.access_token;
+}
+async function sasapayPush(env, opts) {
+  if (!sasapayConfigured(env)) {
+    return {
+      simulated: true,
+      success: true,
+      checkout_request_id: "SP_SIM_" + crypto.randomUUID().slice(0, 12),
+      merchant_request_id: "SPM_" + crypto.randomUUID().slice(0, 8),
+      customer_message: "Simulated SasaPay prompt sent. (Configure SasaPay keys for live payments.)"
+    };
+  }
+  try {
+    const token = await getToken2(env);
+    const phone = normalizePhone2(opts.phone);
+    const body = {
+      MerchantCode: env.SASAPAY_MERCHANT_CODE,
+      NetworkCode: opts.channel || "0",
+      // 0 = auto-detect (M-Pesa/Airtel/etc.)
+      PhoneNumber: phone,
+      TransactionDesc: opts.description.slice(0, 50),
+      AccountReference: opts.account.slice(0, 20),
+      Currency: "KES",
+      Amount: Math.max(1, Math.round(opts.amount)),
+      CallBackURL: env.SASAPAY_CALLBACK_URL || "https://example.com/api/payments/callback/sasapay"
+    };
+    const res = await fetch(`${baseUrl2(env)}/payments/request-payment/`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+      body: JSON.stringify(body)
+    });
+    const data = await res.json();
+    if (data.status === true || data.ResponseCode === "0") {
+      return {
+        simulated: false,
+        success: true,
+        checkout_request_id: data.CheckoutRequestID || data.MerchantRequestID || data.RequestId,
+        merchant_request_id: data.MerchantRequestID,
+        customer_message: data.detail || data.CustomerMessage || "SasaPay prompt sent. Enter your PIN on your phone."
+      };
+    }
+    return { simulated: false, success: false, error: data.detail || data.message || "SasaPay request failed" };
+  } catch (e) {
+    return { simulated: false, success: false, error: e.message || "SasaPay request failed" };
+  }
+}
+async function sasapayQuery(env, checkoutRequestId) {
+  if (!sasapayConfigured(env)) return { ResultCode: "0", ResultDesc: "Simulated success" };
+  try {
+    const token = await getToken2(env);
+    const res = await fetch(`${baseUrl2(env)}/payments/transaction-status/`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ MerchantCode: env.SASAPAY_MERCHANT_CODE, CheckoutRequestID: checkoutRequestId })
+    });
+    const data = await res.json();
+    const code = data.ResultCode ?? (data.status === true ? "0" : data.ResponseCode);
+    return { ResultCode: code, ResultDesc: data.detail || data.ResultDesc, receipt: data.MpesaReceiptNumber || data.TransactionCode };
+  } catch (e) {
+    return { ResultCode: void 0, ResultDesc: e.message };
+  }
+}
+
+// src/kcb.ts
+var SANDBOX_BASE3 = "https://uat.buni.kcbgroup.com";
+var PROD_BASE3 = "https://api.buni.kcbgroup.com";
+function kcbConfigured(env) {
+  return !!(env.KCB_CONSUMER_KEY && env.KCB_CONSUMER_SECRET && env.KCB_TILL_NUMBER);
+}
+function baseUrl3(env) {
+  return env.KCB_ENV === "production" ? PROD_BASE3 : SANDBOX_BASE3;
+}
+function b643(s) {
+  return btoa(s);
+}
+function normalizePhone3(phone) {
+  let p = String(phone || "").replace(/[^0-9]/g, "");
+  if (p.startsWith("0")) p = "254" + p.slice(1);
+  if (p.startsWith("7") && p.length === 9) p = "254" + p;
+  if (p.startsWith("1") && p.length === 9) p = "254" + p;
+  if (p.startsWith("2540")) p = "254" + p.slice(4);
+  return p;
+}
+async function getToken3(env) {
+  const auth = b643(`${env.KCB_CONSUMER_KEY}:${env.KCB_CONSUMER_SECRET}`);
+  const res = await fetch(`${baseUrl3(env)}/token/?grant_type=client_credentials`, {
+    headers: { Authorization: `Basic ${auth}` }
+  });
+  if (!res.ok) throw new Error("Failed to obtain KCB token: " + res.status);
+  const data = await res.json();
+  return data.access_token;
+}
+async function kcbPush(env, opts) {
+  if (!kcbConfigured(env)) {
+    return {
+      simulated: true,
+      success: true,
+      checkout_request_id: "KCB_SIM_" + crypto.randomUUID().slice(0, 12),
+      merchant_request_id: "KCBM_" + crypto.randomUUID().slice(0, 8),
+      customer_message: "Simulated KCB prompt sent. (Configure KCB Buni keys for live payments.)"
+    };
+  }
+  try {
+    const token = await getToken3(env);
+    const phone = normalizePhone3(opts.phone);
+    const body = {
+      phoneNumber: phone,
+      amount: String(Math.max(1, Math.round(opts.amount))),
+      invoiceNumber: opts.account.slice(0, 20),
+      sharedShortCode: true,
+      orgShortCode: env.KCB_TILL_NUMBER,
+      orgPassKey: env.KCB_CONSUMER_SECRET,
+      callbackUrl: env.KCB_CALLBACK_URL || "https://example.com/api/payments/callback/kcb",
+      transactionDescription: opts.description.slice(0, 50)
+    };
+    const res = await fetch(`${baseUrl3(env)}/mm/api/request/1.0.0/stkpush`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+      body: JSON.stringify(body)
+    });
+    const data = await res.json();
+    if (data.header?.statusCode === 0 || data.ResponseCode === "0" || data.responseCode === "0") {
+      return {
+        simulated: false,
+        success: true,
+        checkout_request_id: data.response?.CheckoutRequestID || data.CheckoutRequestID || data.transactionId,
+        merchant_request_id: data.response?.MerchantRequestID || data.MerchantRequestID,
+        customer_message: data.response?.CustomerMessage || data.header?.messages || "KCB prompt sent. Enter your PIN on your phone."
+      };
+    }
+    return { simulated: false, success: false, error: data.header?.messages || data.message || "KCB request failed" };
+  } catch (e) {
+    return { simulated: false, success: false, error: e.message || "KCB request failed" };
+  }
+}
+async function kcbQuery(env, checkoutRequestId) {
+  if (!kcbConfigured(env)) return { ResultCode: "0", ResultDesc: "Simulated success" };
+  try {
+    const token = await getToken3(env);
+    const res = await fetch(`${baseUrl3(env)}/mm/api/request/1.0.0/query`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ orgShortCode: env.KCB_TILL_NUMBER, CheckoutRequestID: checkoutRequestId })
+    });
+    const data = await res.json();
+    const code = data.ResultCode ?? data.response?.ResultCode ?? (data.header?.statusCode === 0 ? "0" : void 0);
+    return { ResultCode: code, ResultDesc: data.ResultDesc || data.header?.messages, receipt: data.MpesaReceiptNumber || data.response?.MpesaReceiptNumber };
+  } catch (e) {
+    return { ResultCode: void 0, ResultDesc: e.message };
+  }
+}
+
 // src/sms.ts
 var TALKSASA_DEFAULT_URL = "https://bulksms.talksasa.com/api/v3/sms/send";
 function smsProvider(env) {
@@ -872,6 +1051,125 @@ async function applyPayment(c, contract, amt, receipt, method, phone) {
   await c.env.DB.prepare(`UPDATE invoices SET status=? WHERE contract_id=?`).bind(newOutstanding <= 0 ? "paid" : "partial", contract.id).run();
   return { amount_paid: newPaid, outstanding: newOutstanding, status };
 }
+var PROVIDERS = {
+  mpesa: {
+    id: "mpesa",
+    label: "M-Pesa",
+    configured: mpesaConfigured,
+    push: (env, o) => stkPush(env, o),
+    query: async (env, id) => {
+      const q = await stkQuery(env, id);
+      return { ResultCode: q.ResultCode, ResultDesc: q.ResultDesc, receipt: void 0 };
+    }
+  },
+  sasapay: {
+    id: "sasapay",
+    label: "SasaPay",
+    configured: sasapayConfigured,
+    push: (env, o) => sasapayPush(env, o),
+    query: (env, id) => sasapayQuery(env, id)
+  },
+  kcb: {
+    id: "kcb",
+    label: "KCB",
+    configured: kcbConfigured,
+    push: (env, o) => kcbPush(env, o),
+    query: (env, id) => kcbQuery(env, id)
+  }
+};
+function getProvider(name) {
+  return PROVIDERS[String(name || "mpesa").toLowerCase()] || PROVIDERS.mpesa;
+}
+function genReceipt(provider, live) {
+  const prefix = provider === "sasapay" ? "SP" : provider === "kcb" ? "KCB" : "MP";
+  if (live) return prefix + "L" + Date.now().toString().slice(-7);
+  return prefix + Math.random().toString(36).slice(2, 9).toUpperCase();
+}
+app.get("/api/payments/providers", requireAuth, (c) => {
+  const providers = Object.values(PROVIDERS).map((p) => {
+    const live = p.configured(c.env);
+    return { id: p.id, label: p.label, live, mode: live ? "live" : "simulation" };
+  });
+  return c.json({ providers });
+});
+app.post("/api/payments/initiate", requireAuth, async (c) => {
+  const { contract_id, amount, phone, provider } = await c.req.json();
+  const prov = getProvider(provider);
+  const contract = await c.env.DB.prepare(`SELECT * FROM murabaha_contracts WHERE id=?`).bind(contract_id).first();
+  if (!contract) return c.json({ error: "Contract not found" }, 404);
+  if (contract.payment_type === "cash" && contract.status === "pending_payment") {
+    const p = await c.env.DB.prepare(`SELECT quantity FROM products WHERE id=?`).bind(contract.product_id).first();
+    if (!p || p.quantity < contract.quantity) return c.json({ error: "This item is now out of stock." }, 409);
+  } else if (contract.payment_type !== "cash" && contract.status !== "active") {
+    return c.json({ error: "This contract is not open for payment." }, 400);
+  }
+  const amt = Number(amount);
+  if (!amt || amt <= 0) return c.json({ error: "Invalid amount" }, 400);
+  if (contract.payment_type !== "cash" && amt > contract.outstanding) {
+    return c.json({ error: `Amount exceeds the outstanding balance of KES ${contract.outstanding}.` }, 400);
+  }
+  const payPhone = phone || c.get("user").phone;
+  const desc = contract.payment_type === "cash" ? "Cash Sale" : "Murabaha";
+  const result = await prov.push(c.env, { phone: payPhone, amount: amt, account: contract.contract_ref, description: desc });
+  if (!result.success) return c.json({ error: result.error || `${prov.label} request failed` }, 502);
+  await c.env.DB.prepare(`INSERT INTO payment_intents (checkout_request_id,merchant_request_id,contract_id,customer_id,amount,phone,method,status) VALUES (?,?,?,?,?,?,?, 'pending')`).bind(result.checkout_request_id, result.merchant_request_id || null, contract_id, contract.customer_id, amt, normalizePhone(payPhone), prov.id).run();
+  await audit(c, c.get("user").id, "payment_initiate", prov.id, `KES ${amt} to ${contract.contract_ref} (${result.simulated ? "sim" : "live"})`);
+  return c.json({ ok: true, provider: prov.id, simulated: result.simulated, checkout_request_id: result.checkout_request_id, customer_message: result.customer_message });
+});
+app.post("/api/payments/confirm", requireAuth, async (c) => {
+  const { checkout_request_id } = await c.req.json();
+  const intent = await c.env.DB.prepare(`SELECT * FROM payment_intents WHERE checkout_request_id=?`).bind(checkout_request_id).first();
+  if (!intent) return c.json({ error: "Payment intent not found" }, 404);
+  if (intent.status === "success") return c.json({ ok: true, status: "success", mpesa_receipt: intent.mpesa_receipt });
+  if (intent.status === "failed") return c.json({ ok: false, status: "failed", result_desc: intent.result_desc || "Payment failed" });
+  const prov = getProvider(intent.method);
+  const live = prov.configured(c.env);
+  let success = false, receipt = "";
+  if (!live || String(checkout_request_id).includes("SIM")) {
+    success = true;
+    receipt = genReceipt(prov.id, false);
+  } else {
+    const q = await prov.query(c.env, checkout_request_id);
+    if (q.ResultCode === "0" || q.ResultCode === 0) {
+      success = true;
+      receipt = q.receipt || genReceipt(prov.id, true);
+    } else if (q.ResultCode !== void 0 && q.ResultCode !== null) {
+      await c.env.DB.prepare(`UPDATE payment_intents SET status='failed', result_desc=? WHERE checkout_request_id=?`).bind(q.ResultDesc || "Payment not completed", checkout_request_id).run();
+      return c.json({ ok: false, status: "failed", result_desc: q.ResultDesc || "Payment not completed" });
+    } else return c.json({ ok: false, status: "pending" });
+  }
+  if (success) {
+    const contract = await c.env.DB.prepare(`SELECT * FROM murabaha_contracts WHERE id=?`).bind(intent.contract_id).first();
+    const res = await applyPayment(c, contract, intent.amount, receipt, prov.id, intent.phone);
+    await c.env.DB.prepare(`UPDATE payment_intents SET status='success', mpesa_receipt=? WHERE checkout_request_id=?`).bind(receipt, checkout_request_id).run();
+    return c.json({ ok: true, status: "success", provider: prov.id, mpesa_receipt: receipt, ...res });
+  }
+  return c.json({ ok: false, status: "pending" });
+});
+app.post("/api/payments/callback/:provider", async (c) => {
+  try {
+    const provName = c.req.param("provider");
+    const body = await c.req.json();
+    const cb = body?.Body?.stkCallback || body?.data || body;
+    const checkout = cb.CheckoutRequestID || cb.checkoutRequestId || cb.MerchantRequestID || body.CheckoutRequestID;
+    if (!checkout) return c.json({ ResultCode: 0, ResultDesc: "Accepted" });
+    const intent = await c.env.DB.prepare(`SELECT * FROM payment_intents WHERE checkout_request_id=?`).bind(checkout).first();
+    if (intent && intent.status === "pending") {
+      const code = cb.ResultCode ?? cb.resultCode ?? (cb.status === true ? 0 : cb.ResponseCode);
+      if (code === 0 || code === "0") {
+        const receipt = cb.MpesaReceiptNumber || cb.TransactionCode || cb.receipt || genReceipt(provName, true);
+        const contract = await c.env.DB.prepare(`SELECT * FROM murabaha_contracts WHERE id=?`).bind(intent.contract_id).first();
+        if (contract) await applyPayment(c, contract, intent.amount, String(receipt), provName, intent.phone);
+        await c.env.DB.prepare(`UPDATE payment_intents SET status='success', mpesa_receipt=?, result_desc=? WHERE checkout_request_id=?`).bind(String(receipt), cb.ResultDesc || "", checkout).run();
+      } else {
+        await c.env.DB.prepare(`UPDATE payment_intents SET status='failed', result_desc=? WHERE checkout_request_id=?`).bind(cb.ResultDesc || "Failed", checkout).run();
+      }
+    }
+    return c.json({ ResultCode: 0, ResultDesc: "Accepted" });
+  } catch (e) {
+    return c.json({ ResultCode: 0, ResultDesc: "Accepted" });
+  }
+});
 app.post("/api/mpesa/stkpush", requireAuth, async (c) => {
   const { contract_id, amount, phone } = await c.req.json();
   const contract = await c.env.DB.prepare(`SELECT * FROM murabaha_contracts WHERE id=?`).bind(contract_id).first();
@@ -1128,6 +1426,41 @@ app.get("/api/repayments", requireAuth, requireRole("admin", "super_admin", "sup
   ).all();
   return c.json({ repayments: results });
 });
+function buildDefaultTerms(ct) {
+  const money = (n) => "KES " + Number(n || 0).toLocaleString("en-KE");
+  if (ct.payment_type === "cash") {
+    return [
+      "TERMS OF CASH PURCHASE",
+      "",
+      `1. Parties. This agreement is between FarmSky Ventures ("the Seller") and ${ct.customer_name || "the Customer"} ("the Buyer").`,
+      `2. Goods. The Seller sells to the Buyer: ${ct.product_name} \xD7 ${ct.quantity}.`,
+      `3. Price. The total purchase price is ${money(ct.murabaha_price)}, payable in full at checkout. This price is fixed and final.`,
+      "4. Sharia Compliance (Murabaha). The price is a transparent cost-plus-markup sale. No interest (riba), penalties or compounding are charged at any time.",
+      "5. Payment. Payment is made via the customer's chosen channel (M-Pesa, SasaPay or KCB). Ownership and risk pass to the Buyer once payment is confirmed.",
+      "6. Delivery. Goods are delivered to the agreed location. The Buyer must inspect goods on receipt.",
+      "7. Title. The Seller warrants clear title to the goods, free of any encumbrance, at the time of sale.",
+      "8. Records. The contract reference and QR code on this document serve as proof of purchase for verification.",
+      "",
+      `Contract Reference: ${ct.contract_ref}`
+    ].join("\n");
+  }
+  return [
+    "MURABAHA FINANCE TERMS",
+    "",
+    `1. Parties. This agreement is between FarmSky Ventures ("the Financier/Seller") and ${ct.customer_name || "the Customer"} ("the Buyer").`,
+    `2. Goods. The Seller purchases and sells to the Buyer on deferred terms: ${ct.product_name} \xD7 ${ct.quantity}.`,
+    `3. Murabaha Sale Price. Cost ${money(ct.supplier_cost)} plus a disclosed markup of ${ct.markup_pct}%, giving a FIXED total sale price of ${money(ct.murabaha_price)}.`,
+    `4. Deposit. An initial deposit of ${money(ct.deposit_required)} is payable.`,
+    `5. Instalments. The balance is repaid over ${ct.term_months} month(s) at approximately ${money(ct.monthly_payment)} per month.`,
+    "6. Sharia Compliance. This is a Murabaha (cost-plus) sale, NOT a loan. The total price is fixed at the outset. No interest (riba), late penalties, or compounding are ever applied \u2014 including on late payment.",
+    "7. Payment Channels. Instalments may be paid via M-Pesa, SasaPay or KCB.",
+    "8. Ownership. The Seller owns the goods before sale; ownership transfers to the Buyer upon execution of this Murabaha contract.",
+    "9. Default. In case of difficulty, the Buyer should contact FarmSky to agree a revised schedule. No additional charges accrue on the outstanding amount.",
+    "10. Records. The contract reference and QR code on this document serve as proof of the agreement for verification.",
+    "",
+    `Contract Reference: ${ct.contract_ref}`
+  ].join("\n");
+}
 app.get("/api/documents/:type/:id", requireAuth, async (c) => {
   const type = c.req.param("type"), id = c.req.param("id");
   const contract = await c.env.DB.prepare(
@@ -1135,8 +1468,18 @@ app.get("/api/documents/:type/:id", requireAuth, async (c) => {
      FROM murabaha_contracts mc JOIN products p ON p.id=mc.product_id JOIN customers cu ON cu.id=mc.customer_id WHERE mc.id=?`
   ).bind(id).first();
   if (!contract) return c.json({ error: "Not found" }, 404);
-  const terms = contract.accepted_terms || (contract.payment_type === "cash" ? contract.cash_terms : contract.finance_terms) || "";
-  return c.json({ type, contract, terms, txn_id: contract.contract_ref, qr: `https://api.qrserver.com/v1/create-qr-code/?size=120x120&data=${contract.contract_ref}` });
+  const stored = (contract.accepted_terms || (contract.payment_type === "cash" ? contract.cash_terms : contract.finance_terms) || "").trim();
+  const terms = stored || buildDefaultTerms(contract);
+  const generated = !stored;
+  return c.json({
+    type,
+    contract,
+    terms,
+    generated,
+    doc_kind: contract.payment_type === "cash" ? "cash_purchase" : "finance",
+    txn_id: contract.contract_ref,
+    qr: `https://api.qrserver.com/v1/create-qr-code/?size=120x120&data=${encodeURIComponent(contract.contract_ref)}`
+  });
 });
 var EXPORT_DATASETS = {
   users: {
@@ -1256,13 +1599,13 @@ app.post("/api/export/email", requireAuth, requireRole("admin", "super_admin"), 
   try {
     const out = await buildExport(c, dataset, filters || {}, date_from, date_to);
     const csv = toCsv(out.cols, out.rows);
-    const b642 = base64Utf8(csv);
+    const b644 = base64Utf8(csv);
     const fname = `farmsky-${dataset}-${(/* @__PURE__ */ new Date()).toISOString().slice(0, 10)}.csv`;
     const r = await sendEmail(c.env, {
       to,
       subject: `Farmsky export \u2014 ${out.label} (${out.rows.length} rows)`,
       text: `Attached is the ${out.label} export you requested from Farmsky (${out.rows.length} rows).`,
-      attachments: [{ filename: fname, contentBase64: b642, contentType: "text/csv" }]
+      attachments: [{ filename: fname, contentBase64: b644, contentType: "text/csv" }]
     });
     if (!r.success) return c.json({ error: r.error || "Email send failed" }, 502);
     await audit(c, c.get("user").id, "export_email", dataset, `to ${to}`);
@@ -1465,6 +1808,18 @@ async function main() {
     MPESA_PASSKEY: process.env.MPESA_PASSKEY,
     MPESA_ENV: process.env.MPESA_ENV,
     MPESA_CALLBACK_URL: process.env.MPESA_CALLBACK_URL,
+    // SasaPay (alternative payment provider)
+    SASAPAY_CLIENT_ID: process.env.SASAPAY_CLIENT_ID,
+    SASAPAY_CLIENT_SECRET: process.env.SASAPAY_CLIENT_SECRET,
+    SASAPAY_MERCHANT_CODE: process.env.SASAPAY_MERCHANT_CODE,
+    SASAPAY_ENV: process.env.SASAPAY_ENV,
+    SASAPAY_CALLBACK_URL: process.env.SASAPAY_CALLBACK_URL,
+    // KCB Buni (alternative payment provider)
+    KCB_CONSUMER_KEY: process.env.KCB_CONSUMER_KEY,
+    KCB_CONSUMER_SECRET: process.env.KCB_CONSUMER_SECRET,
+    KCB_TILL_NUMBER: process.env.KCB_TILL_NUMBER,
+    KCB_ENV: process.env.KCB_ENV,
+    KCB_CALLBACK_URL: process.env.KCB_CALLBACK_URL,
     // SMS OTP provider (TalkSASA by default)
     SMS_PROVIDER: process.env.SMS_PROVIDER,
     SMS_API_URL: process.env.SMS_API_URL,
