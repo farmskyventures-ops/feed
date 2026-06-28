@@ -3,6 +3,8 @@ import { cors } from 'hono/cors'
 import { getCookie, setCookie, deleteCookie } from 'hono/cookie'
 import type { Bindings, SessionUser } from './types'
 import { stkPush, stkQuery, mpesaConfigured, normalizePhone } from './mpesa'
+import { sasapayPush, sasapayQuery, sasapayConfigured } from './sasapay'
+import { kcbPush, kcbQuery, kcbConfigured } from './kcb'
 import { sendSms, smsConfigured, generateOtp } from './sms'
 import { sendEmail, emailConfigured } from './email'
 
@@ -565,6 +567,142 @@ async function applyPayment(c: any, contract: any, amt: number, receipt: string,
   await c.env.DB.prepare(`UPDATE invoices SET status=? WHERE contract_id=?`).bind(newOutstanding <= 0 ? 'paid' : 'partial', contract.id).run()
   return { amount_paid: newPaid, outstanding: newOutstanding, status }
 }
+// ----------------------------------------------------------------------------
+// Unified payment-provider layer: M-Pesa, SasaPay and KCB all behave the same
+// way (initiate a phone STK prompt -> poll for completion). Each provider has
+// the same shape so the rest of the app can treat them interchangeably.
+// ----------------------------------------------------------------------------
+type PaymentProvider = {
+  id: string
+  label: string
+  configured: (env: any) => boolean
+  push: (env: any, opts: { phone: string; amount: number; account: string; description: string }) => Promise<any>
+  query: (env: any, id: string) => Promise<any>
+}
+const PROVIDERS: Record<string, PaymentProvider> = {
+  mpesa: {
+    id: 'mpesa', label: 'M-Pesa',
+    configured: mpesaConfigured,
+    push: (env, o) => stkPush(env, o),
+    query: async (env, id) => { const q = await stkQuery(env, id); return { ResultCode: q.ResultCode, ResultDesc: q.ResultDesc, receipt: undefined } }
+  },
+  sasapay: {
+    id: 'sasapay', label: 'SasaPay',
+    configured: sasapayConfigured,
+    push: (env, o) => sasapayPush(env, o),
+    query: (env, id) => sasapayQuery(env, id)
+  },
+  kcb: {
+    id: 'kcb', label: 'KCB',
+    configured: kcbConfigured,
+    push: (env, o) => kcbPush(env, o),
+    query: (env, id) => kcbQuery(env, id)
+  }
+}
+function getProvider(name?: string): PaymentProvider {
+  return PROVIDERS[String(name || 'mpesa').toLowerCase()] || PROVIDERS.mpesa
+}
+function genReceipt(provider: string, live: boolean): string {
+  const prefix = provider === 'sasapay' ? 'SP' : provider === 'kcb' ? 'KCB' : 'MP'
+  if (live) return prefix + 'L' + Date.now().toString().slice(-7)
+  return prefix + Math.random().toString(36).slice(2, 9).toUpperCase()
+}
+
+// List the available payment providers and whether each is live or simulated.
+app.get('/api/payments/providers', requireAuth, (c) => {
+  const providers = Object.values(PROVIDERS).map((p) => {
+    const live = p.configured(c.env)
+    return { id: p.id, label: p.label, live, mode: live ? 'live' : 'simulation' }
+  })
+  return c.json({ providers })
+})
+
+// Generalised payment initiation — works for any provider (M-Pesa/SasaPay/KCB),
+// for both cash checkout and loan repayment.
+app.post('/api/payments/initiate', requireAuth, async (c) => {
+  const { contract_id, amount, phone, provider } = await c.req.json()
+  const prov = getProvider(provider)
+  const contract = await c.env.DB.prepare(`SELECT * FROM murabaha_contracts WHERE id=?`).bind(contract_id).first<any>()
+  if (!contract) return c.json({ error: 'Contract not found' }, 404)
+  // Cash checkout: must be awaiting payment, and stock must still be available.
+  if (contract.payment_type === 'cash' && contract.status === 'pending_payment') {
+    const p = await c.env.DB.prepare(`SELECT quantity FROM products WHERE id=?`).bind(contract.product_id).first<any>()
+    if (!p || p.quantity < contract.quantity) return c.json({ error: 'This item is now out of stock.' }, 409)
+  } else if (contract.payment_type !== 'cash' && contract.status !== 'active') {
+    return c.json({ error: 'This contract is not open for payment.' }, 400)
+  }
+  const amt = Number(amount)
+  if (!amt || amt <= 0) return c.json({ error: 'Invalid amount' }, 400)
+  if (contract.payment_type !== 'cash' && amt > contract.outstanding) {
+    return c.json({ error: `Amount exceeds the outstanding balance of KES ${contract.outstanding}.` }, 400)
+  }
+  const payPhone = phone || c.get('user').phone
+  const desc = contract.payment_type === 'cash' ? 'Cash Sale' : 'Murabaha'
+  const result = await prov.push(c.env, { phone: payPhone, amount: amt, account: contract.contract_ref, description: desc })
+  if (!result.success) return c.json({ error: result.error || `${prov.label} request failed` }, 502)
+  await c.env.DB.prepare(`INSERT INTO payment_intents (checkout_request_id,merchant_request_id,contract_id,customer_id,amount,phone,method,status) VALUES (?,?,?,?,?,?,?, 'pending')`)
+    .bind(result.checkout_request_id, result.merchant_request_id || null, contract_id, contract.customer_id, amt, normalizePhone(payPhone), prov.id).run()
+  await audit(c, c.get('user').id, 'payment_initiate', prov.id, `KES ${amt} to ${contract.contract_ref} (${result.simulated ? 'sim' : 'live'})`)
+  return c.json({ ok: true, provider: prov.id, simulated: result.simulated, checkout_request_id: result.checkout_request_id, customer_message: result.customer_message })
+})
+
+// Generalised payment confirmation — polls the provider for the result and,
+// on success, settles the cash sale or applies the loan repayment.
+app.post('/api/payments/confirm', requireAuth, async (c) => {
+  const { checkout_request_id } = await c.req.json()
+  const intent = await c.env.DB.prepare(`SELECT * FROM payment_intents WHERE checkout_request_id=?`).bind(checkout_request_id).first<any>()
+  if (!intent) return c.json({ error: 'Payment intent not found' }, 404)
+  if (intent.status === 'success') return c.json({ ok: true, status: 'success', mpesa_receipt: intent.mpesa_receipt })
+  if (intent.status === 'failed') return c.json({ ok: false, status: 'failed', result_desc: intent.result_desc || 'Payment failed' })
+  const prov = getProvider(intent.method)
+  const live = prov.configured(c.env)
+  let success = false, receipt = ''
+  if (!live || String(checkout_request_id).includes('SIM')) {
+    success = true; receipt = genReceipt(prov.id, false)
+  } else {
+    const q = await prov.query(c.env, checkout_request_id)
+    if (q.ResultCode === '0' || q.ResultCode === 0) { success = true; receipt = q.receipt || genReceipt(prov.id, true) }
+    else if (q.ResultCode !== undefined && q.ResultCode !== null) {
+      await c.env.DB.prepare(`UPDATE payment_intents SET status='failed', result_desc=? WHERE checkout_request_id=?`).bind(q.ResultDesc || 'Payment not completed', checkout_request_id).run()
+      return c.json({ ok: false, status: 'failed', result_desc: q.ResultDesc || 'Payment not completed' })
+    } else return c.json({ ok: false, status: 'pending' })
+  }
+  if (success) {
+    const contract = await c.env.DB.prepare(`SELECT * FROM murabaha_contracts WHERE id=?`).bind(intent.contract_id).first<any>()
+    const res = await applyPayment(c, contract, intent.amount, receipt, prov.id, intent.phone)
+    await c.env.DB.prepare(`UPDATE payment_intents SET status='success', mpesa_receipt=? WHERE checkout_request_id=?`).bind(receipt, checkout_request_id).run()
+    return c.json({ ok: true, status: 'success', provider: prov.id, mpesa_receipt: receipt, ...res })
+  }
+  return c.json({ ok: false, status: 'pending' })
+})
+
+// Generalised async webhook for SasaPay / KCB (and any future provider).
+app.post('/api/payments/callback/:provider', async (c) => {
+  try {
+    const provName = c.req.param('provider')
+    const body: any = await c.req.json()
+    // Different providers nest the result differently; try the common shapes.
+    const cb = body?.Body?.stkCallback || body?.data || body
+    const checkout = cb.CheckoutRequestID || cb.checkoutRequestId || cb.MerchantRequestID || body.CheckoutRequestID
+    if (!checkout) return c.json({ ResultCode: 0, ResultDesc: 'Accepted' })
+    const intent = await c.env.DB.prepare(`SELECT * FROM payment_intents WHERE checkout_request_id=?`).bind(checkout).first<any>()
+    if (intent && intent.status === 'pending') {
+      const code = cb.ResultCode ?? cb.resultCode ?? (cb.status === true ? 0 : cb.ResponseCode)
+      if (code === 0 || code === '0') {
+        const receipt = cb.MpesaReceiptNumber || cb.TransactionCode || cb.receipt || genReceipt(provName, true)
+        const contract = await c.env.DB.prepare(`SELECT * FROM murabaha_contracts WHERE id=?`).bind(intent.contract_id).first<any>()
+        if (contract) await applyPayment(c, contract, intent.amount, String(receipt), provName, intent.phone)
+        await c.env.DB.prepare(`UPDATE payment_intents SET status='success', mpesa_receipt=?, result_desc=? WHERE checkout_request_id=?`).bind(String(receipt), cb.ResultDesc || '', checkout).run()
+      } else {
+        await c.env.DB.prepare(`UPDATE payment_intents SET status='failed', result_desc=? WHERE checkout_request_id=?`).bind(cb.ResultDesc || 'Failed', checkout).run()
+      }
+    }
+    return c.json({ ResultCode: 0, ResultDesc: 'Accepted' })
+  } catch (e) {
+    return c.json({ ResultCode: 0, ResultDesc: 'Accepted' })
+  }
+})
+
 app.post('/api/mpesa/stkpush', requireAuth, async (c) => {
   const { contract_id, amount, phone } = await c.req.json()
   const contract = await c.env.DB.prepare(`SELECT * FROM murabaha_contracts WHERE id=?`).bind(contract_id).first<any>()
@@ -828,6 +966,44 @@ app.get('/api/repayments', requireAuth, requireRole('admin', 'super_admin', 'sup
   ).all()
   return c.json({ repayments: results })
 })
+// Build a complete, readable default agreement when a product has no custom
+// terms, so every order always shows a proper Cash Purchase / Finance document
+// (not just a QR code) when the customer comes back to view their orders.
+function buildDefaultTerms(ct: any): string {
+  const money = (n: number) => 'KES ' + Number(n || 0).toLocaleString('en-KE')
+  if (ct.payment_type === 'cash') {
+    return [
+      'TERMS OF CASH PURCHASE',
+      '',
+      `1. Parties. This agreement is between FarmSky Ventures ("the Seller") and ${ct.customer_name || 'the Customer'} ("the Buyer").`,
+      `2. Goods. The Seller sells to the Buyer: ${ct.product_name} × ${ct.quantity}.`,
+      `3. Price. The total purchase price is ${money(ct.murabaha_price)}, payable in full at checkout. This price is fixed and final.`,
+      '4. Sharia Compliance (Murabaha). The price is a transparent cost-plus-markup sale. No interest (riba), penalties or compounding are charged at any time.',
+      '5. Payment. Payment is made via the customer\'s chosen channel (M-Pesa, SasaPay or KCB). Ownership and risk pass to the Buyer once payment is confirmed.',
+      '6. Delivery. Goods are delivered to the agreed location. The Buyer must inspect goods on receipt.',
+      '7. Title. The Seller warrants clear title to the goods, free of any encumbrance, at the time of sale.',
+      '8. Records. The contract reference and QR code on this document serve as proof of purchase for verification.',
+      '',
+      `Contract Reference: ${ct.contract_ref}`
+    ].join('\n')
+  }
+  return [
+    'MURABAHA FINANCE TERMS',
+    '',
+    `1. Parties. This agreement is between FarmSky Ventures ("the Financier/Seller") and ${ct.customer_name || 'the Customer'} ("the Buyer").`,
+    `2. Goods. The Seller purchases and sells to the Buyer on deferred terms: ${ct.product_name} × ${ct.quantity}.`,
+    `3. Murabaha Sale Price. Cost ${money(ct.supplier_cost)} plus a disclosed markup of ${ct.markup_pct}%, giving a FIXED total sale price of ${money(ct.murabaha_price)}.`,
+    `4. Deposit. An initial deposit of ${money(ct.deposit_required)} is payable.`,
+    `5. Instalments. The balance is repaid over ${ct.term_months} month(s) at approximately ${money(ct.monthly_payment)} per month.`,
+    '6. Sharia Compliance. This is a Murabaha (cost-plus) sale, NOT a loan. The total price is fixed at the outset. No interest (riba), late penalties, or compounding are ever applied — including on late payment.',
+    '7. Payment Channels. Instalments may be paid via M-Pesa, SasaPay or KCB.',
+    '8. Ownership. The Seller owns the goods before sale; ownership transfers to the Buyer upon execution of this Murabaha contract.',
+    '9. Default. In case of difficulty, the Buyer should contact FarmSky to agree a revised schedule. No additional charges accrue on the outstanding amount.',
+    '10. Records. The contract reference and QR code on this document serve as proof of the agreement for verification.',
+    '',
+    `Contract Reference: ${ct.contract_ref}`
+  ].join('\n')
+}
 // Documents
 app.get('/api/documents/:type/:id', requireAuth, async (c) => {
   const type = c.req.param('type'), id = c.req.param('id')
@@ -836,10 +1012,18 @@ app.get('/api/documents/:type/:id', requireAuth, async (c) => {
      FROM murabaha_contracts mc JOIN products p ON p.id=mc.product_id JOIN customers cu ON cu.id=mc.customer_id WHERE mc.id=?`
   ).bind(id).first<any>()
   if (!contract) return c.json({ error: 'Not found' }, 404)
-  // Prefer the snapshot accepted at checkout; fall back to the product's
-  // current terms for the relevant payment type.
-  const terms = contract.accepted_terms || (contract.payment_type === 'cash' ? contract.cash_terms : contract.finance_terms) || ''
-  return c.json({ type, contract, terms, txn_id: contract.contract_ref, qr: `https://api.qrserver.com/v1/create-qr-code/?size=120x120&data=${contract.contract_ref}` })
+  // Prefer the snapshot accepted at checkout; then the product's current terms
+  // for the relevant payment type; finally a generated default agreement so the
+  // document is always a readable contract, never an empty page with a QR code.
+  const stored = (contract.accepted_terms || (contract.payment_type === 'cash' ? contract.cash_terms : contract.finance_terms) || '').trim()
+  const terms = stored || buildDefaultTerms(contract)
+  const generated = !stored
+  return c.json({
+    type, contract, terms, generated,
+    doc_kind: contract.payment_type === 'cash' ? 'cash_purchase' : 'finance',
+    txn_id: contract.contract_ref,
+    qr: `https://api.qrserver.com/v1/create-qr-code/?size=120x120&data=${encodeURIComponent(contract.contract_ref)}`
+  })
 })
 
 // ----------------------------------------------------------------------------
