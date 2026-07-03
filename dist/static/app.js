@@ -201,6 +201,7 @@ function navItems() {
     { k: 'agents', i: 'fa-user-tie', t: 'Agents' },
     { k: 'users', i: 'fa-user-gear', t: 'User Accounts' },
     { k: 'repayments', i: 'fa-money-bill-wave', t: 'Repayments' },
+    { k: 'settings', i: 'fa-sliders', t: 'Financing Settings' },
     { k: 'exports', i: 'fa-database', t: 'Data Export' },
     { k: 'profile', i: 'fa-id-badge', t: 'My Profile' }]
   if (r === 'agent') return [...common,
@@ -264,9 +265,9 @@ window.toggleSidebar = (open) => {
 }
 window.go = (r) => { state.route = r; toggleSidebar(false); renderApp() }
 function route() {
-  const titles = { dashboard: 'Dashboard', approvals: 'Murabaha Approvals', inventory: 'Inventory Management', customers: 'Customers', contracts: 'Contracts', agents: 'Agent Management', users: 'User Accounts', repayments: 'Repayment Performance', onboard: 'Customer Onboarding', shop: 'Shop', exports: 'Data Export & Reports', profile: 'My Profile & Settings' }
+  const titles = { dashboard: 'Dashboard', approvals: 'Murabaha Approvals', inventory: 'Inventory Management', customers: 'Customers', contracts: 'Contracts', agents: 'Agent Management', users: 'User Accounts', repayments: 'Repayment Performance', onboard: 'Customer Onboarding', shop: 'Shop', exports: 'Data Export & Reports', settings: 'Financing & Markup Settings', profile: 'My Profile & Settings' }
   $('pageTitle').textContent = titles[state.route] || 'Dashboard'
-  const map = { dashboard: viewDashboard, approvals: viewApprovals, inventory: viewInventory, customers: viewCustomers, contracts: viewContracts, agents: viewAgents, users: viewUsers, repayments: viewRepayments, onboard: viewOnboard, shop: viewShop, exports: viewExports, profile: viewProfile }
+  const map = { dashboard: viewDashboard, approvals: viewApprovals, inventory: viewInventory, customers: viewCustomers, contracts: viewContracts, agents: viewAgents, users: viewUsers, repayments: viewRepayments, onboard: viewOnboard, shop: viewShop, exports: viewExports, settings: viewSettings, profile: viewProfile }
   ;(map[state.route] || viewDashboard)()
 }
 
@@ -507,11 +508,11 @@ window.contractDetail = async (id) => {
       <button onclick="closeModal()" class="btn px-4 bg-slate-100 rounded-lg text-sm">Close</button>
     </div>`)
 }
-// Brand colours / icons for each payment provider used in the selector.
+// Brand colours / logos for each payment provider used in the selector.
+// KCB (Buni) is intentionally omitted — it is hidden from the frontend.
 const PROVIDER_META = {
-  mpesa:   { label: 'M-Pesa',  icon: 'fa-mobile-screen-button', color: '#43b02a' },
-  sasapay: { label: 'SasaPay', icon: 'fa-wallet',               color: '#0a7d3e' },
-  kcb:     { label: 'KCB',     icon: 'fa-building-columns',      color: '#00a651' }
+  mpesa:   { label: 'M-Pesa',  logo: '/static/mpesa-logo.svg',   color: '#43b02a' },
+  sasapay: { label: 'SasaPay', logo: '/static/sasapay-logo.svg', color: '#0a7d3e' }
 }
 window.payState = { provider: 'mpesa', providers: [] }
 window.selectProvider = (pid) => {
@@ -535,17 +536,21 @@ window.payModal = async (id, amount, outstanding, kind) => {
   // Load the available providers (M-Pesa / SasaPay / KCB) and their live/sim mode.
   let providers = [
     { id: 'mpesa', label: 'M-Pesa', live: false, mode: 'simulation' },
-    { id: 'sasapay', label: 'SasaPay', live: false, mode: 'simulation' },
-    { id: 'kcb', label: 'KCB', live: false, mode: 'simulation' }
+    { id: 'sasapay', label: 'SasaPay', live: false, mode: 'simulation' }
   ]
   try { providers = (await api.get('/payments/providers')).data.providers || providers } catch {}
+  // Safety net: never render hidden providers (e.g. KCB / Buni) in the UI.
+  providers = providers.filter(p => PROVIDER_META[p.id])
+  if (!providers.length) providers = [{ id: 'mpesa', label: 'M-Pesa', live: false, mode: 'simulation' }]
   window.payState = { provider: providers[0].id, providers }
   const cards = providers.map(p => {
-    const m = PROVIDER_META[p.id] || { label: p.label, icon: 'fa-credit-card', color: '#0d9488' }
+    const m = PROVIDER_META[p.id] || { label: p.label, logo: null, color: '#0d9488' }
+    const visual = m.logo
+      ? `<img src="${m.logo}" alt="${esc(m.label)}" class="h-8 object-contain" style="max-width:110px">`
+      : `<i class="fas fa-credit-card text-xl" style="color:${m.color}"></i><span class="text-xs font-semibold text-slate-700">${esc(m.label)}</span>`
     return `<button type="button" data-prov="${p.id}" onclick="selectProvider('${p.id}')"
-      class="btn flex-1 border border-slate-300 rounded-lg p-3 flex flex-col items-center gap-1 text-center transition">
-      <i class="fas ${m.icon} text-xl" style="color:${m.color}"></i>
-      <span class="text-xs font-semibold text-slate-700">${esc(m.label)}</span>
+      class="btn flex-1 border border-slate-300 rounded-lg p-3 flex flex-col items-center justify-center gap-1 text-center transition">
+      ${visual}
       <span class="text-[10px] ${p.live ? 'text-emerald-600' : 'text-amber-600'}">${p.live ? 'Live' : 'Demo'}</span>
     </button>`
   }).join('')
@@ -1203,6 +1208,125 @@ async function viewAgents() {
   </table></div>`
 }
 // ---------------------------------------------------------------------------
+// FINANCING & MARKUP SETTINGS  (Processing Fee: percentage OR tiered range)
+// ---------------------------------------------------------------------------
+let _feeCfg = { mode: 'none', percentage_rate: 0, tiers: [] }
+let _canManageFees = false, _canManageMarkup = false
+async function viewSettings() {
+  let data
+  try { data = (await api.get('/settings/financing')).data }
+  catch (err) { $('content').innerHTML = `<div class="card p-6 text-red-600 text-sm">${esc(err.response?.data?.error || 'Failed to load settings')}</div>`; return }
+  _feeCfg = data.processing_fee || { mode: 'none', percentage_rate: 0, tiers: [] }
+  if (!Array.isArray(_feeCfg.tiers)) _feeCfg.tiers = []
+  _canManageFees = !!data.can_manage_processing_fees
+  _canManageMarkup = !!data.can_manage_markup
+  const mk = data.finance_markup || { default_markup_pct: 20 }
+  $('content').innerHTML = `
+    <div class="space-y-6 max-w-3xl">
+      <!-- Global Markup -->
+      <div class="card p-6">
+        <h3 class="font-bold text-slate-800 mb-1"><i class="fas fa-percent text-teal-600 mr-2"></i>Financing Markup</h3>
+        <p class="text-xs text-slate-500 mb-4">Default Murabaha markup applied to financed sales. Individual products can override this on their own form.</p>
+        <div class="flex items-end gap-3">
+          <div class="field-group">
+            <label class="field-label">Default Finance Markup (%)</label>
+            <input id="set_markup" type="number" step="0.1" value="${mk.default_markup_pct ?? 20}" ${_canManageMarkup ? '' : 'disabled'} class="w-40 px-3 py-2 border rounded-lg ${_canManageMarkup ? '' : 'bg-slate-100'}">
+          </div>
+          ${_canManageMarkup
+            ? `<button onclick="saveMarkup()" class="btn brand-bg text-white px-5 py-2 rounded-lg text-sm">Save Markup</button>`
+            : `<span class="text-xs text-amber-600 pb-2"><i class="fas fa-lock mr-1"></i>You lack the "Manage Markup Percentage" permission.</span>`}
+        </div>
+      </div>
+
+      <!-- Processing Fee -->
+      <div class="card p-6">
+        <h3 class="font-bold text-slate-800 mb-1"><i class="fas fa-file-invoice-dollar text-teal-600 mr-2"></i>Processing Fee</h3>
+        <p class="text-xs text-slate-500 mb-4">A fee charged on the amount financed (borrowed). Choose a single structure below.</p>
+        <div class="flex flex-wrap gap-3 mb-5">
+          ${feeModeCard('none', 'No Fee', 'fa-ban', 'No processing fee is charged.')}
+          ${feeModeCard('percentage', 'Percentage', 'fa-percent', 'A flat % of the amount borrowed.')}
+          ${feeModeCard('tiered', 'Tiered Range', 'fa-table-list', 'A flat fee based on the amount bracket.')}
+        </div>
+        <div id="feeConfig"></div>
+        ${_canManageFees
+          ? `<div class="flex gap-2 mt-5"><button onclick="saveProcessingFee()" class="btn brand-bg text-white px-5 py-2 rounded-lg text-sm">Save Processing Fee</button></div>`
+          : `<p class="text-xs text-amber-600 mt-4"><i class="fas fa-lock mr-1"></i>You lack the "Manage Processing Fees" permission — settings are read-only.</p>`}
+      </div>
+    </div>`
+  renderFeeConfig()
+}
+function feeModeCard(mode, label, icon, desc) {
+  const active = _feeCfg.mode === mode
+  const clickable = _canManageFees ? `onclick="setFeeMode('${mode}')"` : ''
+  return `<button type="button" data-feemode="${mode}" ${clickable}
+    class="btn text-left border rounded-lg p-3 flex-1 min-w-[160px] transition ${active ? 'ring-2 ring-teal-500 border-teal-500 bg-teal-50' : 'border-slate-300'} ${_canManageFees ? '' : 'cursor-not-allowed opacity-80'}">
+    <div class="font-semibold text-sm text-slate-800"><i class="fas ${icon} text-teal-600 mr-1"></i>${esc(label)}</div>
+    <div class="text-[11px] text-slate-500 mt-1">${esc(desc)}</div>
+  </button>`
+}
+window.setFeeMode = (mode) => {
+  if (!_canManageFees) return
+  _feeCfg.mode = mode
+  document.querySelectorAll('[data-feemode]').forEach(el => {
+    const on = el.getAttribute('data-feemode') === mode
+    el.classList.toggle('ring-2', on); el.classList.toggle('ring-teal-500', on)
+    el.classList.toggle('border-teal-500', on); el.classList.toggle('bg-teal-50', on)
+  })
+  renderFeeConfig()
+}
+function renderFeeConfig() {
+  const el = $('feeConfig'); if (!el) return
+  const ro = _canManageFees ? '' : 'disabled'
+  if (_feeCfg.mode === 'percentage') {
+    el.innerHTML = `<div class="field-group">
+      <label class="field-label">Processing Fee Rate (%)</label>
+      <input id="fee_pct" type="number" step="0.1" min="0" value="${_feeCfg.percentage_rate ?? 0}" ${ro} class="w-48 px-3 py-2 border rounded-lg ${ro ? 'bg-slate-100' : ''}" placeholder="e.g. 2.5">
+      <p class="text-[11px] text-slate-500 mt-1">Charged as this percentage of the amount borrowed.</p>
+    </div>`
+  } else if (_feeCfg.mode === 'tiered') {
+    el.innerHTML = `
+      <div class="overflow-x-auto">
+        <table class="w-full text-sm border border-slate-200 rounded-lg">
+          <thead class="bg-slate-50 text-slate-500 text-xs"><tr>
+            <th class="text-left px-3 py-2">From (KES)</th><th class="text-left px-3 py-2">To (KES)</th>
+            <th class="text-left px-3 py-2">Flat Fee (KES)</th><th class="px-3 py-2"></th></tr></thead>
+          <tbody id="tierRows"></tbody>
+        </table>
+      </div>
+      ${_canManageFees ? `<button onclick="addTier()" class="btn mt-3 bg-slate-800 text-white px-4 py-2 rounded-lg text-xs"><i class="fas fa-plus mr-1"></i>Add Tier</button>` : ''}
+      <p class="text-[11px] text-slate-500 mt-2">Example: <b>100,000</b> to <b>200,000</b> → Flat Fee <b>8,000</b>. Leave "To" blank for an open-ended top tier.</p>`
+    renderTierRows()
+  } else {
+    el.innerHTML = `<p class="text-sm text-slate-500 italic">No processing fee will be charged.</p>`
+  }
+}
+function renderTierRows() {
+  const tb = $('tierRows'); if (!tb) return
+  const ro = _canManageFees ? '' : 'disabled'
+  if (!_feeCfg.tiers.length) { tb.innerHTML = `<tr><td colspan="4" class="text-center text-slate-400 py-4 text-xs">No tiers yet. Click "Add Tier".</td></tr>`; return }
+  tb.innerHTML = _feeCfg.tiers.map((t, i) => `<tr class="border-t border-slate-100">
+    <td class="px-3 py-2"><input type="number" min="0" value="${t.min ?? ''}" ${ro} onchange="updateTier(${i},'min',this.value)" class="w-28 px-2 py-1 border rounded ${ro ? 'bg-slate-100' : ''}"></td>
+    <td class="px-3 py-2"><input type="number" min="0" value="${t.max ?? ''}" ${ro} onchange="updateTier(${i},'max',this.value)" placeholder="∞" class="w-28 px-2 py-1 border rounded ${ro ? 'bg-slate-100' : ''}"></td>
+    <td class="px-3 py-2"><input type="number" min="0" value="${t.fee ?? ''}" ${ro} onchange="updateTier(${i},'fee',this.value)" class="w-28 px-2 py-1 border rounded ${ro ? 'bg-slate-100' : ''}"></td>
+    <td class="px-3 py-2 text-right">${_canManageFees ? `<button onclick="removeTier(${i})" class="text-red-600 hover:underline text-xs"><i class="fas fa-trash"></i></button>` : ''}</td>
+  </tr>`).join('')
+}
+window.addTier = () => { _feeCfg.tiers.push({ min: 0, max: null, fee: 0 }); renderTierRows() }
+window.removeTier = (i) => { _feeCfg.tiers.splice(i, 1); renderTierRows() }
+window.updateTier = (i, field, val) => { _feeCfg.tiers[i][field] = (field === 'max' && val === '') ? null : Number(val) }
+window.saveMarkup = async () => {
+  try { await api.put('/settings/markup', { default_markup_pct: Number($('set_markup').value || 0) }); toast('Markup saved') }
+  catch (err) { toast(err.response?.data?.error || 'Failed', false) }
+}
+window.saveProcessingFee = async () => {
+  const body = { mode: _feeCfg.mode, percentage_rate: 0, tiers: [] }
+  if (_feeCfg.mode === 'percentage') body.percentage_rate = Number(($('fee_pct') || {}).value || 0)
+  if (_feeCfg.mode === 'tiered') body.tiers = _feeCfg.tiers
+  try { await api.put('/settings/processing-fee', body); toast('Processing fee saved') }
+  catch (err) { toast(err.response?.data?.error || 'Failed', false) }
+}
+
+// ---------------------------------------------------------------------------
 // GRANULAR PERMISSION MATRIX (Super Admin authorization grid)
 // ---------------------------------------------------------------------------
 const PERM_MATRIX = [
@@ -1211,13 +1335,44 @@ const PERM_MATRIX = [
     ['add_agents', 'Add Agents'], ['add_lenders', 'Add Lenders'] ] },
   { section: 'Data Correction', items: [
     ['edit_records', 'Edit Records'], ['delete_records', 'Delete Records'] ] },
-  { section: 'Ledger Inspections', items: [
+  { section: 'Feature Configuration', items: [
+    ['manage_processing_fees', 'Manage Processing Fees'], ['manage_markup', 'Manage Markup Percentage'] ] },
+  { section: 'Sales Visibility', items: [
     ['view_cash_sales', 'View Cash Sales'], ['view_financed_sales', 'View Financed Sales'] ] },
+  { section: 'Data Object Visibility', items: [
+    ['view_farmer_profile', 'Farmer Profile Data'], ['view_financial_data', 'Financial Data'],
+    ['view_documents', 'Document Attachments (IDs, Passport)'] ] },
   { section: 'Credit & Logistics', items: [
     ['approve_loan', 'Approve a Loan'], ['dispatch_feeds', 'Dispatch Feeds'] ] },
   { section: 'Operational Tracking', items: [
     ['track_deliveries', 'Track Deliveries'], ['track_payments', 'Track Payments'], ['add_inventory', 'Add Inventory'] ] }
 ]
+// ---------------------------------------------------------------------------
+// TIME-BASED ACCESS CONTROL widget (days-of-week + hours-of-day per user)
+// ---------------------------------------------------------------------------
+const WEEKDAYS = [['1', 'Mon'], ['2', 'Tue'], ['3', 'Wed'], ['4', 'Thu'], ['5', 'Fri'], ['6', 'Sat'], ['0', 'Sun']]
+function accessCtrlHtml(prefix, user) {
+  let days = []
+  try { days = user && user.access_days ? (Array.isArray(user.access_days) ? user.access_days : JSON.parse(user.access_days)) : [] } catch { days = [] }
+  days = (days || []).map(Number)
+  const start = (user && user.access_start) || ''
+  const end = (user && user.access_end) || ''
+  return `<div class="border border-slate-200 rounded-lg p-3 mt-1">
+    <p class="text-xs text-slate-500 mb-2">Restrict when this account can sign in. Leave everything blank for unrestricted (24/7) access.</p>
+    <label class="field-label">Active Days</label>
+    <div class="flex flex-wrap gap-2 mb-3">
+      ${WEEKDAYS.map(([v, lbl]) => `<label class="perm-item text-xs border rounded px-2 py-1 cursor-pointer"><input type="checkbox" id="${prefix}_day_${v}" value="${v}" ${days.includes(Number(v)) ? 'checked' : ''}> ${lbl}</label>`).join('')}
+    </div>
+    <div class="grid grid-cols-2 gap-3">
+      <div class="field-group"><label class="field-label">From (HH:MM)</label><input id="${prefix}_start" type="time" value="${esc(start)}" class="w-full px-3 py-2 border rounded-lg"></div>
+      <div class="field-group"><label class="field-label">To (HH:MM)</label><input id="${prefix}_end" type="time" value="${esc(end)}" class="w-full px-3 py-2 border rounded-lg"></div>
+    </div>
+  </div>`
+}
+function collectAccess(prefix) {
+  const days = WEEKDAYS.map(([v]) => v).filter(v => { const el = $(`${prefix}_day_${v}`); return el && el.checked }).map(Number)
+  return { access_days: days, access_start: ($(`${prefix}_start`) || {}).value || null, access_end: ($(`${prefix}_end`) || {}).value || null }
+}
 function permGridHtml(prefix, selected) {
   selected = selected || []
   return PERM_MATRIX.map(sec => `
@@ -1247,11 +1402,13 @@ window.addAgentModal = () => {
     </div>
     <h4 class="font-bold text-sm text-teal-700 mt-3 mb-2">Permissions</h4>
     ${permGridHtml('ag', [])}
+    <h4 class="font-bold text-sm text-teal-700 mt-3 mb-2">Time-Based Access</h4>
+    ${accessCtrlHtml('ag', null)}
     <div class="flex gap-2 mt-4"><button onclick="doAddAgent()" class="btn flex-1 brand-bg text-white py-2 rounded-lg text-sm">Create Agent</button><button onclick="closeModal()" class="btn px-4 bg-slate-100 rounded-lg text-sm">Cancel</button></div>`)
 }
 window.doAddAgent = async () => {
   try {
-    const body = { full_name: $('ag_name').value, phone: $('ag_phone').value, email: $('ag_email').value, region: $('ag_region').value, custom_role: $('ag_custom').value || null, permissions: collectPerms('ag') }
+    const body = { full_name: $('ag_name').value, phone: $('ag_phone').value, email: $('ag_email').value, region: $('ag_region').value, custom_role: $('ag_custom').value || null, permissions: collectPerms('ag'), ...collectAccess('ag') }
     if ($('ag_pwd').value) body.password = $('ag_pwd').value
     const { data } = await api.post('/agents', body)
     closeModal()
@@ -1278,11 +1435,13 @@ window.addUserModal = () => {
     </div>
     <h4 class="font-bold text-sm text-teal-700 mt-3 mb-2">Permissions</h4>
     ${permGridHtml('nu', [])}
+    <h4 class="font-bold text-sm text-teal-700 mt-3 mb-2">Time-Based Access</h4>
+    ${accessCtrlHtml('nu', null)}
     <div class="flex gap-2 mt-4"><button onclick="doAddUser()" class="btn flex-1 brand-bg text-white py-2 rounded-lg text-sm">Create User</button><button onclick="closeModal()" class="btn px-4 bg-slate-100 rounded-lg text-sm">Cancel</button></div>`)
 }
 window.doAddUser = async () => {
   try {
-    const body = { full_name: $('nu_name').value, phone: $('nu_phone').value, email: $('nu_email').value, role: $('nu_role').value, region: $('nu_region').value, custom_role: $('nu_custom').value || null, permissions: collectPerms('nu') }
+    const body = { full_name: $('nu_name').value, phone: $('nu_phone').value, email: $('nu_email').value, role: $('nu_role').value, region: $('nu_region').value, custom_role: $('nu_custom').value || null, permissions: collectPerms('nu'), ...collectAccess('nu') }
     if ($('nu_pwd').value) body.password = $('nu_pwd').value
     const { data } = await api.post('/users', body)
     closeModal()
@@ -1382,7 +1541,8 @@ window.editUserModal = (id) => {
     </select></div>
     <div class="field-group"><label class="field-label">Region</label><input id="eu_region" value="${esc(u.region || '')}" class="w-full px-3 py-2 border rounded-lg"></div>
     ${canPerm ? `<div class="field-group"><label class="field-label">Custom User Type (overrides role title)</label><input id="eu_custom" value="${esc(u.custom_role || '')}" placeholder="e.g. Regional Lead, Junior Auditor" class="w-full px-3 py-2 border rounded-lg"></div>
-    <div class="field-group"><label class="field-label">Permissions</label>${permGridHtml('eu', perms)}</div>` : ''}
+    <div class="field-group"><label class="field-label">Permissions</label>${permGridHtml('eu', perms)}</div>
+    <div class="field-group"><label class="field-label">Time-Based Access</label>${accessCtrlHtml('eu', u)}</div>` : ''}
     <div class="field-group"><label class="field-label">New password (leave blank to keep)</label><input id="eu_pwd" type="password" class="w-full px-3 py-2 border rounded-lg"></div>
   </div><div class="flex gap-2 mt-4"><button onclick="doEditUser(${id})" class="btn flex-1 brand-bg text-white py-2 rounded-lg text-sm">Save Changes</button><button onclick="closeModal()" class="btn px-4 bg-slate-100 rounded-lg text-sm">Cancel</button></div>`)
 }
@@ -1390,7 +1550,7 @@ window.doEditUser = async (id) => {
   try {
     const canPerm = state.user.role === 'super_admin' || state.user.role === 'admin'
     const body = { full_name: $('eu_name').value, phone: $('eu_phone').value, email: $('eu_email').value, role: $('eu_role').value, region: $('eu_region').value }
-    if (canPerm) { body.custom_role = $('eu_custom').value || null; body.permissions = collectPerms('eu') }
+    if (canPerm) { body.custom_role = $('eu_custom').value || null; body.permissions = collectPerms('eu'); Object.assign(body, collectAccess('eu')) }
     if ($('eu_pwd').value) body.password = $('eu_pwd').value
     await api.put('/users/' + id, body)
     closeModal(); toast('User updated'); viewUsers()

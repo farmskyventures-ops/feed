@@ -462,6 +462,79 @@ function requireRole(...roles) {
     await next();
   };
 }
+function hasPerm(user, perm) {
+  if (!user) return false;
+  if (user.role === "super_admin") return true;
+  return Array.isArray(user.permissions) && user.permissions.includes(perm);
+}
+function requirePerm(perm) {
+  return async (c, next) => {
+    const user = c.get("user");
+    if (!hasPerm(user, perm)) return c.json({ error: 'Forbidden: missing permission "' + perm + '"' }, 403);
+    await next();
+  };
+}
+async function getSetting(c, key, fallback) {
+  try {
+    const row = await c.env.DB.prepare(`SELECT value FROM app_settings WHERE key=?`).bind(key).first();
+    if (!row || !row.value) return fallback;
+    return JSON.parse(row.value);
+  } catch {
+    return fallback;
+  }
+}
+async function setSetting(c, key, value, userId) {
+  const json = JSON.stringify(value);
+  await c.env.DB.prepare(
+    `INSERT INTO app_settings (key, value, updated_by, updated_at) VALUES (?,?,?, CURRENT_TIMESTAMP)
+     ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value, updated_by=EXCLUDED.updated_by, updated_at=CURRENT_TIMESTAMP`
+  ).bind(key, json, userId).run();
+}
+function computeProcessingFee(cfg, amount) {
+  if (!cfg || cfg.mode === "none" || !cfg.mode) return 0;
+  const amt = Number(amount) || 0;
+  if (cfg.mode === "percentage") {
+    const rate = Number(cfg.percentage_rate) || 0;
+    return Math.round(amt * rate / 100);
+  }
+  if (cfg.mode === "tiered") {
+    const tiers = Array.isArray(cfg.tiers) ? cfg.tiers : [];
+    for (const t of tiers) {
+      const min = Number(t.min) || 0;
+      const max = t.max === null || t.max === void 0 || t.max === "" ? Infinity : Number(t.max);
+      if (amt >= min && amt <= max) return Number(t.fee) || 0;
+    }
+  }
+  return 0;
+}
+function checkAccessWindow(user) {
+  if (user.role === "super_admin") return { allowed: true };
+  let days = [];
+  try {
+    days = user.access_days ? JSON.parse(user.access_days) : [];
+  } catch {
+    days = [];
+  }
+  const start = user.access_start, end = user.access_end;
+  if ((!days || days.length === 0) && !start && !end) return { allowed: true };
+  const now = new Date(Date.now() + 3 * 3600 * 1e3);
+  const dow = now.getUTCDay();
+  const mins = now.getUTCHours() * 60 + now.getUTCMinutes();
+  if (days && days.length > 0 && !days.includes(dow)) {
+    return { allowed: false, message: "Your account is not permitted to sign in today. Please try during your assigned days." };
+  }
+  const toMins = (hhmm) => {
+    const [h, m] = String(hhmm).split(":").map(Number);
+    return (h || 0) * 60 + (m || 0);
+  };
+  if (start && end) {
+    const s = toMins(start), e = toMins(end);
+    if (mins < s || mins > e) {
+      return { allowed: false, message: `Access is only allowed between ${start} and ${end} (EAT). Please try again during your assigned hours.` };
+    }
+  }
+  return { allowed: true };
+}
 async function audit(c, userId, action, entity, detail) {
   try {
     await c.env.DB.prepare(`INSERT INTO audit_logs (user_id, action, entity, detail) VALUES (?,?,?,?)`).bind(userId, action, entity, detail).run();
@@ -508,6 +581,8 @@ app.post("/api/login", async (c) => {
   let user = await c.env.DB.prepare(`SELECT * FROM users WHERE phone = ? OR phone = ?`).bind(raw, norm).first();
   if (!user || user.password !== String(password)) return c.json({ error: "Invalid phone number or password" }, 401);
   if (user.status !== "active") return c.json({ error: "Account suspended" }, 403);
+  const access = checkAccessWindow(user);
+  if (!access.allowed) return c.json({ error: access.message || "Access not allowed at this time" }, 403);
   const token = await createSession(c, user);
   await audit(c, user.id, "login", "user", `${user.role} logged in`);
   let permissions = [];
@@ -783,11 +858,36 @@ app.get("/api/customers", requireAuth, async (c) => {
   return c.json({ customers: results });
 });
 app.get("/api/customers/:id", requireAuth, async (c) => {
+  const user = c.get("user");
   const cust = await c.env.DB.prepare(`SELECT * FROM customers WHERE id=?`).bind(c.req.param("id")).first();
   if (!cust) return c.json({ error: "Not found" }, 404);
   const tu = await c.env.DB.prepare(`SELECT * FROM transunion_checks WHERE customer_id=? ORDER BY id DESC LIMIT 1`).bind(c.req.param("id")).first();
   const idv = await c.env.DB.prepare(`SELECT * FROM id_verifications WHERE customer_id=? ORDER BY id DESC LIMIT 1`).bind(c.req.param("id")).first();
-  return c.json({ customer: cust, transunion: tu, id_verification: idv });
+  const isSelf = user.role === "customer" && cust.user_id === user.id;
+  let transunion = tu;
+  if (!isSelf && !hasPerm(user, "view_financial_data")) {
+    ;
+    ["current_loan_amount", "credit_score", "risk_band", "sacco_member", "output_tonnage", "herd_count", "herd_size", "acreage"].forEach((k) => {
+      if (k in cust) cust[k] = null;
+    });
+    cust._financial_hidden = true;
+    transunion = null;
+  }
+  if (!isSelf && !hasPerm(user, "view_documents")) {
+    ;
+    ["id_front_url", "id_back_url", "selfie_url", "passport_selfie_url"].forEach((k) => {
+      if (k in cust) cust[k] = null;
+    });
+    cust._documents_hidden = true;
+  }
+  if (!isSelf && !hasPerm(user, "view_farmer_profile")) {
+    ;
+    ["national_id", "date_of_birth", "gender", "alt_mobile", "county", "sub_county", "ward", "village", "latitude", "longitude", "value_chain", "value_chain_type", "farming_profile", "farm_experience"].forEach((k) => {
+      if (k in cust) cust[k] = null;
+    });
+    cust._profile_hidden = true;
+  }
+  return c.json({ customer: cust, transunion, id_verification: idv });
 });
 app.post("/api/customers", requireAuth, requireRole("agent", "admin", "super_admin"), async (c) => {
   const b = await c.req.json();
@@ -878,6 +978,9 @@ app.post("/api/murabaha/quote", requireAuth, async (c) => {
   const deposit_required = isCash ? murabaha_price : Math.round(murabaha_price * depositPct / 100);
   const term = payment_type === "credit" ? Number(term_months) || 6 : 0;
   const monthly = term > 0 ? Math.round(Math.max(0, murabaha_price - deposit_required) / term) : 0;
+  const amount_borrowed = isCash ? 0 : Math.max(0, murabaha_price - deposit_required);
+  const feeCfg = await getSetting(c, "processing_fee", { mode: "none" });
+  const processing_fee = isCash ? 0 : computeProcessingFee(feeCfg, amount_borrowed);
   return c.json({
     product: p.name,
     quantity: qty,
@@ -888,6 +991,9 @@ app.post("/api/murabaha/quote", requireAuth, async (c) => {
     monthly_payment: monthly,
     deposit_pct: depositPct,
     deposit_required,
+    amount_borrowed,
+    processing_fee,
+    processing_fee_mode: feeCfg?.mode || "none",
     payment_eligibility: p.payment_eligibility || "both",
     terms: isCash ? p.cash_terms || "" : p.finance_terms || "",
     sharia_note: "Price becomes FIXED once the contract is signed. No interest, penalties, or compounding."
@@ -929,11 +1035,14 @@ app.post("/api/murabaha/apply", requireAuth, async (c) => {
   const term = payment_type === "credit" ? Number(term_months) || 6 : 0;
   const monthly = term > 0 ? Math.round(Math.max(0, murabaha_price - deposit_required) / term) : 0;
   const acceptedTerms = isCash ? p.cash_terms || "" : p.finance_terms || "";
+  const amountBorrowed = isCash ? 0 : Math.max(0, murabaha_price - deposit_required);
+  const feeCfg = await getSetting(c, "processing_fee", { mode: "none" });
+  const processingFee = isCash ? 0 : computeProcessingFee(feeCfg, amountBorrowed);
   const contractRef = ref("MRB");
   const status = payment_type === "cash" ? "pending_payment" : "pending";
   const r = await c.env.DB.prepare(
-    `INSERT INTO murabaha_contracts (contract_ref,customer_id,agent_id,product_id,quantity,payment_type,supplier_cost,markup_pct,murabaha_price,term_months,monthly_payment,delivery_location,status,ownership_recorded,consent_given,amount_paid,outstanding,accepted_terms,terms_accepted,deposit_required)
-     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
+    `INSERT INTO murabaha_contracts (contract_ref,customer_id,agent_id,product_id,quantity,payment_type,supplier_cost,markup_pct,murabaha_price,term_months,monthly_payment,delivery_location,status,ownership_recorded,consent_given,amount_paid,outstanding,accepted_terms,terms_accepted,deposit_required,processing_fee)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
   ).bind(
     contractRef,
     custId,
@@ -954,7 +1063,8 @@ app.post("/api/murabaha/apply", requireAuth, async (c) => {
     murabaha_price,
     acceptedTerms,
     1,
-    deposit_required
+    deposit_required,
+    processingFee
   ).run();
   const contractId = r.meta.last_row_id;
   await audit(c, user.id, "apply", "murabaha", `${payment_type} ${contractRef}`);
@@ -965,6 +1075,7 @@ app.post("/api/murabaha/apply", requireAuth, async (c) => {
     murabaha_price,
     monthly_payment: monthly,
     deposit_required,
+    processing_fee: processingFee,
     requires_payment: payment_type === "cash",
     outstanding: murabaha_price,
     payment_type
@@ -975,14 +1086,24 @@ app.get("/api/murabaha", requireAuth, async (c) => {
   let q = `SELECT mc.*, p.name as product_name, cu.full_name as customer_name
            FROM murabaha_contracts mc JOIN products p ON p.id = mc.product_id JOIN customers cu ON cu.id = mc.customer_id`;
   const binds = [];
+  const wheres = [];
   if (user.role === "agent") {
-    q += ` WHERE mc.agent_id = ?`;
+    wheres.push(`mc.agent_id = ?`);
     binds.push(user.id);
   } else if (user.role === "customer") {
     const myCust = await c.env.DB.prepare(`SELECT id FROM customers WHERE user_id=?`).bind(user.id).first();
-    q += ` WHERE mc.customer_id = ?`;
+    wheres.push(`mc.customer_id = ?`);
     binds.push(myCust?.id || -1);
+  } else {
+    const canCash = hasPerm(user, "view_cash_sales");
+    const canFin = hasPerm(user, "view_financed_sales");
+    const hasSalesGrid = Array.isArray(user.permissions) && (user.permissions.includes("view_cash_sales") || user.permissions.includes("view_financed_sales"));
+    if (user.role !== "super_admin" && hasSalesGrid) {
+      if (canCash && !canFin) wheres.push(`mc.payment_type = 'cash'`);
+      else if (canFin && !canCash) wheres.push(`mc.payment_type = 'credit'`);
+    }
   }
+  if (wheres.length) q += ` WHERE ` + wheres.join(" AND ");
   q += ` ORDER BY mc.created_at DESC`;
   const { results } = await c.env.DB.prepare(q).bind(...binds).all();
   return c.json({ contracts: results });
@@ -1072,6 +1193,9 @@ var PROVIDERS = {
   kcb: {
     id: "kcb",
     label: "KCB",
+    // KCB (Buni) is hidden from the end-user payment UI per configuration.
+    // The integration is retained server-side but not advertised.
+    hidden: true,
     configured: kcbConfigured,
     push: (env, o) => kcbPush(env, o),
     query: (env, id) => kcbQuery(env, id)
@@ -1086,7 +1210,7 @@ function genReceipt(provider, live) {
   return prefix + Math.random().toString(36).slice(2, 9).toUpperCase();
 }
 app.get("/api/payments/providers", requireAuth, (c) => {
-  const providers = Object.values(PROVIDERS).map((p) => {
+  const providers = Object.values(PROVIDERS).filter((p) => !p.hidden).map((p) => {
     const live = p.configured(c.env);
     return { id: p.id, label: p.label, live, mode: live ? "live" : "simulation" };
   });
@@ -1274,6 +1398,38 @@ app.get("/api/dashboard", requireAuth, async (c) => {
   const { results: topProducts } = await db.prepare(`SELECT p.name, COUNT(mc.id) sales FROM murabaha_contracts mc JOIN products p ON p.id=mc.product_id GROUP BY p.id ORDER BY sales DESC LIMIT 5`).all();
   return c.json({ role: "admin", total_sales: sales?.tot || 0, murabaha_financed: financed?.tot || 0, cash_sales: cashSales?.tot || 0, repayment_rate: repayRate, default_rate: defaultRate, inventory_value: invValue?.tot || 0, active_customers: activeCust?.n || 0, pending_approvals: pending?.n || 0, top_products: topProducts });
 });
+app.get("/api/settings/financing", requireAuth, requireRole("admin", "super_admin"), async (c) => {
+  const processing_fee = await getSetting(c, "processing_fee", { mode: "none", percentage_rate: 0, tiers: [] });
+  const finance_markup = await getSetting(c, "finance_markup", { default_markup_pct: 20 });
+  const user = c.get("user");
+  return c.json({
+    processing_fee,
+    finance_markup,
+    can_manage_processing_fees: hasPerm(user, "manage_processing_fees"),
+    can_manage_markup: hasPerm(user, "manage_markup")
+  });
+});
+app.put("/api/settings/processing-fee", requireAuth, requireRole("admin", "super_admin"), requirePerm("manage_processing_fees"), async (c) => {
+  const b = await c.req.json();
+  const mode = ["none", "percentage", "tiered"].includes(b.mode) ? b.mode : "none";
+  const percentage_rate = Math.max(0, Number(b.percentage_rate) || 0);
+  const tiers = Array.isArray(b.tiers) ? b.tiers.map((t) => ({
+    min: Math.max(0, Number(t.min) || 0),
+    max: t.max === null || t.max === void 0 || t.max === "" ? null : Math.max(0, Number(t.max) || 0),
+    fee: Math.max(0, Number(t.fee) || 0)
+  })) : [];
+  const cfg = { mode, percentage_rate, tiers };
+  await setSetting(c, "processing_fee", cfg, c.get("user").id);
+  await audit(c, c.get("user").id, "update", "processing_fee", `mode=${mode}`);
+  return c.json({ ok: true, processing_fee: cfg });
+});
+app.put("/api/settings/markup", requireAuth, requireRole("admin", "super_admin"), requirePerm("manage_markup"), async (c) => {
+  const b = await c.req.json();
+  const cfg = { default_markup_pct: Math.max(0, Number(b.default_markup_pct) || 0) };
+  await setSetting(c, "finance_markup", cfg, c.get("user").id);
+  await audit(c, c.get("user").id, "update", "finance_markup", `default=${cfg.default_markup_pct}%`);
+  return c.json({ ok: true, finance_markup: cfg });
+});
 app.get("/api/agents", requireAuth, requireRole("admin", "super_admin"), async (c) => {
   const { results } = await c.env.DB.prepare(
     `SELECT u.id, u.full_name, u.phone, u.email, u.region, u.status,
@@ -1293,9 +1449,10 @@ app.post("/api/agents", requireAuth, requireRole("admin", "super_admin"), async 
   const pwd = provided ? String(b.password) : genPassword();
   const perms = Array.isArray(b.permissions) ? b.permissions : [];
   const permsJson = JSON.stringify(perms);
+  const accessDays = Array.isArray(b.access_days) && b.access_days.length ? JSON.stringify(b.access_days.map((n) => Number(n))) : null;
   const r = await c.env.DB.prepare(
-    `INSERT INTO users (full_name,phone,email,password,role,region,password_set,custom_role,permissions,supervisor_id)
-     VALUES (?,?,?,?, 'agent', ?, ?, ?, ?, ?)`
+    `INSERT INTO users (full_name,phone,email,password,role,region,password_set,custom_role,permissions,supervisor_id,access_days,access_start,access_end)
+     VALUES (?,?,?,?, 'agent', ?, ?, ?, ?, ?, ?, ?, ?)`
   ).bind(
     b.full_name,
     p,
@@ -1305,7 +1462,10 @@ app.post("/api/agents", requireAuth, requireRole("admin", "super_admin"), async 
     provided ? 1 : 0,
     b.custom_role || null,
     permsJson,
-    b.supervisor_id || null
+    b.supervisor_id || null,
+    accessDays,
+    b.access_start || null,
+    b.access_end || null
   ).run();
   await c.env.DB.prepare(`INSERT INTO agents (user_id,region,permissions) VALUES (?,?,?)`).bind(r.meta.last_row_id, b.region || null, permsJson).run();
   await audit(c, c.get("user").id, "create", "agent", b.full_name);
@@ -1337,6 +1497,7 @@ app.put("/api/agents/:id", requireAuth, requireRole("admin", "super_admin"), asy
 app.get("/api/users", requireAuth, requireRole("admin", "super_admin"), async (c) => {
   const { results } = await c.env.DB.prepare(
     `SELECT u.id, u.full_name, u.phone, u.email, u.role, u.status, u.region, u.custom_role, u.permissions, u.supervisor_id,
+            u.access_days, u.access_start, u.access_end,
             s.full_name AS supervisor_name, u.created_at
      FROM users u LEFT JOIN users s ON s.id = u.supervisor_id ORDER BY u.id`
   ).all();
@@ -1353,9 +1514,10 @@ app.post("/api/users", requireAuth, requireRole("admin", "super_admin"), async (
   const pwd = provided ? String(b.password) : genPassword();
   const perms = Array.isArray(b.permissions) ? b.permissions : [];
   const permsJson = JSON.stringify(perms);
+  const accessDays = Array.isArray(b.access_days) && b.access_days.length ? JSON.stringify(b.access_days.map((n) => Number(n))) : null;
   const r = await c.env.DB.prepare(
-    `INSERT INTO users (full_name,phone,email,password,role,status,region,password_set,custom_role,permissions,supervisor_id)
-     VALUES (?,?,?,?,?, 'active', ?, ?, ?, ?, ?)`
+    `INSERT INTO users (full_name,phone,email,password,role,status,region,password_set,custom_role,permissions,supervisor_id,access_days,access_start,access_end)
+     VALUES (?,?,?,?,?, 'active', ?, ?, ?, ?, ?, ?, ?, ?)`
   ).bind(
     b.full_name,
     p,
@@ -1366,7 +1528,10 @@ app.post("/api/users", requireAuth, requireRole("admin", "super_admin"), async (
     provided ? 1 : 0,
     b.custom_role || null,
     permsJson,
-    b.supervisor_id || null
+    b.supervisor_id || null,
+    accessDays,
+    b.access_start || null,
+    b.access_end || null
   ).run();
   if (role === "agent") {
     await c.env.DB.prepare(`INSERT INTO agents (user_id,region,permissions) VALUES (?,?,?)`).bind(r.meta.last_row_id, b.region || null, permsJson).run();
@@ -1390,10 +1555,15 @@ app.put("/api/users/:id", requireAuth, requireRole("admin", "super_admin"), asyn
   const b = await c.req.json();
   const hasPerms = Array.isArray(b.permissions);
   const permsJson = hasPerms ? JSON.stringify(b.permissions) : null;
+  const hasAccess = "access_days" in b || "access_start" in b || "access_end" in b;
+  const accessDays = Array.isArray(b.access_days) && b.access_days.length ? JSON.stringify(b.access_days.map((n) => Number(n))) : null;
   if (b.password) {
     await c.env.DB.prepare(`UPDATE users SET full_name=?, phone=?, email=?, role=?, region=?, custom_role=?, permissions=COALESCE(?,permissions), password=? WHERE id=?`).bind(b.full_name, b.phone, b.email, b.role, b.region, b.custom_role || null, permsJson, String(b.password), id).run();
   } else {
     await c.env.DB.prepare(`UPDATE users SET full_name=?, phone=?, email=?, role=?, region=?, custom_role=?, permissions=COALESCE(?,permissions) WHERE id=?`).bind(b.full_name, b.phone, b.email, b.role, b.region, b.custom_role || null, permsJson, id).run();
+  }
+  if (hasAccess) {
+    await c.env.DB.prepare(`UPDATE users SET access_days=?, access_start=?, access_end=? WHERE id=?`).bind(accessDays, b.access_start || null, b.access_end || null, id).run();
   }
   if (hasPerms) await c.env.DB.prepare(`UPDATE agents SET permissions=? WHERE user_id=?`).bind(permsJson, id).run();
   await audit(c, c.get("user").id, "update", "user", b.full_name);
