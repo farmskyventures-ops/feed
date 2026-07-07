@@ -707,22 +707,24 @@ async function applyPayment(c: any, contract: any, amt: number, receipt: string,
 }
 
 // ----------------------------------------------------------------------------
-// Unified payment-provider configuration layer mapping. 
-// Leverages the core equipment backend to compute configurations.
+// PAYMENTS - Secure Centralized Orchestration Routing Layer
 // ----------------------------------------------------------------------------
 type PaymentProvider = {
   id: string
   label: string
   hidden?: boolean
 }
+
 const PROVIDERS: Record<string, PaymentProvider> = {
   mpesa: { id: 'mpesa', label: 'M-Pesa' },
   sasapay: { id: 'sasapay', label: 'SasaPay' },
   kcb: { id: 'kcb', label: 'KCB', hidden: true }
 }
+
 function getProvider(name?: string): PaymentProvider {
   return PROVIDERS[String(name || 'mpesa').toLowerCase()] || PROVIDERS.mpesa
 }
+
 function genReceipt(provider: string, live: boolean): string {
   const prefix = provider === 'sasapay' ? 'SP' : provider === 'kcb' ? 'KCB' : 'MP'
   if (live) return prefix + 'L' + Date.now().toString().slice(-7)
@@ -737,7 +739,7 @@ app.get('/api/payments/providers', requireAuth, (c) => {
   return c.json({ providers })
 })
 
-// Centralized payment initiation proxy endpoint
+// Centralized payment initiation proxy endpoint with HMAC Security Routing
 app.post('/api/payments/initiate', requireAuth, async (c) => {
   const centralDb = c.env.CENTRAL_DB || c.env.DB
   const { contract_id, amount, phone, provider } = await c.req.json()
@@ -763,37 +765,80 @@ app.post('/api/payments/initiate', requireAuth, async (c) => {
   const desc = contract.payment_type === 'cash' ? 'Feed Cash Sale' : 'Feed Murabaha'
 
   try {
-    // Single absolute endpoint URL tracking execution targets
-    const centralGatewayUrl = 'https://equipment.farmsky/api/central-payments/dispatch'
+    // 1. Point request pipeline directly to production secure endpoint setup
+    const centralGatewayUrl = 'https://equipment.farmsky.africa/api/v1/payments/initiate'
     
+    const requestPayload = {
+      payment_method: prov.id === 'kcb' ? 'buni' : prov.id, // Maps to provider criteria definition
+      amount: amt,
+      phone: normalizePhone(payPhone),
+      origin_reference: contract.contract_ref,
+      description: desc,
+      initiated_by_user: c.get('user').id
+    }
+
+    const rawBodyText = JSON.stringify(requestPayload)
+
+    // 2. Cryptographic signature extraction handling
+    const { signRequest } = await import('./payments-shared')
+    
+    // 3. System markers mapping validation credentials
+    const clientKey = 'feed' 
+    const hmacSecret = c.env.FARMSKY_FEED_HMAC_SECRET 
+
+    if (!hmacSecret) {
+      console.error("Missing critical environment definition: FARMSKY_FEED_HMAC_SECRET configuration is absent.")
+      return c.json({ error: 'Client application secret context initialization breakdown.' }, 500)
+    }
+
+    // Secure compilation prevents 401 Replay/Signature validation exceptions
+    const { timestamp, nonce, signature } = await signRequest(hmacSecret, clientKey, rawBodyText)
+
     const centralResponse = await fetch(centralGatewayUrl, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        marketplace_source: 'feed', 
-        provider: prov.id,
-        phone: payPhone,
-        amount: amt,
-        account: contract.contract_ref,
-        description: desc
-      })
+      headers: { 
+        'Content-Type': 'application/json',
+        'X-Farmsky-Client': clientKey,
+        'X-Farmsky-Timestamp': timestamp,
+        'X-Farmsky-Nonce': nonce,
+        'X-Farmsky-Signature': signature
+      },
+      body: rawBodyText
     })
 
     const result: any = await centralResponse.json()
     if (!centralResponse.ok || !result.success) {
-      return c.json({ error: result.error || `${prov.label} dispatcher proxy rejected request.` }, 502)
+      return c.json({ error: result.error || `${prov.label} central execution core rejected transaction request.` }, centralResponse.status || 502)
     }
   
-    // Writes down the tracking record, declaring 'feed' as the baseline source module
-    await centralDb.prepare(`INSERT INTO payment_intents (checkout_request_id,merchant_request_id,contract_id,customer_id,amount,phone,method,status,marketplace_source) VALUES (?,?,?,?,?,?,?, 'pending', 'feed')`)
-      .bind(result.checkout_request_id, result.merchant_request_id || null, contract_id, contract.customer_id, amt, normalizePhone(payPhone), prov.id).run()
+    // 4. Record mapping rows inside payment_intents using Core's absolute transaction_ref
+    await centralDb.prepare(
+      `INSERT INTO payment_intents 
+        (checkout_request_id, merchant_request_id, contract_id, customer_id, amount, phone, method, status, marketplace_source) 
+       VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', 'feed')`
+    ).bind(
+      result.transaction_ref, 
+      null, 
+      contract_id, 
+      contract.customer_id, 
+      amt, 
+      normalizePhone(payPhone), 
+      prov.id
+    ).run()
       
-    await audit(c, c.get('user').id, 'payment_initiate', prov.id, `KES ${amt} routed via core engine to ${contract.contract_ref}`)
-    return c.json({ ok: true, provider: prov.id, simulated: result.simulated, checkout_request_id: result.checkout_request_id, customer_message: result.customer_message })
+    await audit(c, c.get('user').id, 'payment_initiate', prov.id, `KES ${amt} securely signed & routed to core for ${contract.contract_ref}`)
+    
+    return c.json({ 
+      ok: true, 
+      provider: prov.id, 
+      simulated: result.simulated, 
+      checkout_request_id: result.transaction_ref, 
+      customer_message: result.customer_message 
+    })
   
   } catch (error: any) {
-    console.error("Central engine dispatch failure execution chain dropped:", error)
-    return c.json({ error: 'Could not communicate with the payment orchestration gateway.' }, 500)
+    console.error("Central engine secure dispatch execution dropped:", error)
+    return c.json({ error: 'Could not establish secure link with payment orchestration gateway.' }, 500)
   }
 })
 
