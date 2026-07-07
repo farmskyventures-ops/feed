@@ -660,7 +660,7 @@ app.post('/api/murabaha/:id/decision', requireAuth, requireRole('admin', 'super_
 })
 
 // ----------------------------------------------------------------------------
-// PAYMENTS - M-Pesa Daraja STK Push (real when configured, simulated otherwise)
+// PAYMENTS - Centralized Orchestration Routing Layer
 // ----------------------------------------------------------------------------
 async function applyPayment(c: any, contract: any, amt: number, receipt: string, method: string, phone: string) {
   // Direct interaction target switched to Central DB for tracking unified financial state
@@ -707,40 +707,18 @@ async function applyPayment(c: any, contract: any, amt: number, receipt: string,
 }
 
 // ----------------------------------------------------------------------------
-// Unified payment-provider layer: M-Pesa, SasaPay and KCB all behave the same
-// way (initiate a phone STK prompt -> poll for completion). Each provider has
-// the same shape so the rest of the app can treat them interchangeably.
+// Unified payment-provider configuration layer mapping. 
+// Leverages the core equipment backend to compute configurations.
 // ----------------------------------------------------------------------------
 type PaymentProvider = {
   id: string
   label: string
-  hidden?: boolean          // if true, not shown to end users (backend still works)
-  configured: (env: any) => boolean
-  push: (env: any, opts: { phone: string; amount: number; account: string; description: string }) => Promise<any>
-  query: (env: any, id: string) => Promise<any>
+  hidden?: boolean
 }
 const PROVIDERS: Record<string, PaymentProvider> = {
-  mpesa: {
-    id: 'mpesa', label: 'M-Pesa',
-    configured: mpesaConfigured,
-    push: (env, o) => stkPush(env, o),
-    query: async (env, id) => { const q = await stkQuery(env, id); return { ResultCode: q.ResultCode, ResultDesc: q.ResultDesc, receipt: undefined } }
-  },
-  sasapay: {
-    id: 'sasapay', label: 'SasaPay',
-    configured: sasapayConfigured,
-    push: (env, o) => sasapayPush(env, o),
-    query: (env, id) => sasapayQuery(env, id)
-  },
-  kcb: {
-    id: 'kcb', label: 'KCB',
-    // KCB (Buni) is hidden from the end-user payment UI per configuration.
-    // The integration is retained server-side but not advertised.
-    hidden: true,
-    configured: kcbConfigured,
-    push: (env, o) => kcbPush(env, o),
-    query: (env, id) => kcbQuery(env, id)
-  }
+  mpesa: { id: 'mpesa', label: 'M-Pesa' },
+  sasapay: { id: 'sasapay', label: 'SasaPay' },
+  kcb: { id: 'kcb', label: 'KCB', hidden: true }
 }
 function getProvider(name?: string): PaymentProvider {
   return PROVIDERS[String(name || 'mpesa').toLowerCase()] || PROVIDERS.mpesa
@@ -751,18 +729,15 @@ function genReceipt(provider: string, live: boolean): string {
   return prefix + Math.random().toString(36).slice(2, 9).toUpperCase()
 }
 
-// List the available payment providers and whether each is live or simulated.
-// Hidden providers (e.g. KCB) are excluded from the end-user selection.
+// List the available payment providers exposed across the frontends
 app.get('/api/payments/providers', requireAuth, (c) => {
   const providers = Object.values(PROVIDERS).filter((p) => !p.hidden).map((p) => {
-    const live = p.configured(c.env)
-    return { id: p.id, label: p.label, live, mode: live ? 'live' : 'simulation' }
+    return { id: p.id, label: p.label, live: true, mode: 'live' }
   })
   return c.json({ providers })
 })
 
-// Generalised payment initiation — works for any provider (M-Pesa/SasaPay/KCB),
-// for both cash checkout and loan repayment.
+// Centralized payment initiation proxy endpoint
 app.post('/api/payments/initiate', requireAuth, async (c) => {
   const centralDb = c.env.CENTRAL_DB || c.env.DB
   const { contract_id, amount, phone, provider } = await c.req.json()
@@ -771,7 +746,6 @@ app.post('/api/payments/initiate', requireAuth, async (c) => {
   const contract = await centralDb.prepare(`SELECT * FROM murabaha_contracts WHERE id=?`).bind(contract_id).first<any>()
   if (!contract) return c.json({ error: 'Contract not found' }, 404)
   
-  // Cash checkout: must be awaiting payment, and stock must still be available.
   if (contract.payment_type === 'cash' && contract.status === 'pending_payment') {
     const p = await c.env.DB.prepare(`SELECT quantity FROM products WHERE id=?`).bind(contract.product_id).first<any>()
     if (!p || p.quantity < contract.quantity) return c.json({ error: 'This item is now out of stock.' }, 409)
@@ -786,167 +760,69 @@ app.post('/api/payments/initiate', requireAuth, async (c) => {
   }
   
   const payPhone = phone || c.get('user').phone
-  const desc = contract.payment_type === 'cash' ? 'Cash Sale' : 'Murabaha'
-  const result = await prov.push(c.env, { phone: payPhone, amount: amt, account: contract.contract_ref, description: desc })
-  if (!result.success) return c.json({ error: result.error || `${prov.label} request failed` }, 502)
-  
-  // Central DB tracks intent tracking alongside equipment marketplace processes
-  await centralDb.prepare(`INSERT INTO payment_intents (checkout_request_id,merchant_request_id,contract_id,customer_id,amount,phone,method,status) VALUES (?,?,?,?,?,?,?, 'pending')`)
-    .bind(result.checkout_request_id, result.merchant_request_id || null, contract_id, contract.customer_id, amt, normalizePhone(payPhone), prov.id).run()
+  const desc = contract.payment_type === 'cash' ? 'Feed Cash Sale' : 'Feed Murabaha'
+
+  try {
+    // Single absolute endpoint URL tracking execution targets
+    const centralGatewayUrl = 'https://equipment.farmsky/api/central-payments/dispatch'
     
-  await audit(c, c.get('user').id, 'payment_initiate', prov.id, `KES ${amt} to ${contract.contract_ref} (${result.simulated ? 'sim' : 'live'})`)
-  return c.json({ ok: true, provider: prov.id, simulated: result.simulated, checkout_request_id: result.checkout_request_id, customer_message: result.customer_message })
+    const centralResponse = await fetch(centralGatewayUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        marketplace_source: 'feed', 
+        provider: prov.id,
+        phone: payPhone,
+        amount: amt,
+        account: contract.contract_ref,
+        description: desc
+      })
+    })
+
+    const result: any = await centralResponse.json()
+    if (!centralResponse.ok || !result.success) {
+      return c.json({ error: result.error || `${prov.label} dispatcher proxy rejected request.` }, 502)
+    }
+  
+    // Writes down the tracking record, declaring 'feed' as the baseline source module
+    await centralDb.prepare(`INSERT INTO payment_intents (checkout_request_id,merchant_request_id,contract_id,customer_id,amount,phone,method,status,marketplace_source) VALUES (?,?,?,?,?,?,?, 'pending', 'feed')`)
+      .bind(result.checkout_request_id, result.merchant_request_id || null, contract_id, contract.customer_id, amt, normalizePhone(payPhone), prov.id).run()
+      
+    await audit(c, c.get('user').id, 'payment_initiate', prov.id, `KES ${amt} routed via core engine to ${contract.contract_ref}`)
+    return c.json({ ok: true, provider: prov.id, simulated: result.simulated, checkout_request_id: result.checkout_request_id, customer_message: result.customer_message })
+  
+  } catch (error: any) {
+    console.error("Central engine dispatch failure execution chain dropped:", error)
+    return c.json({ error: 'Could not communicate with the payment orchestration gateway.' }, 500)
+  }
 })
 
-// Generalised payment confirmation — polls the provider for the result and,
-// on success, settles the cash sale or applies the loan repayment.
+// Confirmation query pooling logic targeting the central DB ledger state changes
 app.post('/api/payments/confirm', requireAuth, async (c) => {
   const centralDb = c.env.CENTRAL_DB || c.env.DB
   const { checkout_request_id } = await c.req.json()
   
   const intent = await centralDb.prepare(`SELECT * FROM payment_intents WHERE checkout_request_id=?`).bind(checkout_request_id).first<any>()
-  if (!intent) return c.json({ error: 'Payment intent not found' }, 404)
+  if (!intent) return c.json({ error: 'Payment record tracking reference not found.' }, 404)
   if (intent.status === 'success') return c.json({ ok: true, status: 'success', mpesa_receipt: intent.mpesa_receipt })
   if (intent.status === 'failed') return c.json({ ok: false, status: 'failed', result_desc: intent.result_desc || 'Payment failed' })
   
-  const prov = getProvider(intent.method)
-  const live = prov.configured(c.env)
-  let success = false, receipt = ''
-  
-  if (!live || String(checkout_request_id).includes('SIM')) {
-    success = true; receipt = genReceipt(prov.id, false)
-  } else {
-    const q = await prov.query(c.env, checkout_request_id)
-    if (q.ResultCode === '0' || q.ResultCode === 0) { 
-      success = true; receipt = q.receipt || genReceipt(prov.id, true) 
-    } else if (q.ResultCode !== undefined && q.ResultCode !== null) {
-      await centralDb.prepare(`UPDATE payment_intents SET status='failed', result_desc=? WHERE checkout_request_id=?`).bind(q.ResultDesc || 'Payment not completed', checkout_request_id).run()
-      return c.json({ ok: false, status: 'failed', result_desc: q.ResultDesc || 'Payment not completed' })
-    } else return c.json({ ok: false, status: 'pending' })
-  }
-  
-  if (success) {
-    const contract = await centralDb.prepare(`SELECT * FROM murabaha_contracts WHERE id=?`).bind(intent.contract_id).first<any>()
-    const res = await applyPayment(c, contract, intent.amount, receipt, prov.id, intent.phone)
-    await centralDb.prepare(`UPDATE payment_intents SET status='success', mpesa_receipt=? WHERE checkout_request_id=?`).bind(receipt, checkout_request_id).run()
-    return c.json({ ok: true, status: 'success', provider: prov.id, mpesa_receipt: receipt, ...res })
-  }
+  // Webhooks are writing directly to our shared central tables. 
+  // If the hook has not cleared yet, state retains a pending status.
   return c.json({ ok: false, status: 'pending' })
 })
 
-// Generalised async webhook for SasaPay / KCB (and any future provider).
-app.post('/api/payments/callback/:provider', async (c) => {
-  const centralDb = c.env.CENTRAL_DB || c.env.DB
-  try {
-    const provName = c.req.param('provider')
-    const body: any = await c.req.json()
-    const cb = body?.Body?.stkCallback || body?.data || body
-    const checkout = cb.CheckoutRequestID || cb.checkoutRequestId || cb.MerchantRequestID || body.CheckoutRequestID
-    if (!checkout) return c.json({ ResultCode: 0, ResultDesc: 'Accepted' })
-    
-    const intent = await centralDb.prepare(`SELECT * FROM payment_intents WHERE checkout_request_id=?`).bind(checkout).first<any>()
-    if (intent && intent.status === 'pending') {
-      const code = cb.ResultCode ?? cb.resultCode ?? (cb.status === true ? 0 : cb.ResponseCode)
-      if (code === 0 || code === '0') {
-        const receipt = cb.MpesaReceiptNumber || cb.TransactionCode || cb.receipt || genReceipt(provName, true)
-        const contract = await centralDb.prepare(`SELECT * FROM murabaha_contracts WHERE id=?`).bind(intent.contract_id).first<any>()
-        if (contract) await applyPayment(c, contract, intent.amount, String(receipt), provName, intent.phone)
-        await centralDb.prepare(`UPDATE payment_intents SET status='success', mpesa_receipt=?, result_desc=? WHERE checkout_request_id=?`).bind(String(receipt), cb.ResultDesc || '', checkout).run()
-      } else {
-        await centralDb.prepare(`UPDATE payment_intents SET status='failed', result_desc=? WHERE checkout_request_id=?`).bind(cb.ResultDesc || 'Failed', checkout).run()
-      }
-    }
-    return c.json({ ResultCode: 0, ResultDesc: 'Accepted' })
-  } catch (e) {
-    return c.json({ ResultCode: 0, ResultDesc: 'Accepted' })
-  }
-})
-
+// Legacy individual M-Pesa routes updated to adhere to the centralized multi-tenant format
 app.post('/api/mpesa/stkpush', requireAuth, async (c) => {
-  const centralDb = c.env.CENTRAL_DB || c.env.DB
-  const { contract_id, amount, phone } = await c.req.json()
-  
-  const contract = await centralDb.prepare(`SELECT * FROM murabaha_contracts WHERE id=?`).bind(contract_id).first<any>()
-  if (!contract) return c.json({ error: 'Contract not found' }, 404)
-  
-  if (contract.payment_type === 'cash' && contract.status === 'pending_payment') {
-    const p = await c.env.DB.prepare(`SELECT quantity FROM products WHERE id=?`).bind(contract.product_id).first<any>()
-    if (!p || p.quantity < contract.quantity) return c.json({ error: 'This item is now out of stock.' }, 409)
-  } else if (contract.payment_type !== 'cash' && contract.status !== 'active') {
-    return c.json({ error: 'This contract is not open for payment.' }, 400)
-  }
-  
-  const amt = Number(amount)
-  if (amt <= 0) return c.json({ error: 'Invalid amount' }, 400)
-  const desc = contract.payment_type === 'cash' ? 'Cash Sale' : 'Murabaha'
-  const result = await stkPush(c.env, { phone: phone || c.get('user').phone, amount: amt, account: contract.contract_ref, description: desc })
-  if (!result.success) return c.json({ error: result.error || 'STK push failed' }, 502)
-  
-  await centralDb.prepare(`INSERT INTO payment_intents (checkout_request_id,merchant_request_id,contract_id,customer_id,amount,phone,method,status) VALUES (?,?,?,?,?,?,?, 'pending')`)
-    .bind(result.checkout_request_id, result.merchant_request_id, contract_id, contract.customer_id, amt, normalizePhone(phone || c.get('user').phone), 'mpesa').run()
-    
-  await audit(c, c.get('user').id, 'stk_push', 'mpesa', `KES ${amt} to ${contract.contract_ref} (${result.simulated ? 'sim' : 'live'})`)
-  return c.json({ ok: true, simulated: result.simulated, checkout_request_id: result.checkout_request_id, customer_message: result.customer_message })
+  return c.redirect('/api/payments/initiate', 307)
 })
 
 app.post('/api/mpesa/confirm', requireAuth, async (c) => {
-  const centralDb = c.env.CENTRAL_DB || c.env.DB
-  const { checkout_request_id } = await c.req.json()
-  
-  const intent = await centralDb.prepare(`SELECT * FROM payment_intents WHERE checkout_request_id=?`).bind(checkout_request_id).first<any>()
-  if (!intent) return c.json({ error: 'Payment intent not found' }, 404)
-  if (intent.status === 'success') return c.json({ ok: true, status: 'success', mpesa_receipt: intent.mpesa_receipt })
-  
-  let success = false, receipt = ''
-  if (!mpesaConfigured(c.env) || String(checkout_request_id).includes('SIM')) {
-    success = true; receipt = 'SLE' + Math.random().toString(36).slice(2, 9).toUpperCase()
-  } else {
-    const q = await stkQuery(c.env, checkout_request_id)
-    if (q.ResultCode === '0' || q.ResultCode === 0) { 
-      success = true; receipt = 'LIVE' + Date.now().toString().slice(-7) 
-    } else if (q.ResultCode) {
-      return c.json({ ok: false, status: 'failed', result_desc: q.ResultDesc || 'Payment not completed' })
-    } else return c.json({ ok: false, status: 'pending' })
-  }
-  
-  if (success) {
-    const contract = await centralDb.prepare(`SELECT * FROM murabaha_contracts WHERE id=?`).bind(intent.contract_id).first<any>()
-    const res = await applyPayment(c, contract, intent.amount, receipt, 'mpesa', intent.phone)
-    await centralDb.prepare(`UPDATE payment_intents SET status='success', mpesa_receipt=? WHERE checkout_request_id=?`).bind(receipt, checkout_request_id).run()
-    return c.json({ ok: true, status: 'success', mpesa_receipt: receipt, ...res })
-  }
-  return c.json({ ok: false, status: 'pending' })
-})
-
-app.post('/api/mpesa/callback', async (c) => {
-  const centralDb = c.env.CENTRAL_DB || c.env.DB
-  try {
-    const body: any = await c.req.json()
-    const cb = body?.Body?.stkCallback
-    if (!cb) return c.json({ ResultCode: 0, ResultDesc: 'Accepted' })
-    const checkout = cb.CheckoutRequestID
-    
-    const intent = await centralDb.prepare(`SELECT * FROM payment_intents WHERE checkout_request_id=?`).bind(checkout).first<any>()
-    if (intent && intent.status === 'pending') {
-      if (cb.ResultCode === 0) {
-        const items = cb.CallbackMetadata?.Item || []
-        const receiptItem = items.find((i: any) => i.Name === 'MpesaReceiptNumber')
-        const receipt = receiptItem?.Value || 'LIVE' + Date.now()
-        const contract = await centralDb.prepare(`SELECT * FROM murabaha_contracts WHERE id=?`).bind(intent.contract_id).first<any>()
-        if (contract) await applyPayment(c, contract, intent.amount, String(receipt), 'mpesa', intent.phone)
-        await centralDb.prepare(`UPDATE payment_intents SET status='success', mpesa_receipt=?, result_desc=? WHERE checkout_request_id=?`).bind(String(receipt), cb.ResultDesc || '', checkout).run()
-      } else {
-        await centralDb.prepare(`UPDATE payment_intents SET status='failed', result_desc=? WHERE checkout_request_id=?`).bind(cb.ResultDesc || 'Failed', checkout).run()
-      }
-    }
-    return c.json({ ResultCode: 0, ResultDesc: 'Accepted' })
-  } catch (e) {
-    return c.json({ ResultCode: 0, ResultDesc: 'Accepted' })
-  }
+  return c.redirect('/api/payments/confirm', 307)
 })
 
 app.get('/api/mpesa/status', requireAuth, (c) => {
-  return c.json({ live: mpesaConfigured(c.env), mode: mpesaConfigured(c.env) ? (c.env.MPESA_ENV || 'sandbox') : 'simulation' })
+  return c.json({ live: true, mode: 'live' })
 })
 // ----------------------------------------------------------------------------
 // DASHBOARD / ANALYTICS
