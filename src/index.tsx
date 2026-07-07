@@ -779,7 +779,7 @@ app.post('/api/payments/initiate', requireAuth, async (c) => {
 
     const rawBodyText = JSON.stringify(requestPayload)
 
-    // 2. Cryptographic signature extraction handling
+    // 2. Cryptographic signature extraction handling via your local payments-shared module
     const { signRequest } = await import('./payments-shared')
     
     // 3. System markers mapping validation credentials
@@ -791,7 +791,7 @@ app.post('/api/payments/initiate', requireAuth, async (c) => {
       return c.json({ error: 'Client application secret context initialization breakdown.' }, 500)
     }
 
-    // Secure compilation prevents 401 Replay/Signature validation exceptions
+    // Secure compilation matching your canonical format layout [client_key\ntimestamp\nnonce\nbody]
     const { timestamp, nonce, signature } = await signRequest(hmacSecret, clientKey, rawBodyText)
 
     const centralResponse = await fetch(centralGatewayUrl, {
