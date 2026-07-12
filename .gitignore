@@ -1,6 +1,14 @@
 node_modules/
 .wrangler/
 .env
-.env.local
+.env.*
+!.env.example
 *.log
 .DS_Store
+dist/
+dist-node/
+data/
+*.db
+*.db-shm
+*.db-wal
+frontend/static/tailwind.css
