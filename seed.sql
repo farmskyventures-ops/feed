@@ -36,7 +36,7 @@ INSERT OR IGNORE INTO customers (id, agent_id, full_name, national_id, gender, m
 -- Sample completed cash sale + an active credit contract (kyc considered done historically)
 INSERT OR IGNORE INTO murabaha_contracts (id, contract_ref, customer_id, agent_id, product_id, quantity, payment_type, supplier_cost, markup_pct, murabaha_price, term_months, monthly_payment, delivery_location, status, ownership_recorded, consent_given, amount_paid, outstanding) VALUES
   (1, 'MRB-2026-0001', 1, 2, 1, 2, 'cash', 5000, 10, 5500, 0, 0, 'Mai Mahiu', 'completed', 1, 1, 5500, 0),
-  (2, 'MRB-2026-0002', 1, 2, 4, 2, 'credit', 10000, 20, 12000, 6, 2000, 'Mai Mahiu', 'active', 1, 1, 4000, 8000);
+  (2, 'MRB-2026-0002', 1, 2, 4, 2, 'financing', 10000, 20, 12000, 6, 2000, 'Mai Mahiu', 'active', 1, 1, 4000, 8000);
 
 INSERT OR IGNORE INTO repayments (contract_id, installment_no, due_date, amount_due, amount_paid, status, paid_at) VALUES
   (2, 1, '2026-03-01', 2000, 2000, 'completed', '2026-03-01'),
