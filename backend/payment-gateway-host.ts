@@ -1,10 +1,17 @@
 // =====================================================================
-// Farmsky Central Payment Gateway
+// Farmsky Central Payment Gateway — HOST implementation
 // =====================================================================
+//   This is the SERVER side of the gateway. It is deployed and ACTIVE on
+//   the central host (equipment.farmsky.africa), where it owns every
+//   provider credential and the single merchant shortcode. Satellite
+//   marketplaces (feed / input) do NOT run this against real providers —
+//   they call it remotely via payment-gateway-client.ts. It ships in every
+//   app so the whole family shares one identical, auditable implementation.
+//
 //   Single endpoint shared by all three Farmsky marketplaces:
-//      - equipment.farmsky.africa
-//      - feed.farmsky.africa
-//      - input.farmsky.africa
+//      - equipment.farmsky.africa   (HOST — processes for real)
+//      - feed.farmsky.africa        (satellite — delegates here)
+//      - input.farmsky.africa       (satellite — delegates here)
 //
 //   Supported rails: M-Pesa Daraja, SasaPay, KCB Buni
 //
@@ -35,7 +42,7 @@ import { Hono } from 'hono'
 import { stkPush, stkQuery, normalizePhone } from './mpesa'
 import { sasapayStkPush, sasapayQuery } from './sasapay'
 import { buniStkPush, buniQuery } from './buni'
-import { verifySignature } from './payments-shared'
+import { verifySignature } from './payment-gateway-shared'
 import type { Bindings } from './types'
 
 export type PaymentMethod = 'mpesa' | 'sasapay' | 'buni'
@@ -122,7 +129,7 @@ async function notifyOriginApp(c: any, client: any, tx: any) {
       result_desc: tx.result_desc,
       completed_at: tx.completed_at
     })
-    const { signRequest } = await import('./payments-shared')
+    const { signRequest } = await import('./payment-gateway-shared')
     const { timestamp, nonce, signature } = await signRequest(client.hmac_secret, client.client_key, body)
     await fetch(client.callback_url, {
       method: 'POST',

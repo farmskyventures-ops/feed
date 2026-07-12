@@ -11,7 +11,7 @@ import {
   normalizePhone as sasapayNormalizePhone
 } from './sasapay'
 import { buniStkPush, buniQuery, buniConfigured } from './buni'
-import paymentGateway from './payment-gateway'
+import paymentGateway from './payment-gateway-host'
 import { sendSms, smsConfigured, generateOtp } from './sms'
 import { sendEmail, emailConfigured } from './email'
 import { hashPassword, verifyPassword, isHashed } from './password'
@@ -1494,7 +1494,7 @@ app.post('/api/payments/incoming', rateLimit('ipn', 120, 60_000), async (c) => {
   }
 
   // (2) HMAC + freshness window (verifySignature enforces the ±5-min skew).
-  const { verifySignature } = await import('./payments-shared')
+  const { verifySignature } = await import('./payment-gateway-shared')
   const v = await verifySignature(secret, expectedClient, ts, nonce, raw, sig)
   if (!v.ok) {
     await logPaymentSecurityEvent(c, 'SIGNATURE_FAIL', 'CRITICAL', `reason=${v.error || 'invalid'}`)

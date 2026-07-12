@@ -9,7 +9,7 @@
 //
 // This module signs every outbound request with HMAC-SHA256 using the
 // shared secret stored ONLY in the environment (never hardcoded). The
-// same signing scheme is verified server-side by payments-shared.ts.
+// same signing scheme is verified server-side by payment-gateway-shared.ts.
 //
 // Security properties:
 //   * HMAC-SHA256 over `client_key\ntimestamp\nnonce\nbody`
@@ -19,7 +19,7 @@
 //   * Idempotency-Key prevents double-charging on retry.
 // =====================================================================
 
-import { signRequest } from './payments-shared'
+import { signRequest } from './payment-gateway-shared'
 
 export type GatewayMethod = 'mpesa' | 'sasapay' | 'buni'
 
@@ -102,7 +102,7 @@ export async function initiatePayment(env: GatewayEnv, opts: InitiatePaymentOpti
 
 /**
  * Check the status of a previously-initiated transaction. For GET requests the
- * signed message is the transaction_ref itself (matches payments-shared verify).
+ * signed message is the transaction_ref itself (matches payment-gateway-shared verify).
  */
 export async function getPaymentStatus(env: GatewayEnv, transactionRef: string): Promise<any> {
   if (!gatewayConfigured(env)) return { success: false, error: 'gateway_not_configured' }
