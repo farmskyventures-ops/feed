@@ -3,11 +3,13 @@
 // ============================================================================
 const api = axios.create({ baseURL: '/api', withCredentials: true })
 
-// Dedicated client targeting the central production gateway to prevent local simulation fallback
-const gatewayApi = axios.create({ 
-  baseURL: window.FARMSKY_PAYMENTS_GATEWAY_URL || 'https://farmsky-webapp.onrender.com/api', 
-  withCredentials: true 
-})
+// Payment requests go to THIS app's own backend (same-origin, carrying the
+// logged-in session cookie). FEED's server then HMAC-signs the request and
+// forwards it to the central gateway on the equipment app SERVER-SIDE. The
+// browser must never call the equipment domain directly — it has no session
+// there (that returned "Unauthorized") and cannot HMAC-sign. So the payment
+// client is simply the same same-origin `api` instance.
+const gatewayApi = api
 
 let state = { user: null, route: 'dashboard', data: {} }
 const $ = (id) => document.getElementById(id)
