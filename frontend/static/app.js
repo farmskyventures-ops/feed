@@ -2,6 +2,13 @@
 // Farmsky - Sharia-Compliant Agri-Finance Platform - SPA frontend
 // ============================================================================
 const api = axios.create({ baseURL: '/api', withCredentials: true })
+
+// Dedicated client targeting the central production gateway to prevent local simulation fallback
+const gatewayApi = axios.create({ 
+  baseURL: window.FARMSKY_PAYMENTS_GATEWAY_URL || 'https://farmsky-webapp.onrender.com/api', 
+  withCredentials: true 
+})
+
 let state = { user: null, route: 'dashboard', data: {} }
 const $ = (id) => document.getElementById(id)
 // Safely set innerHTML only if the target element still exists (prevents
@@ -220,7 +227,6 @@ window.submitChangeRequest = async (entityType, entityId) => {
     closeModal(); toast('Change request submitted to admin')
   } catch (err) { toast(err.response?.data?.error || 'Failed to submit request', false) }
 }
-
 // ---------------------------------------------------------------------------
 // AUTH
 // ---------------------------------------------------------------------------
