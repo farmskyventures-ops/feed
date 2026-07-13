@@ -35,30 +35,26 @@ export function smsConfigured(env: SmsEnv): boolean {
 export type SmsResult = { simulated: boolean; success: boolean; error?: string }
 
 /**
- * Formats Kenyan inputs strictly into the standard +254XXXXXXXXX 
- * international format structure required by TalkSasa.
+ * Formats Kenyan inputs strictly into the clean digit-only format 
+ * required by TalkSasa (e.g., 2547XXXXXXXX) without a leading plus sign.
  */
-function toE164(phone: string): string {
+function formatTalksasaPhone(phone: string): string {
   const digits = String(phone || '').replace(/[^0-9]/g, '')
   
   if (!digits) return ''
 
-  // Case 1: Standard local entry (e.g., 0712345678)
+  // Case 1: Standard local entry with leading 0 (e.g., 0712345678 -> 254712345678)
   if (digits.startsWith('0') && digits.length === 10) {
-    return '+254' + digits.substring(1)
+    return '254' + digits.substring(1)
   }
 
-  // Case 2: Local entry missing the zero prefix (e.g., 712345678)
+  // Case 2: Local entry missing the zero prefix (e.g., 712345678 -> 254712345678)
   if (digits.length === 9 && (digits.startsWith('7') || digits.startsWith('1'))) {
-    return '+254' + digits
+    return '254' + digits
   }
 
-  // Case 3: Country code flat digit string without the plus sign (e.g., 254712345678)
-  if (digits.startsWith('254') && (digits.length === 12 || digits.length === 11)) {
-    return '+' + digits
-  }
-
-  return '+' + digits
+  // Case 3: Already has the 254 country code prefix
+  return digits
 }
 
 export async function sendSms(
@@ -76,8 +72,8 @@ export async function sendSms(
     if (provider === 'talksasa') {
       // TalkSASA v3 SMS strict production body schema
       body = {
-        recipient: toE164(phone),
-        sender_id: env.SMS_SENDER_ID || 'Farmsky', // Matches your exact whitelisted sender string
+        recipient: formatTalksasaPhone(phone),
+        sender_id: env.SMS_SENDER_ID || 'TALKSASA', // Falls back to standard documentation test sender
         type: 'plain',
         message
       }
@@ -109,7 +105,7 @@ export async function sendSms(
     if (provider === 'talksasa') {
       try {
         const j = JSON.parse(txt)
-        if (j && j.status && String(j.status).toLowerCase() !== 'success') {
+        if (j && j.status && String(j.status).toLowerCase() === 'error') {
           return { simulated: false, success: false, error: j.message || 'TalkSASA rejected the message' }
         }
       } catch { /* Treat non-JSON 2xx as gateway pass */ }
