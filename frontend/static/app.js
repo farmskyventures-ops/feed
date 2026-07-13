@@ -1043,7 +1043,8 @@ window.doPay = async (id, kind) => {
   $('payStatus').innerHTML = `<div class="text-xs text-slate-500 mb-3 flex items-center gap-2"><span class="inline-block w-3.5 h-3.5 border-2 border-slate-300 border-t-teal-600 rounded-full animate-spin"></span>Sending ${methodLabel} payment request...</div>`
 
   try {
-    const { data } = await api.post(endpoint, payload)
+    // UPDATED: Fired payment initiation outward to central production gateway
+    const { data } = await gatewayApi.post(endpoint, payload)
 
     setHTML('payStatus', `<div class="bg-teal-50 border border-teal-200 rounded-lg p-2 text-xs text-teal-700 mb-3"><i class="fas fa-mobile-alt mr-1"></i>${esc(data.customer_message || 'STK push sent. Confirm on your phone.')}</div><div class="text-xs text-slate-500 mb-3 flex items-center gap-2"><span class="inline-block w-3.5 h-3.5 border-2 border-slate-300 border-t-teal-600 rounded-full animate-spin"></span>Waiting for ${methodLabel} confirmation...</div>`)
     const reEnable = () => { const b = $('payBtn'); if (b) { b.disabled = false; b.classList.remove('opacity-60', 'cursor-not-allowed', 'pointer-events-none'); b.removeAttribute('aria-busy'); if (b.dataset.label) b.innerHTML = b.dataset.label } }
@@ -1054,7 +1055,8 @@ window.doPay = async (id, kind) => {
       if (!$('payStatus') || !state.user) return
       tries++
       try {
-        const { data: cd } = await api.post(confirmEndpoint, { checkout_request_id: data.checkout_request_id })
+        // UPDATED: Request transaction verification through gateway logs
+        const { data: cd } = await gatewayApi.post(confirmEndpoint, { checkout_request_id: data.checkout_request_id })
         if (cd.status === 'success') {
           payStateAlert('success', null, cd.mpesa_receipt)
           toast((isCash ? 'Cash purchase complete! Receipt: ' : 'Payment received! Receipt: ') + cd.mpesa_receipt)
@@ -1086,14 +1088,16 @@ window.doSasaOtp = async (checkoutId, id, kind) => {
   if (!code) return toast('Enter the OTP code', false)
   setHTML('payStatus', `<div class="text-xs text-slate-500 mb-3"><i class="fas fa-spinner fa-spin mr-1"></i>Verifying OTP…</div>`)
   try {
-    await api.post('/sasapay/process', { checkout_request_id: checkoutId, verification_code: code })
+    // UPDATED: Send code validation out to central payment gateway 
+    await gatewayApi.post('/sasapay/process', { checkout_request_id: checkoutId, verification_code: code })
     setHTML('payStatus', `<div class="text-xs text-slate-500 mb-3"><i class="fas fa-spinner fa-spin mr-1"></i>OTP accepted. Confirming payment…</div>`)
     let tries = 0
     const poll = async () => {
       if (!$('payStatus') || !state.user) return
       tries++
       try {
-        const { data: cd } = await api.post('/sasapay/confirm', { checkout_request_id: checkoutId })
+        // UPDATED: Pull SasaPay wallet logs via central production gateway
+        const { data: cd } = await gatewayApi.post('/sasapay/confirm', { checkout_request_id: checkoutId })
         if (cd.status === 'success') {
           payStateAlert('success', null, cd.mpesa_receipt)
           toast((isCash ? 'Cash purchase complete! Receipt: ' : 'Payment received! Receipt: ') + cd.mpesa_receipt)
@@ -1114,7 +1118,9 @@ window.doSasaOtp = async (checkoutId, id, kind) => {
     setHTML('payStatus', `<div class="bg-red-50 border border-red-200 rounded-lg p-2 text-xs text-red-700 mb-3">${esc(err.response?.data?.error || (!err.response ? 'Network error — please check your connection and try again.' : 'OTP verification failed'))}</div>`)
   }
 }
+
 window.viewDoc = async (id) => {
+  // MAINTAINED: Kept local "api" instance intact because agreements live on local backend database
   const { data } = await api.get('/documents/contract/' + id)
   const c = data.contract
   showModal(`<div class="text-center">
@@ -1132,7 +1138,6 @@ window.viewDoc = async (id) => {
     <button onclick="closeModal()" class="btn mt-4 ml-2 bg-slate-100 px-5 py-2 rounded-lg text-sm">Close</button>
   </div>`)
 }
-
 // ---------------------------------------------------------------------------
 // APPROVALS (admin)
 // ---------------------------------------------------------------------------
