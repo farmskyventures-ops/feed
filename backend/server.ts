@@ -72,10 +72,14 @@ const ENV = {
   TRANSUNION_API_KEY: process.env.TRANSUNION_API_KEY,
   TRANSUNION_CLIENT_ID: process.env.TRANSUNION_CLIENT_ID,
   TRANSUNION_ENV: process.env.TRANSUNION_ENV,
-  // Central Payment Gateway client (equipment.farmsky.africa) — env only
-  FARMSKY_PAYMENTS_GATEWAY_URL: process.env.FARMSKY_PAYMENTS_GATEWAY_URL,
-  FARMSKY_PAYMENTS_CLIENT_KEY: process.env.FARMSKY_PAYMENTS_CLIENT_KEY,
-  FARMSKY_PAYMENTS_HMAC_SECRET: process.env.FARMSKY_PAYMENTS_HMAC_SECRET,
+  // Central Payment Gateway client (equipment.farmsky.africa) — env only.
+  // Accept BOTH naming conventions so the app works regardless of which
+  // variable names were entered in the Render dashboard:
+  //   - FARMSKY_PAYMENTS_GATEWAY_URL / _CLIENT_KEY / _HMAC_SECRET  (canonical)
+  //   - PAYMENT_GATEWAY_URL / PAYMENT_CLIENT_KEY                    (short aliases)
+  FARMSKY_PAYMENTS_GATEWAY_URL: process.env.FARMSKY_PAYMENTS_GATEWAY_URL || process.env.PAYMENT_GATEWAY_URL,
+  FARMSKY_PAYMENTS_CLIENT_KEY: process.env.FARMSKY_PAYMENTS_CLIENT_KEY || process.env.PAYMENT_CLIENT_KEY,
+  FARMSKY_PAYMENTS_HMAC_SECRET: process.env.FARMSKY_PAYMENTS_HMAC_SECRET || process.env.PAYMENT_HMAC_SECRET,
   // Session signing secret
   SESSION_SECRET: process.env.SESSION_SECRET
 }

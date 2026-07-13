@@ -705,27 +705,38 @@ app.post('/api/signup/request-otp', async (c) => {
   return c.json({ ok: true, phone: p, message: sms.simulated ? 'Demo mode: use the code shown below.' : `OTP sent to ${p}.`, demo_otp })
 })
 // Step 2: verify OTP + set password -> create account + auto sign-in.
+// Sign-up ONLY collects Full Name, phone and password. KYC data & document
+// attachments are added AFTER sign-up (via /api/me/profile & the KYC upload
+// endpoints) and are enforced only when the user attempts a FINANCING purchase.
 app.post('/api/signup/verify', async (c) => {
-  const { phone, full_name, code, password, region, national_id, id_front_url, id_back_url } = await c.req.json()
+  const { phone, full_name, code, password, region } = await c.req.json()
   const p = normalizePhone(phone || '')
+  if (!full_name || String(full_name).trim().length < 2) return c.json({ error: 'Enter your full name' }, 400)
   if (!password || String(password).length < 4) return c.json({ error: 'Password must be at least 4 characters' }, 400)
-  if (!id_front_url || !id_back_url) return c.json({ error: 'Upload front and back of the national ID to continue' }, 400)
   const v = await verifyOtp(c, p, code, 'signup')
   if (!v.ok) return c.json({ error: v.error }, 400)
   const existing = await c.env.DB.prepare(`SELECT id FROM users WHERE phone=?`).bind(p).first()
   if (existing) return c.json({ error: 'Account already exists. Please sign in.' }, 409)
   const role = 'customer'
   const farmerPerms = await permissionsForRole(c, role)
-  const r = await c.env.DB.prepare(
-    `INSERT INTO users (full_name, phone, password, role, status, region, password_set, label, permissions) VALUES (?,?,?, ?, 'active', ?, 1, ?, ?)`
-  ).bind(String(full_name).trim(), p, await hashPassword(String(password)), role, region || null, 'Farmer', JSON.stringify(farmerPerms)).run()
-  const userId = r.meta.last_row_id
-  await c.env.DB.prepare(
-    `INSERT INTO customers (user_id, full_name, national_id, mobile, id_front_url, id_back_url, kyc_status) VALUES (?,?,?,?,?,?, 'pending')`
-  ).bind(userId, String(full_name).trim(), national_id || null, p, id_front_url, id_back_url).run()
+  // Self-registration is a server-authorized write: run under the admin RLS
+  // context so the non-superuser DB role can create the user + bare customer
+  // profile (matches every other privileged insert in this file).
+  const userId = await withAdminContext(c, async () => {
+    const r = await c.env.DB.prepare(
+      `INSERT INTO users (full_name, phone, password, role, status, region, password_set, label, permissions) VALUES (?,?,?, ?, 'active', ?, 1, ?, ?)`
+    ).bind(String(full_name).trim(), p, await hashPassword(String(password)), role, region || null, 'Farmer', JSON.stringify(farmerPerms)).run()
+    const uid = r.meta.last_row_id
+    // Create a bare customer profile. KYC is 'not_started' until the farmer uploads
+    // their ID documents & profile data later (required before financing).
+    await c.env.DB.prepare(
+      `INSERT INTO customers (user_id, full_name, mobile, kyc_status) VALUES (?,?,?, 'not_started')`
+    ).bind(uid, String(full_name).trim(), p).run()
+    return uid
+  })
   const user = { id: userId, full_name: String(full_name).trim(), phone: p, role, region, label: 'Farmer', permissions: farmerPerms }
   await createSession(c, user)
-  await audit(c, userId, 'signup', 'user', 'customer self-registered via SMS OTP with ID documents')
+  await audit(c, userId, 'signup', 'user', 'customer self-registered via SMS OTP (name, phone, password)')
   return c.json({ ok: true, user })
 })
 
@@ -1344,12 +1355,17 @@ function runInBackground(c: any, work: () => Promise<void>) {
 }
 
 app.post('/api/mpesa/stkpush', requireAuth, async (c) => {
-  const { contract_id, amount, phone, payment_method } = await c.req.json()
+  const { contract_id, amount, phone, payment_method, channel_type, channel_code } = await c.req.json()
   const user = c.get('user')
   // Customer-facing rails only: M-Pesa and SasaPay. KCB Buni is a
   // backend/reconciliation-only rail and MUST NOT be selectable here — any
   // attempt to request it (or any other value) is coerced to 'mpesa'.
   const rail: 'mpesa' | 'sasapay' = payment_method === 'sasapay' ? 'sasapay' : 'mpesa'
+  // SasaPay channel routing (mobile money / bank / wallet). Mapped to the
+  // gateway's channel vocabulary; only forwarded when the rail is SasaPay.
+  const chanMap: Record<string, string> = { mobile: 'MOBILE_MONEY', bank: 'BANK', wallet: 'SASAPAY_WALLET' }
+  const gwChannel = rail === 'sasapay' ? (chanMap[String(channel_type || 'mobile')] || 'MOBILE_MONEY') : undefined
+  const gwChannelCode = rail === 'sasapay' ? (channel_code ? String(channel_code) : undefined) : undefined
   // The contract is read under admin context so a self-service buyer (who is not
   // the contract's onboarding agent) can still pay for their own purchase; we
   // then explicitly authorize the caller against the contract below.
@@ -1385,7 +1401,9 @@ app.post('/api/mpesa/stkpush', requireAuth, async (c) => {
       origin_reference: contract.contract_ref,
       description: desc,
       initiated_by_user: c.get('user').id,
-      idempotency_key: `feed-${contract.contract_ref}-${amt}`
+      idempotency_key: `feed-${contract.contract_ref}-${amt}`,
+      channel: gwChannel,
+      channelCode: gwChannelCode
     })
     if (!g.success) return c.json({ error: g.error || 'Payment gateway rejected the request' }, 502)
     // Store the gateway transaction_ref as the checkout id so /confirm can poll it.

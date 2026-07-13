@@ -332,6 +332,12 @@ window.kycHandlePick = async (input, hiddenId, previewId, statusId, nextSectionI
 }
 function kycStepCard({ sectionId, title, subtitle, previewId, statusId, hiddenId, galleryId, cameraId, cameraFacing = 'environment', cameraLabel = 'Open camera', nextSectionId = '', hidden = false, value = '', previewHtml = '', statusText = 'Required' }) {
   const isSelfie = previewId.toLowerCase().includes('selfie')
+  // The status badge uses a filled colored background so "Required" / "Captured"
+  // is clearly visible against the card, rather than faint low-contrast text.
+  const isCaptured = /captured/i.test(String(statusText))
+  const badgeCls = isCaptured
+    ? 'bg-emerald-100 text-emerald-800 border border-emerald-300'
+    : 'bg-amber-100 text-amber-800 border border-amber-300'
   return `
     <section id="${sectionId}" class="${hidden ? 'hidden ' : ''}border border-slate-200 rounded-xl p-4 bg-slate-50">
       <div class="flex items-start justify-between gap-3 mb-3">
@@ -339,7 +345,7 @@ function kycStepCard({ sectionId, title, subtitle, previewId, statusId, hiddenId
           <div class="text-sm font-semibold text-slate-800">${title}</div>
           <div class="text-xs text-slate-500">${subtitle}</div>
         </div>
-        <div id="${statusId}" class="text-xs text-amber-600">${statusText}</div>
+        <div id="${statusId}" class="text-[11px] font-semibold px-2 py-1 rounded-full ${badgeCls} whitespace-nowrap">${statusText}</div>
       </div>
       <div id="${previewId}" class="${isSelfie ? 'w-28 h-28 rounded-full' : 'w-full h-40 rounded-xl'} overflow-hidden bg-slate-200 flex items-center justify-center mx-auto border border-dashed border-slate-300">
         ${previewHtml || `<i class="fas ${isSelfie ? 'fa-user' : 'fa-id-card'} text-3xl text-slate-400"></i>`}
@@ -348,8 +354,8 @@ function kycStepCard({ sectionId, title, subtitle, previewId, statusId, hiddenId
       <input id="${galleryId}" type="file" accept="image/*" class="hidden" onchange="kycHandlePick(this,'${hiddenId}','${previewId}','${statusId}','${nextSectionId}')">
       <input id="${cameraId}" type="file" accept="image/*" capture="${cameraFacing}" class="hidden" onchange="kycHandlePick(this,'${hiddenId}','${previewId}','${statusId}','${nextSectionId}')">
       <div class="grid grid-cols-1 sm:grid-cols-2 gap-2 mt-3">
-        <button type="button" onclick="kycOpenPicker('${galleryId}')" class="btn bg-white border border-slate-300 px-3 py-2 rounded-lg text-sm"><i class="fas fa-image mr-1"></i>Upload from gallery</button>
-        <button type="button" onclick="kycOpenPicker('${cameraId}')" class="btn brand-bg text-white px-3 py-2 rounded-lg text-sm"><i class="fas fa-camera mr-1"></i>${cameraLabel}</button>
+        <button type="button" onclick="kycOpenPicker('${galleryId}')" class="btn bg-sky-600 hover:bg-sky-700 text-white border border-sky-700 px-3 py-2 rounded-lg text-sm font-semibold shadow-sm"><i class="fas fa-image mr-1"></i>Upload from gallery</button>
+        <button type="button" onclick="kycOpenPicker('${cameraId}')" class="btn bg-teal-600 hover:bg-teal-700 text-white border border-teal-700 px-3 py-2 rounded-lg text-sm font-semibold shadow-sm"><i class="fas fa-camera mr-1"></i>${cameraLabel}</button>
       </div>
     </section>`
 }
@@ -380,32 +386,18 @@ function authSignUpVerify(phone, name, demoOtp) {
     <form id="suvForm" class="space-y-4">
       <div><label class="text-sm font-medium text-slate-600">Verification Code</label>
         <input id="su_code" type="text" inputmode="numeric" placeholder="6-digit code" value="${esc(demoOtp || '')}" class="w-full mt-1 px-4 py-2.5 border border-slate-300 rounded-lg tracking-widest" required></div>
-      <div><label class="text-sm font-medium text-slate-600">National ID Number</label>
-        <input id="su_nid" type="text" placeholder="National ID" class="w-full mt-1 px-4 py-2.5 border border-slate-300 rounded-lg" required></div>
       <div><label class="text-sm font-medium text-slate-600">Create Password</label>
         ${passwordField('su_pass', { placeholder: 'Choose a password', required: true })}</div>
-      <div class="border-t pt-4">
-        <h4 class="font-semibold text-slate-800 mb-1">Identity capture</h4>
-        <p class="text-xs text-slate-500 mb-4">Step 1: ID front. Step 2: ID back. Step 3: passport photo for liveness.</p>
-        <div class="space-y-4">
-          ${kycStepCard({ sectionId: 'su_front_section', title: 'Step 1 — National ID front', subtitle: 'Upload from gallery or use the back camera.', previewId: 'su_front_preview', statusId: 'su_front_status', hiddenId: 'su_id_front_url', galleryId: 'su_front_gallery', cameraId: 'su_front_camera', cameraFacing: 'environment', cameraLabel: 'Open back camera', nextSectionId: 'su_back_section' })}
-          ${kycStepCard({ sectionId: 'su_back_section', title: 'Step 2 — National ID back', subtitle: 'Unlocks after the front image is captured.', previewId: 'su_back_preview', statusId: 'su_back_status', hiddenId: 'su_id_back_url', galleryId: 'su_back_gallery', cameraId: 'su_back_camera', cameraFacing: 'environment', cameraLabel: 'Open back camera', nextSectionId: 'su_selfie_section', hidden: true })}
-          ${kycStepCard({ sectionId: 'su_selfie_section', title: 'Step 3 — Passport photo / live selfie', subtitle: 'Use the front camera for liveness verification.', previewId: 'su_selfie_preview', statusId: 'su_selfie_status', hiddenId: 'su_selfie_url', galleryId: 'su_selfie_gallery', cameraId: 'su_selfie_camera', cameraFacing: 'user', cameraLabel: 'Open front camera', hidden: true })}
-        </div>
+      <div class="bg-sky-50 border border-sky-200 rounded-lg p-3 text-[12px] text-sky-800 leading-relaxed">
+        <i class="fas fa-circle-info mr-1"></i>You're almost done! Your ID documents and farm details are <b>not</b> needed to sign up. You can add them later from your profile — they're only required when you apply for <b>financing</b>. Cash purchases work right away.
       </div>
-      <button class="btn w-full brand-bg text-white py-2.5 rounded-lg font-semibold">Verify & Create Account</button>
+      <button class="btn w-full brand-bg text-white py-2.5 rounded-lg font-semibold">Create Account</button>
     </form>
     <button onclick="renderLogin('signup')" class="btn w-full mt-2 bg-slate-100 py-2 rounded-lg text-sm">Back</button>`
   $('suvForm').onsubmit = async (e) => {
     e.preventDefault()
     try {
-      const id_front_url = $('su_id_front_url').value
-      const id_back_url = $('su_id_back_url').value
-      const selfie_url = $('su_selfie_url').value
-      if (!id_front_url) return toast('Capture the front of the ID first', false)
-      if (!id_back_url) return toast('Capture the back of the ID next', false)
-      if (!selfie_url) return toast('Take the passport photo / selfie to continue', false)
-      const { data } = await api.post('/signup/verify', { phone, full_name: name, code: $('su_code').value, password: $('su_pass').value, national_id: $('su_nid').value, id_front_url, id_back_url, selfie_url })
+      const { data } = await api.post('/signup/verify', { phone, full_name: name, code: $('su_code').value, password: $('su_pass').value })
       state.user = data.user; toast('Account created. Welcome, ' + data.user.full_name); renderApp()
     } catch (err) { toast(err.response?.data?.error || 'Verification failed', false) }
   }
@@ -883,15 +875,37 @@ window.payModal = async (id, amount, outstanding, kind) => {
     <label class="text-sm font-medium block mb-2">Choose payment method</label>
     <div class="grid grid-cols-2 gap-3 mb-3">
       <label class="border rounded-lg p-3 text-center cursor-pointer bg-white border-slate-200 has-[:checked]:ring-2 has-[:checked]:ring-emerald-500 has-[:checked]:border-emerald-400">
-        <input type="radio" name="paymethod" value="mpesa" checked class="hidden">
+        <input type="radio" name="paymethod" value="mpesa" checked onchange="toggleSasaChannels()" class="hidden">
         <img src="/static/mpesa-logo.svg" alt="M-Pesa" class="h-10 mx-auto mb-1 object-contain">
         <div>${modeBadge(mpMode)}<span class="text-[10px] text-slate-400 block">via Farmsky Gateway</span></div>
       </label>
       <label class="border rounded-lg p-3 text-center cursor-pointer bg-white border-slate-200 has-[:checked]:ring-2 has-[:checked]:ring-green-500 has-[:checked]:border-green-400">
-        <input type="radio" name="paymethod" value="sasapay" class="hidden">
+        <input type="radio" name="paymethod" value="sasapay" onchange="toggleSasaChannels()" class="hidden">
         <img src="/static/sasapay-logo.svg" alt="SasaPay" class="h-10 mx-auto mb-1 object-contain">
-        <div><span class="text-[10px] text-slate-400 block">via Farmsky Gateway</span></div>
+        <div>${modeBadge(mpMode)}<span class="text-[10px] text-slate-400 block">via Farmsky Gateway</span></div>
       </label>
+    </div>
+
+    <!-- SasaPay channel customizer: Mobile Money / Bank / Wallet. Mirrors the
+         equipment app so customers can pay from a mobile network OR a bank
+         account. The prompt is delivered to the phone; no bank account number
+         is required. Hidden unless SasaPay is selected. -->
+    <div id="sasapayChannelBlock" class="hidden mb-3 p-3 bg-slate-50 border border-slate-200 rounded-lg space-y-3">
+      <div>
+        <label class="text-xs font-semibold text-slate-600 uppercase tracking-wider block mb-1">Pay from</label>
+        <select id="spChanType" onchange="onSasaChanTypeChange()" class="w-full px-2 py-1.5 border border-slate-300 bg-white rounded-md text-sm">
+          <option value="mobile">Mobile Money (M-PESA / Airtel / T-Kash / Telkom)</option>
+          <option value="bank">Bank Account</option>
+          <option value="wallet">SasaPay Wallet (OTP)</option>
+        </select>
+      </div>
+      <div id="spChanPickWrap">
+        <label class="text-xs font-semibold text-slate-600 uppercase tracking-wider block mb-1" id="spChanPickLabel">Network</label>
+        <select id="spChannelCode" class="w-full px-2 py-1.5 border border-slate-300 bg-white rounded-md text-sm"></select>
+      </div>
+      <div id="spBankAcctWrap" class="hidden">
+        <p class="text-xs text-slate-500">Select your bank above, then approve the payment prompt sent to your phone. A bank account number is not required.</p>
+      </div>
     </div>
 
     <label class="text-sm font-medium">Phone</label><input id="mpphone" value="${esc(state.user.phone)}" class="w-full mt-1 mb-3 px-3 py-2 border border-slate-300 rounded-lg">
@@ -998,14 +1012,35 @@ window.doPay = async (id, kind) => {
     payment_method: method
   }
 
-  const btn = $('payBtn'); btn.disabled = true; btn.classList.add('opacity-50')
-  $('payStatus').innerHTML = `<div class="text-xs text-slate-500 mb-3"><i class="fas fa-spinner fa-spin mr-1"></i>Sending ${methodLabel} payment request...</div>`
+  // Inject SasaPay channel routing (mobile / bank / wallet). Bank payments route
+  // via the selected bank/network code and the customer's phone number (prompt
+  // delivered to the phone) — no bank account number is required or sent.
+  if (method === 'sasapay') {
+    const type = $('spChanType')?.value || 'mobile'
+    const code = $('spChannelCode')?.value || ''
+    payload.channel_type = type
+    payload.channel_code = code
+    if (type === 'bank' && !code) {
+      $('payStatus').innerHTML = `<div class="bg-red-50 border border-red-200 rounded-lg p-2 text-xs text-red-700 mb-3">Please select your bank.</div>`
+      return
+    }
+  }
+
+  // Circular processing indicator on the button + disable to prevent double-click.
+  const btn = $('payBtn')
+  if (!btn || btn.disabled) return   // guard: already processing
+  btn.disabled = true
+  btn.classList.add('opacity-60', 'cursor-not-allowed', 'pointer-events-none')
+  btn.setAttribute('aria-busy', 'true')
+  btn.dataset.label = btn.innerHTML
+  btn.innerHTML = `<span class="inline-flex items-center justify-center gap-2"><span class="inline-block w-4 h-4 border-2 border-white/40 border-t-white rounded-full animate-spin"></span>Processing…</span>`
+  $('payStatus').innerHTML = `<div class="text-xs text-slate-500 mb-3 flex items-center gap-2"><span class="inline-block w-3.5 h-3.5 border-2 border-slate-300 border-t-teal-600 rounded-full animate-spin"></span>Sending ${methodLabel} payment request...</div>`
 
   try {
     const { data } = await api.post(endpoint, payload)
 
-    setHTML('payStatus', `<div class="bg-teal-50 border border-teal-200 rounded-lg p-2 text-xs text-teal-700 mb-3"><i class="fas fa-mobile-alt mr-1"></i>${esc(data.customer_message || 'STK push sent. Confirm on your phone.')}</div><div class="text-xs text-slate-500 mb-3"><i class="fas fa-spinner fa-spin mr-1"></i>Waiting for ${methodLabel} confirmation...</div>`)
-    const reEnable = () => { const b = $('payBtn'); if (b) { b.disabled = false; b.classList.remove('opacity-50') } }
+    setHTML('payStatus', `<div class="bg-teal-50 border border-teal-200 rounded-lg p-2 text-xs text-teal-700 mb-3"><i class="fas fa-mobile-alt mr-1"></i>${esc(data.customer_message || 'STK push sent. Confirm on your phone.')}</div><div class="text-xs text-slate-500 mb-3 flex items-center gap-2"><span class="inline-block w-3.5 h-3.5 border-2 border-slate-300 border-t-teal-600 rounded-full animate-spin"></span>Waiting for ${methodLabel} confirmation...</div>`)
+    const reEnable = () => { const b = $('payBtn'); if (b) { b.disabled = false; b.classList.remove('opacity-60', 'cursor-not-allowed', 'pointer-events-none'); b.removeAttribute('aria-busy'); if (b.dataset.label) b.innerHTML = b.dataset.label } }
     let tries = 0
     const poll = async () => {
       // Stop immediately if the modal was closed or the session ended — this
@@ -1034,7 +1069,7 @@ window.doPay = async (id, kind) => {
     setTimeout(poll, data.simulated ? 1200 : 4000)
   } catch (err) {
     setHTML('payStatus', `<div class="bg-red-50 border border-red-200 rounded-lg p-2 text-xs text-red-700 mb-3">${esc(err.response?.data?.error || (!err.response ? 'Network error — please check your connection and try again.' : 'Payment failed'))}</div>`)
-    const b = $('payBtn'); if (b) { b.disabled = false; b.classList.remove('opacity-50') }
+    const b = $('payBtn'); if (b) { b.disabled = false; b.classList.remove('opacity-60', 'cursor-not-allowed', 'pointer-events-none'); b.removeAttribute('aria-busy'); if (b.dataset.label) b.innerHTML = b.dataset.label }
   }
 }
 

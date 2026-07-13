@@ -20,6 +20,11 @@ export interface InitiatePaymentOptions {
   description?: string
   initiated_by_user?: number
   idempotency_key?: string
+  // SasaPay channel routing (mobile money / bank / wallet). Only meaningful when
+  // payment_method === 'sasapay'; the host gateway maps these to the provider.
+  channel?: string          // 'MOBILE_MONEY' | 'BANK' | 'SASAPAY_WALLET'
+  channelCode?: string      // network/bank code selected by the customer
+  accountNumber?: string    // optional; bank prompts are delivered to the phone
 }
 
 export interface GatewayResult {
@@ -64,7 +69,11 @@ export async function initiatePayment(env: GatewayEnv, opts: InitiatePaymentOpti
       payment_method: opts.payment_method,
       origin_reference: opts.origin_reference,
       description: opts.description,
-      initiated_by_user: opts.initiated_by_user
+      initiated_by_user: opts.initiated_by_user,
+      // SasaPay channel routing (ignored by the host for M-Pesa/Buni)
+      channel: opts.channel,
+      channelCode: opts.channelCode,
+      accountNumber: opts.accountNumber
     })
 
     const { timestamp, nonce, signature } = await signRequest(secret, clientKey, body)
