@@ -882,11 +882,11 @@ window.payModal = async (id, amount, outstanding, kind) => {
     <div class="grid grid-cols-2 gap-3 mb-3">
       <label class="border rounded-lg p-3 text-center cursor-pointer bg-white border-slate-200 has-[:checked]:ring-2 has-[:checked]:ring-emerald-500 has-[:checked]:border-emerald-400">
         <input type="radio" name="paymethod" value="mpesa" checked onchange="toggleSasaChannels()" class="hidden">
-        <img src="/static/mpesa-logo.svg" alt="M-Pesa" class="h-10 mx-auto mb-1 object-contain">
+        <img src="/static/mpesa-logo.png" alt="M-Pesa" class="h-10 mx-auto mb-1 object-contain">
       </label>
       <label class="border rounded-lg p-3 text-center cursor-pointer bg-white border-slate-200 has-[:checked]:ring-2 has-[:checked]:ring-green-500 has-[:checked]:border-green-400">
         <input type="radio" name="paymethod" value="sasapay" onchange="toggleSasaChannels()" class="hidden">
-        <img src="/static/sasapay-logo.svg" alt="SasaPay" class="h-10 mx-auto mb-1 object-contain">
+        <img src="/static/sasapay-logo.png" alt="SasaPay" class="h-10 mx-auto mb-1 object-contain">
       </label>
     </div>
 

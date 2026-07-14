@@ -1,6 +1,0 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 72" role="img" aria-label="M-PESA">
-  <rect x="1" y="1" width="198" height="70" rx="12" fill="#ffffff" stroke="#e2e8f0" stroke-width="2"/>
-  <rect x="10" y="12" width="180" height="30" rx="6" fill="#e30613"/>
-  <text x="100" y="33" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="20" font-weight="700" fill="#ffffff" letter-spacing="0.5">M-PESA</text>
-  <text x="100" y="60" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="12" font-weight="700" fill="#009a44">SAFARICOM</text>
-</svg>
