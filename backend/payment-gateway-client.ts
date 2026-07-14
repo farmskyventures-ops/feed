@@ -149,6 +149,48 @@ export async function initiatePayment(env: GatewayEnv, opts: InitiatePaymentOpti
 }
 
 /**
+ * Complete a SasaPay WALLET checkout by submitting the buyer's OTP
+ * (VerificationCode) to the central gateway. Only meaningful when the gateway
+ * returned needs_otp=true on /initiate. The gateway forwards the code to
+ * SasaPay's process-payment endpoint and settlement then arrives via callback,
+ * so this simply authorises the debit; the caller keeps polling /status.
+ *
+ * The gateway exposes this at POST /process with a JSON body carrying the
+ * transaction_ref and verification_code, HMAC-signed like every other call.
+ */
+export async function processPayment(
+  env: GatewayEnv,
+  transactionRef: string,
+  verificationCode: string
+): Promise<GatewayResult> {
+  if (!gatewayConfigured(env)) return { success: false, error: 'gateway_not_configured' }
+  try {
+    const key = clientKey(env)
+    const secret = String(env.FARMSKY_PAYMENTS_HMAC_SECRET)
+    const body = JSON.stringify({ transaction_ref: transactionRef, verification_code: verificationCode })
+    const { timestamp, nonce, signature } = await signRequest(secret, key, body)
+    const headers: Record<string, string> = {
+      'Content-Type': 'application/json',
+      'X-Farmsky-Client': key,
+      'X-Farmsky-Timestamp': timestamp,
+      'X-Farmsky-Nonce': nonce,
+      'X-Farmsky-Signature': signature
+    }
+    const res = await fetch(`${baseUrl(env)}/process`, { method: 'POST', headers, body })
+    const text = await res.text()
+    let json: GatewayResult = {} as GatewayResult
+    try { json = text ? JSON.parse(text) : ({} as GatewayResult) } catch { /* non-JSON */ }
+    if (!res.ok) {
+      const detail = json.error || (text ? text.slice(0, 160) : `gateway_http_${res.status}`)
+      return { success: false, status: String(res.status), error: detail }
+    }
+    return { success: true, ...json }
+  } catch (err: any) {
+    return { success: false, error: `gateway_connection_failed: ${err?.message || err}` }
+  }
+}
+
+/**
  * Check status of a transaction.
  */
 export async function getPaymentStatus(env: GatewayEnv, transactionRef: string): Promise<GatewayResult> {

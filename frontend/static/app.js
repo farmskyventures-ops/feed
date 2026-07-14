@@ -45,6 +45,67 @@ api.interceptors.response.use(
 )
 const fmt = (n) => 'KES ' + Number(n || 0).toLocaleString()
 const esc = (s) => String(s ?? '').replace(/[&<>"]/g, m => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[m]))
+
+// ---------------------------------------------------------------------------
+// GLOBAL UI HELPERS: button busy-state + OTP resend cooldown
+// ---------------------------------------------------------------------------
+// btnLoading(btn, label): disable a button, remember its original markup, and
+// show an inline spinner + a status word ("Loading…" / "Processing…" / etc.)
+// so the user cannot double-click and always sees that work is in progress.
+// Accepts either an element or an element id. Returns a done() restorer.
+function btnLoading(target, label = 'Processing…') {
+  const btn = typeof target === 'string' ? $(target) : target
+  if (!btn) return () => {}
+  if (btn.disabled) return () => {}           // already busy — ignore re-entry
+  btn.disabled = true
+  btn.setAttribute('aria-busy', 'true')
+  btn.classList.add('opacity-60', 'cursor-not-allowed', 'pointer-events-none')
+  if (btn.dataset.origHtml === undefined) btn.dataset.origHtml = btn.innerHTML
+  btn.innerHTML = `<span class="inline-flex items-center justify-center gap-2"><span class="inline-block w-4 h-4 border-2 border-white/40 border-t-white rounded-full animate-spin"></span>${esc(label)}</span>`
+  return () => btnReset(btn)
+}
+// btnReset(btn): re-enable a button and restore its original label markup.
+function btnReset(target) {
+  const btn = typeof target === 'string' ? $(target) : target
+  if (!btn) return
+  btn.disabled = false
+  btn.removeAttribute('aria-busy')
+  btn.classList.remove('opacity-60', 'cursor-not-allowed', 'pointer-events-none')
+  if (btn.dataset.origHtml !== undefined) { btn.innerHTML = btn.dataset.origHtml; delete btn.dataset.origHtml }
+}
+window.btnLoading = btnLoading
+window.btnReset = btnReset
+
+// startResendCountdown(btnId, seconds, onResend): manage a "Resend code" button
+// that stays disabled for `seconds` after each send (so the user cannot trigger
+// a flood of OTP SMS), counting down live, then re-enabling itself. Clears any
+// previous timer for the same button so re-renders don't stack intervals.
+const _resendTimers = {}
+function startResendCountdown(btnId, seconds, onResend) {
+  const btn = $(btnId)
+  if (!btn) return
+  if (_resendTimers[btnId]) { clearInterval(_resendTimers[btnId]); delete _resendTimers[btnId] }
+  let remaining = Math.max(1, Number(seconds) || 30)
+  const baseLabel = 'Resend code'
+  const tick = () => {
+    const b = $(btnId); if (!b) { clearInterval(_resendTimers[btnId]); delete _resendTimers[btnId]; return }
+    if (remaining > 0) {
+      b.disabled = true
+      b.classList.add('opacity-60', 'cursor-not-allowed')
+      b.innerHTML = `Resend code in ${remaining}s`
+      remaining--
+    } else {
+      clearInterval(_resendTimers[btnId]); delete _resendTimers[btnId]
+      b.disabled = false
+      b.classList.remove('opacity-60', 'cursor-not-allowed')
+      b.innerHTML = `<i class="fas fa-rotate-right mr-1"></i>${baseLabel}`
+    }
+  }
+  tick()
+  _resendTimers[btnId] = setInterval(tick, 1000)
+  if (typeof onResend === 'function') btn.onclick = onResend
+}
+window.startResendCountdown = startResendCountdown
 // Friendly labels for payment types
 const payLabel = (t, model) => {
   if (t === 'financing') {
@@ -291,14 +352,15 @@ function authSignIn() {
         <label class="text-sm font-medium text-slate-600">Password</label>
         ${passwordField('password', { placeholder: '••••', required: true })}
       </div>
-      <button class="btn w-full brand-bg text-white py-2.5 rounded-lg font-semibold">Sign In</button>
+      <button id="loginBtn" class="btn w-full brand-bg text-white py-2.5 rounded-lg font-semibold">Sign In</button>
     </form>`
   $('loginForm').onsubmit = async (e) => {
     e.preventDefault()
+    const done = btnLoading('loginBtn', 'Signing in…')
     try {
       const { data } = await api.post('/login', { phone: $('phone').value, password: $('password').value })
       state.user = data.user; toast('Welcome, ' + data.user.full_name); renderApp()
-    } catch (err) { toast(err.response?.data?.error || 'Login failed', false) }
+    } catch (err) { done(); toast(err.response?.data?.error || 'Login failed', false) }
   }
 }
 // ---------------------------------------------------------------------------
@@ -312,6 +374,63 @@ function kycFileToDataUrl(file) {
     reader.readAsDataURL(file)
   })
 }
+// Allowed raster image formats for user uploads (profile picture, KYC).
+const ALLOWED_IMAGE_TYPES = ['image/png', 'image/jpeg', 'image/jpg', 'image/webp', 'image/gif']
+const MAX_IMAGE_BYTES = 5 * 1024 * 1024   // 5 MB
+// validateImageFile: defence-in-depth client check before we even read the file.
+// Confirms the declared MIME type is an image we accept AND sniffs the first
+// bytes so a mislabelled / disguised file (e.g. a script renamed .png) is
+// rejected before upload. Returns { ok, error }. The server re-validates too.
+async function validateImageFile(file) {
+  if (!file) return { ok: false, error: 'No file selected.' }
+  const type = String(file.type || '').toLowerCase()
+  if (!ALLOWED_IMAGE_TYPES.includes(type)) {
+    return { ok: false, error: 'Only PNG, JPEG, WEBP or GIF images are allowed.' }
+  }
+  if (file.size > MAX_IMAGE_BYTES) {
+    return { ok: false, error: 'Image is too large (max 5 MB).' }
+  }
+  // Magic-byte sniff on the first 12 bytes.
+  try {
+    const buf = new Uint8Array(await file.slice(0, 12).arrayBuffer())
+    const hex = Array.from(buf).map(b => b.toString(16).padStart(2, '0')).join('')
+    const isPng = hex.startsWith('89504e47')
+    const isJpg = hex.startsWith('ffd8ff')
+    const isGif = hex.startsWith('474946383')          // GIF87a / GIF89a
+    const isWebp = buf.length >= 12 &&
+      String.fromCharCode(buf[0], buf[1], buf[2], buf[3]) === 'RIFF' &&
+      String.fromCharCode(buf[8], buf[9], buf[10], buf[11]) === 'WEBP'
+    if (!(isPng || isJpg || isGif || isWebp)) {
+      return { ok: false, error: 'That file is not a valid image.' }
+    }
+  } catch (_) {
+    return { ok: false, error: 'Could not read the image file.' }
+  }
+  return { ok: true }
+}
+window.validateImageFile = validateImageFile
+// pickAvatar: validate the chosen file, then load it into the hidden field +
+// live preview. Rejects anything that is not a genuine image.
+window.pickAvatar = async (input) => {
+  const file = input?.files?.[0]
+  const hint = $('pf_avatar_hint')
+  if (!file) return
+  const v = await validateImageFile(file)
+  if (!v.ok) {
+    input.value = ''
+    if (hint) { hint.className = 'text-[11px] text-red-600 mt-1'; hint.textContent = v.error }
+    return
+  }
+  try {
+    const dataUrl = await kycFileToDataUrl(file)
+    const hidden = $('pf_avatar_data'); if (hidden) hidden.value = dataUrl
+    const box = $('avatarPreview')
+    if (box) box.innerHTML = `<img src="${dataUrl}" class="h-24 w-24 rounded-full object-cover border-2 border-teal-200">`
+    if (hint) { hint.className = 'text-[11px] text-emerald-600 mt-1'; hint.textContent = '✓ ' + file.name + ' ready — click Save picture.' }
+  } catch (_) {
+    if (hint) { hint.className = 'text-[11px] text-red-600 mt-1'; hint.textContent = 'Could not read the image file.' }
+  }
+}
 window.kycOpenPicker = (inputId) => {
   const input = $(inputId)
   if (!input) return
@@ -321,6 +440,9 @@ window.kycOpenPicker = (inputId) => {
 window.kycHandlePick = async (input, hiddenId, previewId, statusId, nextSectionId = '') => {
   const file = input?.files?.[0]
   if (!file) return
+  // Only accept genuine image files (PNG/JPEG/WEBP/GIF); reject disguised files.
+  const iv = await validateImageFile(file)
+  if (!iv.ok) { input.value = ''; toast(iv.error, false); return }
   try {
     const dataUrl = await kycFileToDataUrl(file)
     const hidden = $(hiddenId)
@@ -377,14 +499,15 @@ function authSignUp() {
         <input id="su_name" type="text" placeholder="Jane Wanjiku" class="w-full mt-1 px-4 py-2.5 border border-slate-300 rounded-lg" required></div>
       <div><label class="text-sm font-medium text-slate-600">Mobile Number</label>
         <input id="su_phone" type="text" placeholder="07XX XXX XXX" class="w-full mt-1 px-4 py-2.5 border border-slate-300 rounded-lg" required></div>
-      <button class="btn w-full brand-bg text-white py-2.5 rounded-lg font-semibold"><i class="fas fa-paper-plane mr-1"></i>Send Verification Code</button>
+      <button id="suSendBtn" class="btn w-full brand-bg text-white py-2.5 rounded-lg font-semibold"><i class="fas fa-paper-plane mr-1"></i>Send Verification Code</button>
     </form>`
   $('suForm').onsubmit = async (e) => {
     e.preventDefault()
+    const done = btnLoading('suSendBtn', 'Sending…')
     try {
       const { data } = await api.post('/signup/request-otp', { phone: $('su_phone').value, full_name: $('su_name').value })
       authSignUpVerify(data.phone, $('su_name').value, data.demo_otp)
-    } catch (err) { toast(err.response?.data?.error || 'Could not send code', false) }
+    } catch (err) { done(); toast(err.response?.data?.error || 'Could not send code', false) }
   }
 }
 function authSignUpVerify(phone, name, demoOtp) {
@@ -399,15 +522,35 @@ function authSignUpVerify(phone, name, demoOtp) {
       <div class="bg-sky-50 border border-sky-200 rounded-lg p-3 text-[12px] text-sky-800 leading-relaxed">
         <i class="fas fa-circle-info mr-1"></i>You're almost done! Your ID documents and farm details are <b>not</b> needed to sign up. You can add them later from your profile — they're only required when you apply for <b>financing</b>. Cash purchases work right away.
       </div>
-      <button class="btn w-full brand-bg text-white py-2.5 rounded-lg font-semibold">Create Account</button>
+      <button id="suvBtn" class="btn w-full brand-bg text-white py-2.5 rounded-lg font-semibold">Create Account</button>
     </form>
+    <div class="text-center mt-3 text-sm text-slate-500">
+      Didn't get the code?
+      <button id="suResendBtn" type="button" class="text-teal-600 font-semibold ml-1"></button>
+    </div>
     <button onclick="renderLogin('signup')" class="btn w-full mt-2 bg-slate-100 py-2 rounded-lg text-sm">Back</button>`
+  // Resend: disabled for a short cooldown after each send to avoid multiple OTPs.
+  const suResend = async () => {
+    const done = btnLoading('suResendBtn', 'Sending…')
+    try {
+      const { data } = await api.post('/signup/request-otp', { phone, full_name: name })
+      toast('A new code has been sent to ' + phone)
+      // Re-render the verify screen so the demo code (if any) refreshes; this
+      // also re-arms the resend cooldown on the freshly-rendered button.
+      authSignUpVerify(data.phone, name, data.demo_otp)
+    } catch (err) {
+      done(); startResendCountdown('suResendBtn', 30, suResend)
+      toast(err.response?.data?.error || 'Could not resend code', false)
+    }
+  }
+  startResendCountdown('suResendBtn', 30, suResend)
   $('suvForm').onsubmit = async (e) => {
     e.preventDefault()
+    const done = btnLoading('suvBtn', 'Creating account…')
     try {
       const { data } = await api.post('/signup/verify', { phone, full_name: name, code: $('su_code').value, password: $('su_pass').value })
       state.user = data.user; toast('Account created. Welcome, ' + data.user.full_name); renderApp()
-    } catch (err) { toast(err.response?.data?.error || 'Verification failed', false) }
+    } catch (err) { done(); toast(err.response?.data?.error || 'Verification failed', false) }
   }
 }
 // ---- PASSWORD RESET (SMS OTP) ----
@@ -417,14 +560,15 @@ function authReset() {
     <form id="rsForm" class="space-y-3">
       <div><label class="text-sm font-medium text-slate-600">Mobile Number</label>
         <input id="rs_phone" type="text" placeholder="07XX XXX XXX" class="w-full mt-1 px-4 py-2.5 border border-slate-300 rounded-lg" required></div>
-      <button class="btn w-full brand-bg text-white py-2.5 rounded-lg font-semibold"><i class="fas fa-paper-plane mr-1"></i>Send Reset Code</button>
+      <button id="rsSendBtn" class="btn w-full brand-bg text-white py-2.5 rounded-lg font-semibold"><i class="fas fa-paper-plane mr-1"></i>Send Reset Code</button>
     </form>`
   $('rsForm').onsubmit = async (e) => {
     e.preventDefault()
+    const done = btnLoading('rsSendBtn', 'Sending…')
     try {
       const { data } = await api.post('/reset-password/request-otp', { phone: $('rs_phone').value })
       authResetVerify(data.phone, data.demo_otp)
-    } catch (err) { toast(err.response?.data?.error || 'Could not send code', false) }
+    } catch (err) { done(); toast(err.response?.data?.error || 'Could not send code', false) }
   }
 }
 function authResetVerify(phone, demoOtp) {
@@ -436,15 +580,33 @@ function authResetVerify(phone, demoOtp) {
         <input id="rs_code" type="text" inputmode="numeric" placeholder="6-digit code" value="${esc(demoOtp || '')}" class="w-full mt-1 px-4 py-2.5 border border-slate-300 rounded-lg tracking-widest" required></div>
       <div><label class="text-sm font-medium text-slate-600">New Password</label>
         ${passwordField('rs_pass', { placeholder: 'New password', required: true })}</div>
-      <button class="btn w-full brand-bg text-white py-2.5 rounded-lg font-semibold">Update Password</button>
+      <button id="rsvBtn" class="btn w-full brand-bg text-white py-2.5 rounded-lg font-semibold">Update Password</button>
     </form>
+    <div class="text-center mt-3 text-sm text-slate-500">
+      Didn't get the code?
+      <button id="rsResendBtn" type="button" class="text-teal-600 font-semibold ml-1"></button>
+    </div>
     <button onclick="renderLogin('reset')" class="btn w-full mt-2 bg-slate-100 py-2 rounded-lg text-sm">Back</button>`
+  // Resend: disabled for a short cooldown after each send to avoid multiple OTPs.
+  const rsResend = async () => {
+    const done = btnLoading('rsResendBtn', 'Sending…')
+    try {
+      const { data } = await api.post('/reset-password/request-otp', { phone })
+      toast('A new reset code has been sent to ' + phone)
+      authResetVerify(data.phone, data.demo_otp)
+    } catch (err) {
+      done(); startResendCountdown('rsResendBtn', 30, rsResend)
+      toast(err.response?.data?.error || 'Could not resend code', false)
+    }
+  }
+  startResendCountdown('rsResendBtn', 30, rsResend)
   $('rsvForm').onsubmit = async (e) => {
     e.preventDefault()
+    const done = btnLoading('rsvBtn', 'Updating…')
     try {
       await api.post('/reset-password/verify', { phone, code: $('rs_code').value, password: $('rs_pass').value })
       toast('Password updated. Please sign in.'); renderLogin('signin')
-    } catch (err) { toast(err.response?.data?.error || 'Reset failed', false) }
+    } catch (err) { done(); toast(err.response?.data?.error || 'Reset failed', false) }
   }
 }
 window.renderLogin = renderLogin
@@ -717,11 +879,12 @@ window.getQuote = async (productId) => {
       ${data.terms_text ? `<div class="mt-3 text-xs text-slate-600 bg-white/70 rounded-lg p-3 border border-teal-100"><b>Terms summary:</b> ${esc(data.terms_text)}</div>` : ''}
       ${data.terms_document_url ? `<p class="mt-2 text-xs"><a href="${esc(data.terms_document_url)}" target="_blank" class="text-teal-700 underline">Open uploaded agreement</a></p>` : ''}
       <label class="flex items-center gap-2 mt-3 text-sm"><input type="checkbox" id="consent"> I consent to these configured cash / financing terms.</label>
-      <button onclick="submitBuy(${productId})" class="btn w-full mt-3 brand-bg text-white py-2.5 rounded-lg text-sm">${financing ? 'Submit Financing Application' : 'Confirm Cash Purchase'}</button>
+      <button onclick="submitBuy(${productId}, event)" class="btn w-full mt-3 brand-bg text-white py-2.5 rounded-lg text-sm">${financing ? 'Submit Financing Application' : 'Confirm Cash Purchase'}</button>
     </div>`
 }
-window.submitBuy = async (productId) => {
+window.submitBuy = async (productId, ev) => {
   if (!$('consent').checked) return toast('Consent is required (Sharia requirement)', false)
+  const done = btnLoading(ev?.currentTarget, 'Submitting…')
   const body = { product_id: productId, quantity: $('qty').value, payment_type: $('ptype').value, term_months: $('term') ? $('term').value : 0, delivery_location: $('dloc').value, consent: true }
   try {
     const { data } = await api.post('/murabaha/apply', body)
@@ -734,6 +897,7 @@ window.submitBuy = async (productId) => {
     toast('Application submitted: ' + data.contract_ref)
     state.route = 'contracts'; renderApp()
   } catch (err) {
+    done()
     const d = err.response?.data
     if (err.response?.status === 412 && d?.error === 'kyc_required') {
       showModal(`<div class="text-center">
@@ -1033,19 +1197,47 @@ window.doPay = async (id, kind) => {
   // Circular processing indicator on the button + disable to prevent double-click.
   const btn = $('payBtn')
   if (!btn || btn.disabled) return   // guard: already processing
-  btn.disabled = true
-  btn.classList.add('opacity-60', 'cursor-not-allowed', 'pointer-events-none')
-  btn.setAttribute('aria-busy', 'true')
-  btn.dataset.label = btn.innerHTML
-  btn.innerHTML = `<span class="inline-flex items-center justify-center gap-2"><span class="inline-block w-4 h-4 border-2 border-white/40 border-t-white rounded-full animate-spin"></span>Processing…</span>`
+  const reEnable = () => btnReset('payBtn')
+  btnLoading('payBtn', 'Processing…')
   $('payStatus').innerHTML = `<div class="text-xs text-slate-500 mb-3 flex items-center gap-2"><span class="inline-block w-3.5 h-3.5 border-2 border-slate-300 border-t-teal-600 rounded-full animate-spin"></span>Sending ${methodLabel} payment request...</div>`
 
   try {
     // UPDATED: Fired payment initiation outward to central production gateway
     const { data } = await gatewayApi.post(endpoint, payload)
 
+    // SasaPay WALLET flow: if the central gateway indicates an OTP is required
+    // (SasaPay wallet, NetworkCode 0), prompt the buyer for the code in-app and
+    // complete via the gateway-routed /mpesa/process step. For mobile money and
+    // bank rails the prompt is delivered to the phone and no OTP box is shown.
+    if (method === 'sasapay' && data.needs_otp) {
+      reEnable()
+      setHTML('payStatus', `<div class="bg-green-50 border border-green-200 rounded-lg p-2 text-xs text-green-700 mb-2">${esc(data.customer_message || 'Enter the OTP sent to your SasaPay wallet to authorise the payment.')}</div>
+        <div class="flex gap-2 mb-2">
+          <input id="spOtp" type="text" inputmode="numeric" placeholder="OTP code" class="flex-1 px-3 py-2 border border-slate-300 rounded-lg text-sm">
+          <button id="spOtpBtn" onclick="doSasaOtp('${esc(data.checkout_request_id)}', ${id}, '${kind}')" class="btn brand-bg text-white px-4 rounded-lg text-sm whitespace-nowrap">Verify</button>
+        </div>
+        <div class="text-xs text-slate-500 text-right">Didn't get the OTP?
+          <button id="spOtpResend" type="button" class="text-teal-600 font-semibold ml-1"></button>
+        </div>`)
+      // Allow the buyer to request a fresh wallet OTP after a short cooldown.
+      const resendOtp = async () => {
+        const d2 = btnLoading('spOtpResend', 'Sending…')
+        try {
+          const { data: rd } = await gatewayApi.post(endpoint, payload)
+          toast('A new OTP has been sent to your SasaPay wallet.')
+          // Point the Verify button at the new checkout id, then re-arm cooldown.
+          const vb = $('spOtpBtn'); if (vb && rd.checkout_request_id) vb.setAttribute('onclick', `doSasaOtp('${esc(rd.checkout_request_id)}', ${id}, '${kind}')`)
+          d2(); startResendCountdown('spOtpResend', 30, resendOtp)
+        } catch (err) {
+          d2(); startResendCountdown('spOtpResend', 30, resendOtp)
+          toast(err.response?.data?.error || 'Could not resend OTP', false)
+        }
+      }
+      startResendCountdown('spOtpResend', 30, resendOtp)
+      return
+    }
+
     setHTML('payStatus', `<div class="bg-teal-50 border border-teal-200 rounded-lg p-2 text-xs text-teal-700 mb-3"><i class="fas fa-mobile-alt mr-1"></i>${esc(data.customer_message || 'STK push sent. Confirm on your phone.')}</div><div class="text-xs text-slate-500 mb-3 flex items-center gap-2"><span class="inline-block w-3.5 h-3.5 border-2 border-slate-300 border-t-teal-600 rounded-full animate-spin"></span>Waiting for ${methodLabel} confirmation...</div>`)
-    const reEnable = () => { const b = $('payBtn'); if (b) { b.disabled = false; b.classList.remove('opacity-60', 'cursor-not-allowed', 'pointer-events-none'); b.removeAttribute('aria-busy'); if (b.dataset.label) b.innerHTML = b.dataset.label } }
     let tries = 0
     const poll = async () => {
       // Stop immediately if the modal was closed or the session ended — this
@@ -1075,45 +1267,50 @@ window.doPay = async (id, kind) => {
     setTimeout(poll, data.simulated ? 1200 : 4000)
   } catch (err) {
     setHTML('payStatus', `<div class="bg-red-50 border border-red-200 rounded-lg p-2 text-xs text-red-700 mb-3">${esc(err.response?.data?.error || (!err.response ? 'Network error — please check your connection and try again.' : 'Payment failed'))}</div>`)
-    const b = $('payBtn'); if (b) { b.disabled = false; b.classList.remove('opacity-60', 'cursor-not-allowed', 'pointer-events-none'); b.removeAttribute('aria-busy'); if (b.dataset.label) b.innerHTML = b.dataset.label }
+    btnReset('payBtn')
   }
 }
 
-// Submit the SasaPay wallet OTP, then poll /sasapay/confirm to settle the contract.
+// Submit the SasaPay wallet OTP through the central gateway, then poll
+// /mpesa/confirm to settle the contract. The Verify button shows a busy state
+// so the OTP is never submitted twice.
 window.doSasaOtp = async (checkoutId, id, kind) => {
   const isCash = kind === 'cash'
   const code = $('spOtp')?.value?.trim()
   if (!code) return toast('Enter the OTP code', false)
-  setHTML('payStatus', `<div class="text-xs text-slate-500 mb-3"><i class="fas fa-spinner fa-spin mr-1"></i>Verifying OTP…</div>`)
+  const doneBtn = btnLoading('spOtpBtn', 'Verifying…')
+  setHTML('payStatus', `<div class="text-xs text-slate-500 mb-3 flex items-center gap-2"><span class="inline-block w-3.5 h-3.5 border-2 border-slate-300 border-t-teal-600 rounded-full animate-spin"></span>Verifying OTP…</div>`)
   try {
-    // UPDATED: Send code validation out to central payment gateway 
-    await gatewayApi.post('/sasapay/process', { checkout_request_id: checkoutId, verification_code: code })
-    setHTML('payStatus', `<div class="text-xs text-slate-500 mb-3"><i class="fas fa-spinner fa-spin mr-1"></i>OTP accepted. Confirming payment…</div>`)
+    // Send the wallet OTP out through the central payment gateway (server-side
+    // HMAC-signed forward to equipment.farmsky.africa).
+    await gatewayApi.post('/mpesa/process', { checkout_request_id: checkoutId, verification_code: code })
+    setHTML('payStatus', `<div class="text-xs text-slate-500 mb-3 flex items-center gap-2"><span class="inline-block w-3.5 h-3.5 border-2 border-slate-300 border-t-teal-600 rounded-full animate-spin"></span>OTP accepted. Confirming payment…</div>`)
     let tries = 0
     const poll = async () => {
       if (!$('payStatus') || !state.user) return
       tries++
       try {
-        // UPDATED: Pull SasaPay wallet logs via central production gateway
-        const { data: cd } = await gatewayApi.post('/sasapay/confirm', { checkout_request_id: checkoutId })
+        // Poll the definitive status via the central production gateway.
+        const { data: cd } = await gatewayApi.post('/mpesa/confirm', { checkout_request_id: checkoutId })
         if (cd.status === 'success') {
           payStateAlert('success', null, cd.mpesa_receipt)
           toast((isCash ? 'Cash purchase complete! Receipt: ' : 'Payment received! Receipt: ') + cd.mpesa_receipt)
           setTimeout(() => { closeModal(); state.route = 'contracts'; renderApp() }, 1800)
           return
         }
-        else if (cd.status === 'failed') { payStateAlert('failed', cd.result_desc || 'Payment failed'); return }
+        else if (cd.status === 'failed') { payStateAlert('failed', cd.result_desc || 'Payment failed'); btnReset('spOtpBtn'); return }
       } catch (e) {
         const st = e?.response?.status
-        if (st === 401 || st === 403 || !e?.response) return
+        if (st === 401 || st === 403 || !e?.response) { btnReset('spOtpBtn'); return }
       }
       if (!$('payStatus') || !state.user) return
       if (tries < 40) setTimeout(poll, 3000)
-      else setHTML('payStatus', '<div class="bg-amber-50 border border-amber-200 rounded-lg p-2 text-xs text-amber-700 mb-3">Still confirming your wallet payment. It will settle automatically once SasaPay confirms — check your Purchases shortly.</div>')
+      else { setHTML('payStatus', '<div class="bg-amber-50 border border-amber-200 rounded-lg p-2 text-xs text-amber-700 mb-3">Still confirming your wallet payment. It will settle automatically once SasaPay confirms — check your Purchases shortly.</div>'); btnReset('spOtpBtn') }
     }
     setTimeout(poll, 1500)
   } catch (err) {
     setHTML('payStatus', `<div class="bg-red-50 border border-red-200 rounded-lg p-2 text-xs text-red-700 mb-3">${esc(err.response?.data?.error || (!err.response ? 'Network error — please check your connection and try again.' : 'OTP verification failed'))}</div>`)
+    btnReset('spOtpBtn')
   }
 }
 
@@ -1150,15 +1347,16 @@ async function viewApprovals() {
       <td class="px-4 py-3">${c.term_months}mo</td>
       <td class="px-4 py-3 text-right whitespace-nowrap">
         <button onclick="contractDetail(${c.id})" class="text-slate-500 hover:underline text-xs mr-3">Review</button>
-        <button onclick="decide(${c.id},'approve')" class="text-emerald-600 hover:underline text-xs mr-2"><i class="fas fa-check"></i> Approve</button>
-        <button onclick="decide(${c.id},'reject')" class="text-red-600 hover:underline text-xs"><i class="fas fa-xmark"></i> Reject</button>
+        <button onclick="decide(${c.id},'approve', event)" class="text-emerald-600 hover:underline text-xs mr-2"><i class="fas fa-check"></i> Approve</button>
+        <button onclick="decide(${c.id},'reject', event)" class="text-red-600 hover:underline text-xs"><i class="fas fa-xmark"></i> Reject</button>
       </td></tr>`).join('') || '<tr><td colspan="6" class="text-center py-8 text-slate-400">No pending approvals</td></tr>'}</tbody>
   </table></div>`
 }
-window.decide = async (id, action) => {
+window.decide = async (id, action, ev) => {
   if (!confirmEdit(`Confirm ${action} for this financing contract?`)) return
+  const done = btnLoading(ev?.currentTarget, action === 'approve' ? 'Approving…' : 'Rejecting…')
   try { await api.post(`/murabaha/${id}/decision`, { action }); toast('Contract ' + action + 'd'); viewApprovals() }
-  catch (err) { toast(err.response?.data?.error || 'Failed', false) }
+  catch (err) { done(); toast(err.response?.data?.error || 'Failed', false) }
 }
 
 // ---------------------------------------------------------------------------
@@ -1578,13 +1776,14 @@ window.assignWalletModal = async () => {
   showModal(`<h3 class="font-bold mb-3"><i class="fas fa-user-plus text-teal-600 mr-2"></i>Assign / authorize wallet</h3>
     <label class="field-label">User</label>
     <select id="aw_user" class="w-full px-3 py-2 border rounded-lg mb-4">${opts || '<option value="">All users already have wallets</option>'}</select>
-    <div class="flex gap-2"><button onclick="doAssignWallet()" class="btn flex-1 brand-bg text-white py-2 rounded-lg text-sm">Assign wallet</button><button onclick="closeModal()" class="btn px-4 bg-slate-100 rounded-lg text-sm">Cancel</button></div>`)
+    <div class="flex gap-2"><button onclick="doAssignWallet(event)" class="btn flex-1 brand-bg text-white py-2 rounded-lg text-sm">Assign wallet</button><button onclick="closeModal()" class="btn px-4 bg-slate-100 rounded-lg text-sm">Cancel</button></div>`)
 }
-window.doAssignWallet = async () => {
+window.doAssignWallet = async (ev) => {
   const userId = Number($('aw_user').value)
   if (!userId) return toast('Select a user', false)
+  const done = btnLoading(ev?.currentTarget, 'Assigning…')
   try { await api.post('/wallets', { user_id: userId }); closeModal(); toast('Wallet assigned'); viewWallets() }
-  catch (err) { toast(err.response?.data?.error || 'Failed', false) }
+  catch (err) { done(); toast(err.response?.data?.error || 'Failed', false) }
 }
 window.earningRulesModal = async (userId, name) => {
   let rules = []
@@ -1693,14 +1892,14 @@ window.doWithdraw = async () => {
   const saved = $('wd_saved')?.value
   if (saved) payload.payout_account_id = Number(saved)
   else { payload.channel_code = $('wd_channel')?.value; payload.account_number = $('wd_account')?.value }
-  const btn = $('wd_btn'); btn.disabled = true; btn.classList.add('opacity-50')
-  $('wd_status').innerHTML = `<div class="text-xs text-slate-500 mb-2"><i class="fas fa-spinner fa-spin mr-1"></i>Processing withdrawal…</div>`
+  const done = btnLoading('wd_btn', 'Processing…')
+  $('wd_status').innerHTML = `<div class="text-xs text-slate-500 mb-2 flex items-center gap-2"><span class="inline-block w-3.5 h-3.5 border-2 border-slate-300 border-t-teal-600 rounded-full animate-spin"></span>Processing withdrawal…</div>`
   try {
     const { data } = await api.post('/wallet/withdraw', payload)
     closeModal(); toast(data.customer_message || `Withdrawal ${data.status} (${data.reference})`); viewMyWallet()
   } catch (err) {
     $('wd_status').innerHTML = `<div class="bg-red-50 border border-red-200 rounded-lg p-2 text-xs text-red-700 mb-2">${esc(err.response?.data?.error || 'Withdrawal failed')}</div>`
-    btn.disabled = false; btn.classList.remove('opacity-50')
+    done()
   }
 }
 
@@ -1758,13 +1957,14 @@ window.payoutModal = (userId, name) => {
       <div><label class="field-label">Amount (KES)</label><input id="po_amt" type="number" value="5000" class="px-3 py-2 border rounded-lg"></div>
       <div style="grid-column:1 / -1"><label class="field-label">Description</label><input id="po_desc" placeholder="e.g. March retainer" class="px-3 py-2 border rounded-lg"></div>
     </div>
-    <div class="flex gap-2 mt-4"><button onclick="doPayout(${userId})" class="btn flex-1 brand-bg text-white py-2 rounded-lg text-sm">Disburse</button><button onclick="closeModal()" class="btn px-4 bg-slate-100 rounded-lg text-sm">Cancel</button></div>`)
+    <div class="flex gap-2 mt-4"><button onclick="doPayout(${userId}, event)" class="btn flex-1 brand-bg text-white py-2 rounded-lg text-sm">Disburse</button><button onclick="closeModal()" class="btn px-4 bg-slate-100 rounded-lg text-sm">Cancel</button></div>`)
 }
-window.doPayout = async (userId) => {
+window.doPayout = async (userId, ev) => {
   const payload = { user_id: userId, category: $('po_cat').value, amount: Number($('po_amt').value || 0), description: $('po_desc').value || null }
   if (payload.amount <= 0) return toast('Amount must be greater than zero', false)
+  const done = btnLoading(ev?.currentTarget, 'Disbursing…')
   try { const { data } = await api.post('/wallet/payouts', payload); closeModal(); toast(`Paid out ${fmt(data.total)} (${data.batch_ref})`); viewWallets() }
-  catch (err) { toast(err.response?.data?.error || 'Failed', false) }
+  catch (err) { done(); toast(err.response?.data?.error || 'Failed', false) }
 }
 window.batchPayoutModal = (target) => {
   showModal(`<h3 class="font-bold mb-1"><i class="fas fa-users text-teal-600 mr-2"></i>Batch payout — all active agents</h3>
@@ -1776,14 +1976,15 @@ window.batchPayoutModal = (target) => {
       <div><label class="field-label">Amount per agent (KES)</label><input id="bp_amt" type="number" value="5000" class="px-3 py-2 border rounded-lg"></div>
       <div style="grid-column:1 / -1"><label class="field-label">Description</label><input id="bp_desc" placeholder="e.g. Monthly retainer batch" class="px-3 py-2 border rounded-lg"></div>
     </div>
-    <div class="flex gap-2 mt-4"><button onclick="doBatchPayout('${target}')" class="btn flex-1 brand-bg text-white py-2 rounded-lg text-sm">Disburse to all agents</button><button onclick="closeModal()" class="btn px-4 bg-slate-100 rounded-lg text-sm">Cancel</button></div>`)
+    <div class="flex gap-2 mt-4"><button onclick="doBatchPayout('${target}', event)" class="btn flex-1 brand-bg text-white py-2 rounded-lg text-sm">Disburse to all agents</button><button onclick="closeModal()" class="btn px-4 bg-slate-100 rounded-lg text-sm">Cancel</button></div>`)
 }
-window.doBatchPayout = async (target) => {
+window.doBatchPayout = async (target, ev) => {
   const payload = { target, category: $('bp_cat').value, amount: Number($('bp_amt').value || 0), description: $('bp_desc').value || null }
   if (payload.amount <= 0) return toast('Amount must be greater than zero', false)
   if (!confirmEdit('Disburse ' + fmt(payload.amount) + ' to every active agent?')) return
+  const done = btnLoading(ev?.currentTarget, 'Disbursing…')
   try { const { data } = await api.post('/wallet/payouts', payload); closeModal(); toast(`Paid ${data.count} agent(s), total ${fmt(data.total)}`); viewWallets() }
-  catch (err) { toast(err.response?.data?.error || 'Failed', false) }
+  catch (err) { done(); toast(err.response?.data?.error || 'Failed', false) }
 }
 
 // ---------------------------------------------------------------------------
@@ -2479,12 +2680,15 @@ async function viewProfile() {
           </div>
         </div>
         <div class="mt-4 field-group">
-          <label class="field-label">Profile picture URL</label>
-          <div class="flex gap-2">
-            <input id="pf_avatar" value="${esc(u.avatar_url || '')}" class="flex-1 px-3 py-2 border rounded-lg text-sm" placeholder="https://... image URL">
-            <button onclick="saveAvatar()" class="btn brand-bg text-white px-4 py-2 rounded-lg text-sm"><i class="fas fa-image mr-1"></i>Update</button>
+          <label class="field-label">Profile picture</label>
+          <input id="pf_avatar_data" type="hidden" value="${esc(u.avatar_url || '')}">
+          <input id="pf_avatar_file" type="file" accept="image/png,image/jpeg,image/webp,image/gif" class="hidden" onchange="pickAvatar(this)">
+          <div class="flex flex-wrap gap-2">
+            <button type="button" onclick="kycOpenPicker('pf_avatar_file')" class="btn bg-sky-600 hover:bg-sky-700 text-white px-4 py-2 rounded-lg text-sm font-semibold"><i class="fas fa-image mr-1"></i>Choose image</button>
+            <button id="pf_avatar_save" onclick="saveAvatar()" class="btn brand-bg text-white px-4 py-2 rounded-lg text-sm"><i class="fas fa-upload mr-1"></i>Save picture</button>
           </div>
-          <p class="text-[11px] text-slate-500 mt-1">Everyone can update their profile picture.</p>
+          <p class="text-[11px] text-slate-500 mt-1">Upload a PNG, JPEG, WEBP or GIF image (max 5&nbsp;MB). Links / URLs are not accepted.</p>
+          <p id="pf_avatar_hint" class="text-[11px] text-slate-400 mt-1"></p>
         </div>
       </div>
 
@@ -2526,14 +2730,22 @@ async function viewProfile() {
     </div>`
 }
 window.saveAvatar = async () => {
+  const data = ($('pf_avatar_data') || {}).value || ''
+  // Only accept an uploaded image (data: URL). Reject links / remote URLs — the
+  // picture must be an uploaded PNG/JPEG/WEBP/GIF, never an external link.
+  if (data && !/^data:image\/(png|jpe?g|webp|gif);base64,/i.test(data)) {
+    return toast('Please upload an image file (PNG/JPEG/WEBP/GIF). Links are not accepted.', false)
+  }
+  if (!data) return toast('Choose an image to upload first.', false)
+  const done = btnLoading('pf_avatar_save', 'Saving…')
   try {
-    const url = ($('pf_avatar') || {}).value || ''
-    await api.put('/me/avatar', { avatar_url: url })
-    if (state.user) state.user.avatar_url = url
+    await api.put('/me/avatar', { avatar_url: data })
+    if (state.user) state.user.avatar_url = data
     const box = $('avatarPreview')
-    if (box) box.innerHTML = url ? `<img src="${esc(url)}" class="h-24 w-24 rounded-full object-cover border-2 border-teal-200">` : box.innerHTML
+    if (box) box.innerHTML = `<img src="${data}" class="h-24 w-24 rounded-full object-cover border-2 border-teal-200">`
+    done()
     toast('Profile picture updated')
-  } catch (err) { toast(err.response?.data?.error || 'Failed', false) }
+  } catch (err) { done(); toast(err.response?.data?.error || 'Failed', false) }
 }
 window.saveFarmerProfile = async () => {
   const body = {

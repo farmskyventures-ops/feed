@@ -7,7 +7,9 @@ export default defineConfig({
   // Frontend static assets live in ./frontend (served at web root, e.g. /static/*).
   publicDir: 'frontend',
   plugins: [
-    build(),
+    // The backend entry is backend/index.tsx (not the plugin default src/index.tsx),
+    // so it must be passed explicitly or the Workers bundle ships with no routes.
+    build({ entry: 'backend/index.tsx' }),
     devServer({
       adapter,
       entry: 'backend/index.tsx'

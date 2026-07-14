@@ -15,7 +15,8 @@ import paymentGateway from './payment-gateway-host'
 import { sendSms, smsConfigured, generateOtp } from './sms'
 import { sendEmail, emailConfigured } from './email'
 import { hashPassword, verifyPassword, isHashed } from './password'
-import { initiatePayment as gatewayInitiate, getPaymentStatus as gatewayStatus, gatewayConfigured } from './payment-gateway-client'
+import { initiatePayment as gatewayInitiate, getPaymentStatus as gatewayStatus, processPayment as gatewayProcess, gatewayConfigured } from './payment-gateway-client'
+import { validateImageDataUrl, validateText, validateTextFields } from './upload-validation'
 
 const app = new Hono<{ Bindings: Bindings; Variables: { user: SessionUser } }>()
 
@@ -601,6 +602,11 @@ app.get('/api/me/profile', requireAuth, async (c) => {
 app.put('/api/me/avatar', requireAuth, async (c) => {
   const user = c.get('user') as SessionUser
   const { avatar_url } = await c.req.json()
+  // The profile picture must be an UPLOADED image (base64 data URL of an
+  // allowed raster type) — never an external link, and never a disguised
+  // non-image file. Empty clears the picture.
+  const v = validateImageDataUrl(avatar_url, { allowEmpty: true })
+  if (!v.ok) return c.json({ error: v.error }, 400)
   await c.env.DB.prepare(`UPDATE users SET avatar_url=? WHERE id=?`).bind(avatar_url || null, user.id).run()
   await audit(c, user.id, 'update', 'profile', 'avatar')
   return c.json({ ok: true, avatar_url: avatar_url || null })
@@ -626,10 +632,26 @@ app.put('/api/me/profile', requireAuth, async (c) => {
   const user = c.get('user') as SessionUser
   const b = await c.req.json()
 
-  // Everyone may update their avatar via this endpoint.
+  // Everyone may update their avatar via this endpoint — validated as an
+  // uploaded image (no external links, no disguised non-image files).
   if (b.avatar_url !== undefined) {
+    const v = validateImageDataUrl(b.avatar_url, { allowEmpty: true })
+    if (!v.ok) return c.json({ error: v.error }, 400)
     await c.env.DB.prepare(`UPDATE users SET avatar_url=? WHERE id=?`).bind(b.avatar_url || null, user.id).run()
   }
+
+  // Screen free-text profile fields for injection / harmful content.
+  const tv = validateTextFields(b, [
+    { key: 'full_name', label: 'Full name', max: 120 },
+    { key: 'alt_mobile', label: 'Alternate mobile', max: 40 },
+    { key: 'county', label: 'County', max: 80 },
+    { key: 'sub_county', label: 'Sub-county', max: 80 },
+    { key: 'ward', label: 'Ward', max: 80 },
+    { key: 'village', label: 'Village', max: 120 },
+    { key: 'value_chain', label: 'Value chain', max: 120 },
+    { key: 'value_chain_type', label: 'Value chain type', max: 120 }
+  ])
+  if (!tv.ok) return c.json({ error: tv.error }, 400)
 
   if (user.role !== 'customer') {
     // Non-farmers: profile picture only (already handled above). Everything else ignored.
@@ -991,6 +1013,21 @@ app.get('/api/customers/:id', requireAuth, async (c) => {
 app.post('/api/customers', requireAuth, requireRole('agent', 'admin', 'super_admin'), async (c) => {
   const b = await c.req.json()
   const user = c.get('user')
+  // KYC ID images must be uploaded files (no external links / disguised files).
+  for (const f of ['id_front_url', 'id_back_url', 'selfie_url']) {
+    if (b[f] !== undefined && b[f] !== null && b[f] !== '') {
+      const v = validateImageDataUrl(b[f], { allowEmpty: true })
+      if (!v.ok) return c.json({ error: `${f.replace(/_url$/, '').replace(/_/g, ' ')}: ${v.error}` }, 400)
+    }
+  }
+  // Screen free-text identity/location fields for injection / harmful content.
+  const tv = validateTextFields(b, [
+    { key: 'full_name', label: 'Full name', max: 120 },
+    { key: 'county', label: 'County', max: 80 }, { key: 'sub_county', label: 'Sub-county', max: 80 },
+    { key: 'ward', label: 'Ward', max: 80 }, { key: 'village', label: 'Village', max: 120 },
+    { key: 'value_chain', label: 'Value chain', max: 120 }, { key: 'value_chain_type', label: 'Value chain type', max: 120 }
+  ])
+  if (!tv.ok) return c.json({ error: tv.error }, 400)
   const saccoMember = ['yes', 'true', '1', 'on'].includes(String(b.sacco_membership || '').toLowerCase())
   const assignedAgent = user.role === 'agent' ? user.id : (b.agent_id || user.id)
   const r = await c.env.DB.prepare(
@@ -1018,6 +1055,20 @@ app.put('/api/customers/:id', requireAuth, async (c) => {
   const isOwningAgent = user.role === 'agent' && cust.agent_id === user.id
   if (!isAdmin && !isOwningAgent) return c.json({ error: 'Forbidden' }, 403)
   const b = await c.req.json()
+  // KYC ID images must be uploaded files (no external links / disguised files).
+  for (const f of ['id_front_url', 'id_back_url', 'selfie_url']) {
+    if (b[f] !== undefined && b[f] !== null && b[f] !== '') {
+      const v = validateImageDataUrl(b[f], { allowEmpty: true })
+      if (!v.ok) return c.json({ error: `${f.replace(/_url$/, '').replace(/_/g, ' ')}: ${v.error}` }, 400)
+    }
+  }
+  const tv = validateTextFields(b, [
+    { key: 'full_name', label: 'Full name', max: 120 },
+    { key: 'county', label: 'County', max: 80 }, { key: 'sub_county', label: 'Sub-county', max: 80 },
+    { key: 'ward', label: 'Ward', max: 80 }, { key: 'village', label: 'Village', max: 120 },
+    { key: 'value_chain', label: 'Value chain', max: 120 }, { key: 'value_chain_type', label: 'Value chain type', max: 120 }
+  ])
+  if (!tv.ok) return c.json({ error: tv.error }, 400)
   const saccoProvided = b.sacco_membership !== undefined
   const saccoMember = ['yes', 'true', '1', 'on'].includes(String(b.sacco_membership || '').toLowerCase())
   await c.env.DB.prepare(
@@ -1412,7 +1463,11 @@ app.post('/api/mpesa/stkpush', requireAuth, async (c) => {
     await c.env.DB.prepare(`INSERT INTO payment_intents (checkout_request_id,merchant_request_id,contract_id,customer_id,amount,phone,method,status) VALUES (?,?,?,?,?,?,?, 'pending')`)
       .bind(g.transaction_ref, g.transaction_ref, contract_id, contract.customer_id, amt, normalizePhone(payerPhone), `gateway_${rail}`).run()
     await audit(c, c.get('user').id, 'stk_push', 'gateway', `KES ${amt} to ${contract.contract_ref} via central gateway ${rail} (${g.simulated ? 'sim' : 'live'})`)
-    return c.json({ ok: true, simulated: !!g.simulated, checkout_request_id: g.transaction_ref, customer_message: g.customer_message || 'Payment request sent. Approve the prompt on your phone.' })
+    // Pass through the gateway's needs_otp flag so the SasaPay WALLET flow can
+    // prompt the buyer for the wallet OTP in-app (completed via /api/mpesa/process).
+    // For mobile-money / bank the gateway delivers the prompt to the phone and
+    // needs_otp is falsy, so the client just polls /confirm as before.
+    return c.json({ ok: true, simulated: !!g.simulated, checkout_request_id: g.transaction_ref, needs_otp: !!(g as any).needs_otp, customer_message: g.customer_message || 'Payment request sent. Approve the prompt on your phone.' })
   }
 
   // FALLBACK PATH (local/standalone dev only): direct Daraja STK / simulation.
@@ -1462,6 +1517,25 @@ app.post('/api/mpesa/confirm', requireAuth, async (c) => {
     return c.json({ ok: true, status: 'success', mpesa_receipt: receipt, amount_paid: res?.amount_paid, outstanding: res?.outstanding, contract_status: res?.status })
   }
   return c.json({ ok: false, status: 'pending' })
+})
+// Complete a gateway-routed SasaPay WALLET checkout by submitting the OTP the
+// buyer received on their SasaPay wallet. The code is forwarded to the central
+// gateway (server-side, HMAC-signed); settlement then arrives via callback and
+// the client keeps polling /api/mpesa/confirm to finalise the contract.
+app.post('/api/mpesa/process', requireAuth, async (c) => {
+  const { checkout_request_id, verification_code } = await c.req.json()
+  if (!checkout_request_id || !verification_code) return c.json({ error: 'checkout_request_id and verification_code are required' }, 400)
+  const intent = await c.env.DB.prepare(`SELECT * FROM payment_intents WHERE checkout_request_id=?`).bind(checkout_request_id).first<any>()
+  if (!intent) return c.json({ error: 'Payment intent not found' }, 404)
+  if (intent.status === 'success') return c.json({ ok: true, status: 'success', mpesa_receipt: intent.mpesa_receipt })
+  // Gateway-routed intent: forward the OTP to the central gateway.
+  if (String(intent.method).startsWith('gateway_') && gatewayConfigured(c.env)) {
+    const r = await gatewayProcess(c.env, checkout_request_id, String(verification_code))
+    if (!r.success) return c.json({ ok: false, error: r.error || 'OTP verification failed' }, 400)
+    return c.json({ ok: true, status: 'processing', customer_message: r.customer_message || 'OTP accepted. Confirming payment…' })
+  }
+  // Simulation / local fallback: accept the OTP and let /confirm settle it.
+  return c.json({ ok: true, status: 'processing', customer_message: 'OTP accepted. Confirming payment…' })
 })
 // Lightweight security-event logger for the payment surface. Best-effort: never
 // throws into the request path (a logging failure must not block the ACK).
