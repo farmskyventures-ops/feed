@@ -4,9 +4,9 @@
 const api = axios.create({ baseURL: '/api', withCredentials: true })
 
 // Payment requests go to THIS app's own backend (same-origin, carrying the
-// logged-in session cookie). FEED's server then HMAC-signs the request and
-// forwards it to the central gateway on the equipment app SERVER-SIDE. The
-// browser must never call the equipment domain directly — it has no session
+// logged-in session cookie). Feed's server then HMAC-signs the request and
+// forwards it to the central gateway on the Equipment app SERVER-SIDE. The
+// browser must never call the Equipment domain directly — it has no session
 // there (that returned "Unauthorized") and cannot HMAC-sign. So the payment
 // client is simply the same same-origin `api` instance.
 const gatewayApi = api
@@ -45,10 +45,10 @@ api.interceptors.response.use(
 )
 const fmt = (n) => 'KES ' + Number(n || 0).toLocaleString()
 const esc = (s) => String(s ?? '').replace(/[&<>"]/g, m => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[m]))
-// Friendly labels for equipment payment types
+// Friendly labels for payment types
 const payLabel = (t, model) => {
   if (t === 'financing') {
-    return 'Murabaha Financing <span class="text-[10px] text-slate-400">(Sharia cost-plus, no interest)</span>'
+    return 'Murabaha Financing <span class="text-[10px] text-slate-400">(cost-plus)</span>'
   }
   return t === 'cash'
     ? 'Cash'
@@ -495,7 +495,7 @@ function navItems() {
     { k: 'contracts', i: 'fa-file-signature', t: 'Credit Purchases' },
     myWallet])
   if (r === 'customer') return withAccount([...common,
-    { k: 'shop', i: 'fa-store', t: 'Equipment Shop' },
+    { k: 'shop', i: 'fa-store', t: 'Shop' },
     { k: 'contracts', i: 'fa-file-signature', t: 'My Purchases' }])
   if (r === 'support') return withAccount([...common,
     { k: 'customers', i: 'fa-users', t: 'Customers' },
@@ -543,7 +543,7 @@ function renderApp() {
 }
 window.go = (r) => { state.route = r; toggleSidebar(false); renderApp() }
 function route() {
-  const titles = { dashboard: 'Dashboard', approvals: 'Financing Approvals', inventory: 'Equipment Inventory', finance_queue: 'Finance Approval Queue', customers: 'Customers', contracts: 'Purchases & Contracts', agents: 'Agent Management', users: 'User Accounts & Access', repayments: 'Repayment Performance', onboard: 'Farmer Onboarding', shop: 'Equipment Shop', exports: 'Data Export & Reports', settings: 'Financing & Markup Settings', profile: 'My Account', wallet: 'My Wallet', wallets: 'Wallets & Payouts' }
+  const titles = { dashboard: 'Dashboard', approvals: 'Financing Approvals', inventory: 'Inventory', finance_queue: 'Finance Approval Queue', customers: 'Customers', contracts: 'Purchases & Contracts', agents: 'Agent Management', users: 'User Accounts & Access', repayments: 'Repayment Performance', onboard: 'Farmer Onboarding', shop: 'Feed Shop', exports: 'Data Export & Reports', settings: 'Financing & Markup Settings', profile: 'My Account', wallet: 'My Wallet', wallets: 'Wallets & Payouts' }
   $('pageTitle').textContent = titles[state.route] || 'Dashboard'
   const map = { dashboard: viewDashboard, approvals: viewApprovals, inventory: viewInventory, finance_queue: viewFinanceQueue, customers: viewCustomers, contracts: viewContracts, agents: viewAgents, users: viewUsers, repayments: viewRepayments, onboard: viewOnboard, shop: viewShop, exports: viewExports, settings: viewSettings, profile: viewProfile, wallet: viewMyWallet, wallets: viewWallets }
   ;(map[state.route] || viewDashboard)()
@@ -571,7 +571,7 @@ async function viewDashboard() {
       ${next}
     </div>
     <div class="card p-6"><h3 class="font-bold mb-2"><i class="fas fa-store text-teal-600 mr-2"></i>Quick Actions</h3>
-      <button onclick="go('shop')" class="btn brand-bg text-white px-5 py-2.5 rounded-lg text-sm mr-2"><i class="fas fa-cart-plus mr-1"></i>Buy Equipment</button>
+      <button onclick="go('shop')" class="btn brand-bg text-white px-5 py-2.5 rounded-lg text-sm mr-2"><i class="fas fa-cart-plus mr-1"></i>Buy Feed</button>
       <button onclick="go('contracts')" class="btn bg-slate-100 px-5 py-2.5 rounded-lg text-sm"><i class="fas fa-list mr-1"></i>My Purchases</button>
     </div>`
   } else if (data.role === 'agent') {
@@ -589,7 +589,7 @@ async function viewDashboard() {
   } else {
     $('content').innerHTML = `<div class="grid grid-cols-1 md:grid-cols-4 gap-4 mb-6">
       ${statCard('fa-chart-line', 'Total Sales', fmt(data.total_sales), 'bg-teal-50 text-teal-600')}
-      ${statCard('fa-hand-holding-dollar', 'Equipment Financed', fmt(data.equipment_financed), 'bg-blue-50 text-blue-600')}
+      ${statCard('fa-hand-holding-dollar', 'Feed Financed', fmt(data.feed_financed), 'bg-blue-50 text-blue-600')}
       ${statCard('fa-money-bill', 'Cash Sales', fmt(data.cash_sales), 'bg-emerald-50 text-emerald-600')}
       ${statCard('fa-percent', 'Repayment Rate', data.repayment_rate + '%', 'bg-indigo-50 text-indigo-600')}
       ${statCard('fa-triangle-exclamation', 'Default Rate', data.default_rate + '%', 'bg-red-50 text-red-600')}
@@ -850,7 +850,7 @@ window.contractDetail = async (id) => {
       ${canPay ? `<button onclick="payModal(${c.id}, ${c.monthly_payment || c.installment_amount || c.outstanding}, ${c.outstanding})" class="btn flex-1 brand-bg text-white py-2.5 rounded-lg text-sm"><i class="fas fa-mobile-alt mr-1"></i>Pay via M-Pesa</button>` : ''}
       ${cashBalanceDue && canCollect ? `<button onclick="payModal(${c.id}, ${outstanding}, ${outstanding}, 'cash')" class="btn flex-1 bg-amber-500 text-white py-2.5 rounded-lg text-sm"><i class="fas fa-wallet mr-1"></i>Pay Balance (${fmt(outstanding)})</button>` : ''}
       ${!isCash && hasBalance && canCollect ? `<button onclick="payModal(${c.id}, ${nextDue ? (Number(nextDue.amount_due) - Number(nextDue.amount_paid||0)) : outstanding}, ${outstanding}, 'repay')" class="btn flex-1 bg-teal-600 text-white py-2.5 rounded-lg text-sm"><i class="fas fa-coins mr-1"></i>Collect Installment</button>` : ''}
-      ${canDispatch ? `<button onclick="dispatchContract(${c.id})" class="btn flex-1 bg-emerald-600 text-white py-2.5 rounded-lg text-sm"><i class="fas fa-truck mr-1"></i>Dispatch Equipment</button>` : ''}
+      ${canDispatch ? `<button onclick="dispatchContract(${c.id})" class="btn flex-1 bg-emerald-600 text-white py-2.5 rounded-lg text-sm"><i class="fas fa-truck mr-1"></i>Dispatch Feedt</button>` : ''}
       ${canRequest ? `<button onclick="requestChangeModal('contract', ${c.id}, 'amend contract')" class="btn flex-1 bg-amber-500 text-white py-2.5 rounded-lg text-sm"><i class="fas fa-paper-plane mr-1"></i>Request Admin Change</button>` : ''}
       <button onclick="viewDoc(${c.id})" class="btn flex-1 bg-slate-800 text-white py-2.5 rounded-lg text-sm"><i class="fas fa-file-pdf mr-1"></i>Documents</button>
       <button onclick="closeModal()" class="btn px-4 bg-slate-100 rounded-lg text-sm">Close</button>
@@ -859,7 +859,7 @@ window.contractDetail = async (id) => {
 window.dispatchContract = async (id) => {
   try {
     await api.post(`/murabaha/${id}/dispatch`, {})
-    toast('Equipment dispatched')
+    toast('Feed dispatched')
     closeModal(); viewContracts()
   } catch (err) { toast(err.response?.data?.error || 'Dispatch failed', false) }
 }
@@ -876,7 +876,7 @@ window.payModal = async (id, amount, outstanding, kind) => {
     <p class="text-xs text-slate-500 mb-3">${isCash ? 'Amount due' : 'Outstanding'}: ${fmt(outstanding)}</p>
 
     <!-- Customer-facing payment rails: M-Pesa and SasaPay. BOTH are routed
-         through the Farmsky Central Payment Gateway (equipment.farmsky.africa),
+         through the Farmsky Central Payment Gateway (Feed.farmsky.africa),
          which owns all provider credentials — FEED never touches raw payment
          secrets. NOTE: KCB Buni is deliberately NOT exposed here; it is a
          backend/reconciliation-only rail and must stay hidden from customers. -->
@@ -895,7 +895,7 @@ window.payModal = async (id, amount, outstanding, kind) => {
     </div>
 
     <!-- SasaPay channel customizer: Mobile Money / Bank / Wallet. Mirrors the
-         equipment app so customers can pay from a mobile network OR a bank
+         Feed app so customers can pay from a mobile network OR a bank
          account. The prompt is delivered to the phone; no bank account number
          is required. Hidden unless SasaPay is selected. -->
     <div id="sasapayChannelBlock" class="hidden mb-3 p-3 bg-slate-50 border border-slate-200 rounded-lg space-y-3">
@@ -924,7 +924,7 @@ window.payModal = async (id, amount, outstanding, kind) => {
     <div id="payTermsBlock" class="text-left mb-4 mt-1 p-3 bg-slate-50 border border-slate-200 rounded-lg">
       <div class="text-[11px] font-semibold text-slate-600 uppercase tracking-wider mb-1 text-left">${isCash ? 'Cash Sale Agreement' : 'Asset Financing Agreement'}</div>
       <p class="text-[11px] leading-relaxed text-slate-500 text-left">${isCash
-        ? 'This is an outright cash sale. By proceeding you confirm full/settlement payment of the amount due and accept transfer of ownership of the equipment upon settlement. All sales are governed by FarmSky cash sale terms and no financing profit or installment obligations apply.'
+        ? 'This is an outright cash sale. By proceeding you confirm full/settlement payment of the amount due and accept transfer of ownership of the Feed upon settlement. All sales are governed by FarmSky cash sale terms and no financing profit or installment obligations apply.'
         : 'This is a Sharia-compliant asset financing (Murabaha) transaction. By proceeding you agree to the disclosed murabaha price, deposit and the installment repayment schedule until the outstanding balance is fully settled. Ownership transfers per the executed financing agreement and applicable FarmSky financing terms.'}</p>
     </div>
     <div id="payStatus"></div>
@@ -1181,21 +1181,21 @@ function productForm(prefix, p = {}) {
       Complete the basic inventory details below — an admin or finance officer supplies the financial components before the product goes live.
     </div>`
   return `
-    <div class="bg-slate-50 border border-slate-200 rounded-xl px-4 py-3 text-xs text-slate-600 mb-4"><i class="fas fa-circle-info text-teal-600 mr-1"></i>Use the labeled fields below to collect or update inventory clearly: identify the equipment, capture stock levels, then define cash and financing terms.</div>
+    <div class="bg-slate-50 border border-slate-200 rounded-xl px-4 py-3 text-xs text-slate-600 mb-4"><i class="fas fa-circle-info text-teal-600 mr-1"></i>Use the labeled fields below to collect or update inventory clearly: identify the Feed, capture stock levels, then define cash and financing terms.</div>
     <div class="flex items-center gap-3 mb-4">
       <div id="${prefix}_preview">${p.id ? prodImg(p, 'w-16 h-16 rounded-lg') : '<div class="w-16 h-16 rounded-lg bg-slate-100 flex items-center justify-center text-slate-400"><i class="fas fa-image"></i></div>'}</div>
       <div class="space-y-2">
-        <label class="btn bg-slate-100 px-3 py-2 rounded-lg text-xs cursor-pointer"><i class="fas fa-upload mr-1"></i>Upload equipment image<input type="file" accept="image/*" class="hidden" onchange="pickImage(this,'${prefix}_img','${prefix}_preview')"></label>
-        <div class="text-[11px] text-slate-400">Agreement files can be uploaded as an image or PDF and saved with the equipment record.</div>
+        <label class="btn bg-slate-100 px-3 py-2 rounded-lg text-xs cursor-pointer"><i class="fas fa-upload mr-1"></i>Upload Feed image<input type="file" accept="image/*" class="hidden" onchange="pickImage(this,'${prefix}_img','${prefix}_preview')"></label>
+        <div class="text-[11px] text-slate-400">Agreement files can be uploaded as an image or PDF and saved with the Feed record.</div>
       </div>
     </div>
     <input type="hidden" id="${prefix}_img" value="${esc(p.image || '')}">
     <div class="responsive-grid cols-2 text-sm">
-      <div><label class="field-label">Equipment SKU</label><input id="${prefix}_sku" value="${esc(p.sku || '')}" placeholder="SKU" class="px-3 py-2 border rounded-lg"></div>
-      <div><label class="field-label">Equipment name</label><input id="${prefix}_name" value="${esc(p.name || '')}" placeholder="Equipment name" class="px-3 py-2 border rounded-lg"></div>
-      <div><label class="field-label">Inventory category</label><input id="${prefix}_cat" value="${esc(p.category || 'Equipment')}" placeholder="Category" class="px-3 py-2 border rounded-lg"></div>
+      <div><label class="field-label">Feed SKU</label><input id="${prefix}_sku" value="${esc(p.sku || '')}" placeholder="SKU" class="px-3 py-2 border rounded-lg"></div>
+      <div><label class="field-label">Feed name</label><input id="${prefix}_name" value="${esc(p.name || '')}" placeholder="Feed name" class="px-3 py-2 border rounded-lg"></div>
+      <div><label class="field-label">Inventory category</label><input id="${prefix}_cat" value="${esc(p.category || 'Feed')}" placeholder="Category" class="px-3 py-2 border rounded-lg"></div>
       <div><label class="field-label">Stock unit</label><input id="${prefix}_unit" value="${esc(p.unit || 'unit')}" placeholder="Unit" class="px-3 py-2 border rounded-lg"></div>
-      <div style="grid-column:1 / -1"><label class="field-label">Equipment description</label><textarea id="${prefix}_desc" placeholder="Equipment details / description" class="px-3 py-2 border rounded-lg min-h-24">${esc(p.description || '')}</textarea></div>
+      <div style="grid-column:1 / -1"><label class="field-label">Feed description</label><textarea id="${prefix}_desc" placeholder="Feed details / description" class="px-3 py-2 border rounded-lg min-h-24">${esc(p.description || '')}</textarea></div>
       <div><label class="field-label">Buying cost</label><input id="${prefix}_buy" type="number" value="${Number(p.buying_price || 0)}" placeholder="Buying price" class="px-3 py-2 border rounded-lg"></div>
       <div><label class="field-label">Quantity in stock</label><input id="${prefix}_qty" type="number" value="${Number(p.quantity || 0)}" placeholder="Quantity" class="px-3 py-2 border rounded-lg"></div>
       <div><label class="field-label">Cash markup %</label><input id="${prefix}_cm" type="number" value="${Number(p.cash_markup_pct || 10)}" placeholder="Cash markup %" class="px-3 py-2 border rounded-lg"></div>
@@ -1249,7 +1249,7 @@ function productPayload(prefix) {
     name: $(prefix + '_name').value,
     category: $(prefix + '_cat').value,
     description: $(prefix + '_desc').value,
-    product_type: 'equipment',
+    product_type: 'Feed',
     unit: $(prefix + '_unit').value,
     buying_price: Number($(prefix + '_buy').value || 0),
     quantity: Number($(prefix + '_qty').value || 0),
@@ -1293,14 +1293,14 @@ async function viewInventory() {
     : `<span class="text-xs text-slate-400">Read-only view · you are not authorized to add inventory</span>`
   $('content').innerHTML = `
   <div class="flex items-center justify-between mb-4">
-    <div class="text-sm text-slate-500">${isAdmin ? 'Full equipment catalog' : 'Equipment you have listed'} · ${data.products.length} item(s)</div>
+    <div class="text-sm text-slate-500">${isAdmin ? 'Full Feed catalog' : 'Feed you have listed'} · ${data.products.length} item(s)</div>
     <div class="action-bar">${addBtn}</div>
   </div>
   <div class="card table-card"><table class="w-full text-sm">
-    <thead class="bg-slate-50 text-slate-500 text-xs uppercase"><tr><th class="text-left px-4 py-3">Image</th><th class="text-left px-4 py-3">Equipment</th><th class="text-left px-4 py-3">Status</th><th class="text-left px-4 py-3">Payment Options</th><th class="text-left px-4 py-3">Financing</th><th class="text-right px-4 py-3">Cash Dep.</th><th class="text-right px-4 py-3">Fin. Dep.</th><th class="text-right px-4 py-3">Qty</th><th></th></tr></thead>
+    <thead class="bg-slate-50 text-slate-500 text-xs uppercase"><tr><th class="text-left px-4 py-3">Image</th><th class="text-left px-4 py-3">Feed</th><th class="text-left px-4 py-3">Status</th><th class="text-left px-4 py-3">Payment Options</th><th class="text-left px-4 py-3">Financing</th><th class="text-right px-4 py-3">Cash Dep.</th><th class="text-right px-4 py-3">Fin. Dep.</th><th class="text-right px-4 py-3">Qty</th><th></th></tr></thead>
     <tbody>${data.products.map(p => `<tr class="border-t border-slate-100">
       <td class="px-4 py-2">${prodImg(p, 'w-10 h-10 rounded-lg')}</td>
-      <td class="px-4 py-3"><div class="font-medium">${esc(p.name)}</div><div class="text-xs text-slate-500">${esc(p.sku)} · ${esc(p.category || 'Equipment')}</div></td>
+      <td class="px-4 py-3"><div class="font-medium">${esc(p.name)}</div><div class="text-xs text-slate-500">${esc(p.sku)} · ${esc(p.category || 'Feed')}</div></td>
       <td class="px-4 py-3">${financeStatusBadge(p.finance_status)}</td>
       <td class="px-4 py-3">${esc((p.payment_option_mode || 'both').replace('_', ' '))}</td>
       <td class="px-4 py-3">${esc(p.financing_model === 'paygo' ? 'PAYGO' : 'Interest financing')}<div class="text-xs text-slate-400">${Number(p.financing_interest_pct || 0)}% · ${esc(p.financing_frequency || 'monthly')}</div></td>
@@ -1334,23 +1334,23 @@ window.pickImage = (input, targetId, previewId) => {
   reader.readAsDataURL(file)
 }
 window.addProductModal = () => {
-  showModal(`<h3 class="font-bold mb-3">Add Equipment</h3>${productForm('np')}<div class="flex gap-2 mt-4"><button onclick="doAddProduct()" class="btn flex-1 brand-bg text-white py-2 rounded-lg text-sm">Save</button><button onclick="closeModal()" class="btn px-4 bg-slate-100 rounded-lg text-sm">Cancel</button></div>`)
+  showModal(`<h3 class="font-bold mb-3">Add Feed</h3>${productForm('np')}<div class="flex gap-2 mt-4"><button onclick="doAddProduct()" class="btn flex-1 brand-bg text-white py-2 rounded-lg text-sm">Save</button><button onclick="closeModal()" class="btn px-4 bg-slate-100 rounded-lg text-sm">Cancel</button></div>`)
 }
 window.doAddProduct = async () => {
   try {
     await api.post('/products', productPayload('np'))
-    closeModal(); toast('Equipment added'); viewInventory()
+    closeModal(); toast('Feed added'); viewInventory()
   } catch (err) { toast(err.response?.data?.error || 'Failed', false) }
 }
 window.editProductModal = (id) => {
   const p = _products.find(x => x.id === id)
-  showModal(`<h3 class="font-bold mb-3">Edit Equipment</h3>${productForm('ep', p)}<div class="flex gap-2 mt-4"><button onclick="doEditProduct(${id})" class="btn flex-1 brand-bg text-white py-2 rounded-lg text-sm">Save Changes</button><button onclick="closeModal()" class="btn px-4 bg-slate-100 rounded-lg text-sm">Cancel</button></div>`)
+  showModal(`<h3 class="font-bold mb-3">Edit Feed</h3>${productForm('ep', p)}<div class="flex gap-2 mt-4"><button onclick="doEditProduct(${id})" class="btn flex-1 brand-bg text-white py-2 rounded-lg text-sm">Save Changes</button><button onclick="closeModal()" class="btn px-4 bg-slate-100 rounded-lg text-sm">Cancel</button></div>`)
 }
 window.doEditProduct = async (id) => {
-  if (!confirmEdit('Save changes to this equipment record?')) return
+  if (!confirmEdit('Save changes to this Feed record?')) return
   try {
     await api.put('/products/' + id, productPayload('ep'))
-    closeModal(); toast('Equipment updated'); viewInventory()
+    closeModal(); toast('Feed updated'); viewInventory()
   } catch (err) { toast(err.response?.data?.error || 'Failed', false) }
 }
 window.deleteProduct = async (id, name) => {
@@ -1389,7 +1389,7 @@ async function viewFinanceQueue() {
     : `<div class="bg-emerald-50 border border-emerald-200 rounded-xl px-4 py-3 text-sm text-emerald-800 mb-4"><i class="fas fa-circle-check mr-2"></i>${esc(audit.reminder || 'All products have complete financial parameters.')}</div>`
   const rows = queue.map(p => `<tr class="border-t border-slate-100">
       <td class="px-4 py-2">${prodImg(p, 'w-10 h-10 rounded-lg')}</td>
-      <td class="px-4 py-3"><div class="font-medium">${esc(p.name)}</div><div class="text-xs text-slate-500">${esc(p.sku)} · ${esc(p.category || 'Equipment')}</div></td>
+      <td class="px-4 py-3"><div class="font-medium">${esc(p.name)}</div><div class="text-xs text-slate-500">${esc(p.sku)} · ${esc(p.category || 'Feed')}</div></td>
       <td class="px-4 py-3 text-xs text-slate-500">${esc(p.created_by_name || '—')}</td>
       <td class="px-4 py-3 text-right">${fmt(p.buying_price)}</td>
       <td class="px-4 py-3 text-right">${p.quantity} ${esc(p.unit || '')}</td>
@@ -1407,14 +1407,14 @@ async function viewFinanceQueue() {
   <div class="card table-card mb-6">
     <div class="px-4 py-3 border-b font-semibold text-slate-700"><i class="fas fa-list-check text-teal-600 mr-2"></i>Products awaiting financial setup</div>
     <table class="w-full text-sm">
-      <thead class="bg-slate-50 text-slate-500 text-xs uppercase"><tr><th class="text-left px-4 py-3">Image</th><th class="text-left px-4 py-3">Equipment</th><th class="text-left px-4 py-3">Listed by</th><th class="text-right px-4 py-3">Buying cost</th><th class="text-right px-4 py-3">Qty</th><th></th></tr></thead>
+      <thead class="bg-slate-50 text-slate-500 text-xs uppercase"><tr><th class="text-left px-4 py-3">Image</th><th class="text-left px-4 py-3">Feed</th><th class="text-left px-4 py-3">Listed by</th><th class="text-right px-4 py-3">Buying cost</th><th class="text-right px-4 py-3">Qty</th><th></th></tr></thead>
       <tbody>${rows || '<tr><td colspan="6" class="text-center py-8 text-slate-400">Nothing awaiting finance approval</td></tr>'}</tbody>
     </table>
   </div>
   <div class="card table-card">
     <div class="px-4 py-3 border-b font-semibold text-slate-700"><i class="fas fa-eye-slash text-amber-500 mr-2"></i>Hidden from storefront (audit)</div>
     <table class="w-full text-sm">
-      <thead class="bg-slate-50 text-slate-500 text-xs uppercase"><tr><th class="text-left px-4 py-3">Equipment</th><th class="text-left px-4 py-3">Status</th><th class="text-left px-4 py-3">Markup</th><th class="text-left px-4 py-3">Agreement</th><th class="text-left px-4 py-3">Listed by</th></tr></thead>
+      <thead class="bg-slate-50 text-slate-500 text-xs uppercase"><tr><th class="text-left px-4 py-3">Feed</th><th class="text-left px-4 py-3">Status</th><th class="text-left px-4 py-3">Markup</th><th class="text-left px-4 py-3">Agreement</th><th class="text-left px-4 py-3">Listed by</th></tr></thead>
       <tbody>${auditRows || '<tr><td colspan="5" class="text-center py-8 text-slate-400">No hidden products</td></tr>'}</tbody>
     </table>
   </div>`
@@ -2658,7 +2658,7 @@ function productPicker(cfg, ns, canEdit) {
         <div class="grid grid-cols-2 gap-3">
           <div><label class="field-label">SKU</label><input id="qp_sku_${ns}" class="w-full px-3 py-2 border rounded-lg text-sm" placeholder="e.g. EQ-045"></div>
           <div><label class="field-label">Name</label><input id="qp_name_${ns}" class="w-full px-3 py-2 border rounded-lg text-sm" placeholder="Product name"></div>
-          <div><label class="field-label">Category</label><input id="qp_cat_${ns}" class="w-full px-3 py-2 border rounded-lg text-sm" placeholder="Equipment" value="Equipment"></div>
+          <div><label class="field-label">Category</label><input id="qp_cat_${ns}" class="w-full px-3 py-2 border rounded-lg text-sm" placeholder="Feed" value="Feed"></div>
           <div><label class="field-label">Buying Price (KES)</label><input id="qp_price_${ns}" type="number" min="0" class="w-full px-3 py-2 border rounded-lg text-sm" placeholder="0"></div>
         </div>
         <button type="button" onclick="createQuickProduct('${ns}')" class="btn mt-3 brand-bg text-white px-4 py-2 rounded-lg text-xs"><i class="fas fa-check mr-1"></i>Create &amp; select</button>
@@ -2675,7 +2675,7 @@ window.toggleQuickProduct = (ns) => { const el = $('quickProduct_' + ns); if (el
 window.createQuickProduct = async (ns) => {
   const sku = ($('qp_sku_' + ns) || {}).value, name = ($('qp_name_' + ns) || {}).value
   if (!sku || !name) return toast('SKU and name are required', false)
-  const body = { sku: sku.trim(), name: name.trim(), category: ($('qp_cat_' + ns) || {}).value || 'Equipment', buying_price: Number(($('qp_price_' + ns) || {}).value || 0) }
+  const body = { sku: sku.trim(), name: name.trim(), category: ($('qp_cat_' + ns) || {}).value || 'Feed', buying_price: Number(($('qp_price_' + ns) || {}).value || 0) }
   try {
     const res = await api.post('/settings/quick-product', body)
     const prod = res.data.product
