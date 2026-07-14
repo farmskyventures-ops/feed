@@ -3031,7 +3031,7 @@ const SHELL = `<!DOCTYPE html>
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Farmsky — Sharia-Compliant Agri-Finance</title>
+  <title>Farmsky</title>
   <link rel="icon" type="image/png" href="/static/favicon.png">
   <!-- Production Tailwind build (compiled via Tailwind CLI, no runtime CDN JIT). -->
   <link href="/static/tailwind.css" rel="stylesheet">
