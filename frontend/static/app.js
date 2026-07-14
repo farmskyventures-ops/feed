@@ -869,8 +869,6 @@ window.payModal = async (id, amount, outstanding, kind) => {
   let mpMode = { mode: 'simulation', live: false }
   try { mpMode = (await api.get('/mpesa/status')).data } catch {}
   const modeBadge = (m) => m.live
-    ? `<span class="text-[10px] text-emerald-700">live · ${esc(m.mode)}</span>`
-    : `<span class="text-[10px] text-amber-700">simulation</span>`
 
   showModal(`<h3 class="text-lg font-bold mb-1"><i class="fas fa-mobile-alt text-teal-600 mr-2"></i>${isCash ? 'Cash Checkout' : 'Repayment'}</h3>
     <p class="text-xs text-slate-500 mb-3">${isCash ? 'Amount due' : 'Outstanding'}: ${fmt(outstanding)}</p>
@@ -885,12 +883,10 @@ window.payModal = async (id, amount, outstanding, kind) => {
       <label class="border rounded-lg p-3 text-center cursor-pointer bg-white border-slate-200 has-[:checked]:ring-2 has-[:checked]:ring-emerald-500 has-[:checked]:border-emerald-400">
         <input type="radio" name="paymethod" value="mpesa" checked onchange="toggleSasaChannels()" class="hidden">
         <img src="/static/mpesa-logo.svg" alt="M-Pesa" class="h-10 mx-auto mb-1 object-contain">
-        <div>${modeBadge(mpMode)}<span class="text-[10px] text-slate-400 block">via Farmsky Gateway</span></div>
       </label>
       <label class="border rounded-lg p-3 text-center cursor-pointer bg-white border-slate-200 has-[:checked]:ring-2 has-[:checked]:ring-green-500 has-[:checked]:border-green-400">
         <input type="radio" name="paymethod" value="sasapay" onchange="toggleSasaChannels()" class="hidden">
         <img src="/static/sasapay-logo.svg" alt="SasaPay" class="h-10 mx-auto mb-1 object-contain">
-        <div>${modeBadge(mpMode)}<span class="text-[10px] text-slate-400 block">via Farmsky Gateway</span></div>
       </label>
     </div>
 
