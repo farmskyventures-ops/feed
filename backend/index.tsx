@@ -15,7 +15,7 @@ import paymentGateway from './payment-gateway-host'
 import { sendSms, smsConfigured, generateOtp } from './sms'
 import { sendEmail, emailConfigured } from './email'
 import { hashPassword, verifyPassword, isHashed } from './password'
-import { initiatePayment as gatewayInitiate, getPaymentStatus as gatewayStatus, processPayment as gatewayProcess, gatewayConfigured } from './payment-gateway-client'
+import { initiatePayment as gatewayInitiate, getPaymentStatus as gatewayStatus, processPayment as gatewayProcess, payoutPayment as gatewayPayout, gatewayConfigured } from './payment-gateway-client'
 import { validateImageDataUrl, validateText, validateTextFields } from './upload-validation'
 
 const app = new Hono<{ Bindings: Bindings; Variables: { user: SessionUser } }>()
@@ -404,7 +404,7 @@ function financingQuote(p: any, quantity: any, paymentType: string, termMonths: 
     total_price: principalBase,
     total_payable,
     outstanding_after_deposit: financed_total,
-    disclosure_note: 'Sharia-compliant Murabaha: a fixed cost-plus markup is agreed up front and repaid in equal installments over the selected term. No interest (riba) is charged.'
+    disclosure_note: 'Sharia-compliant Murabaha: a fixed cost-plus markup is agreed up front and repaid in equal installments over the selected term. No riba is charged.'
       + (processing_fee > 0 ? ` A processing fee of ${processing_fee.toLocaleString()} applies to the financed amount.` : ''),
     terms_text: p.financing_terms_text || null,
     terms_document_url: p.financing_terms_doc_url || null
@@ -508,6 +508,44 @@ async function audit(c: any, userId: number | null, action: string, entity: stri
 function genPassword(): string {
   return String(Math.floor(1000 + Math.random() * 9000))
 }
+
+// A secure, random TEMPORARY password for the multi-user onboarding flow.
+// Mixed-case + digits, avoids ambiguous characters (0/O, 1/l/I).
+function genTempPassword(len = 10): string {
+  const alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789'
+  const bytes = new Uint8Array(len)
+  crypto.getRandomValues(bytes)
+  let out = ''
+  for (let i = 0; i < len; i++) out += alphabet[bytes[i] % alphabet.length]
+  return out
+}
+
+// Milliseconds a temporary password stays valid before it must be reset (3 hours).
+const TEMP_PASSWORD_TTL_MS = 3 * 60 * 60 * 1000
+
+// Stamp a freshly-created user with a temporary password + lifecycle flags and
+// SMS it to them with the mandatory "do not share / expires in 3 hours" notice.
+// Returns the plaintext temp password (also surfaced to the creator's UI as a
+// fallback for when SMS is not configured / delivery is delayed).
+async function issueTempPassword(
+  c: any,
+  opts: { userId: number | bigint; phone: string; fullName?: string; hashedInto?: 'insert' }
+): Promise<{ tempPassword: string; expiresAt: number; sms: { simulated?: boolean; success?: boolean; error?: string } }> {
+  const tempPassword = genTempPassword()
+  const expiresAt = Date.now() + TEMP_PASSWORD_TTL_MS
+  const hashed = await hashPassword(tempPassword)
+  await c.env.DB.prepare(
+    `UPDATE users SET password=?, password_set=0, must_change_password=1, is_temp_password=1, temp_password_expires_at=? WHERE id=?`
+  ).bind(hashed, expiresAt, opts.userId).run()
+  const msg =
+    `Farmsky account created${opts.fullName ? ' for ' + opts.fullName : ''}. ` +
+    `Temporary password: ${tempPassword}. ` +
+    `Do not share this password. It expires within 3 hours. ` +
+    `Log in and set your own password.`
+  let sms: any = { simulated: true, success: true }
+  try { sms = await sendSms(c.env, opts.phone, msg) } catch (e: any) { sms = { success: false, error: e?.message || 'SMS failed' } }
+  return { tempPassword, expiresAt, sms }
+}
 async function createSession(c: any, user: any) {
   const token = genToken()
   const expires = Date.now() + 1000 * 60 * 60 * 12
@@ -558,9 +596,25 @@ app.post('/api/login', async (c) => {
   const check = user ? await verifyPassword(String(password), user.password) : { ok: false, legacy: false }
   if (!user || !check.ok) return c.json({ error: 'Invalid phone number or password' }, 401)
   if (user.status !== 'active') return c.json({ error: 'Account suspended' }, 403)
+  // PASSWORD LIFECYCLE: a temporary (admin/agent-issued) password that has
+  // expired can no longer be used. Tell the client to offer an admin reset.
+  if (user.is_temp_password && user.temp_password_expires_at && Number(user.temp_password_expires_at) < Date.now()) {
+    return c.json({ error: 'Your temporary password has expired. Please ask an admin to reset it.', temp_expired: true, phone: user.phone }, 403)
+  }
   // Upgrade-on-login: transparently re-hash any legacy plaintext password.
   if (check.legacy) {
     try { await c.env.DB.prepare(`UPDATE users SET password=? WHERE id=?`).bind(await hashPassword(String(password)), user.id).run() } catch (_) {}
+  }
+  // First-login with a temporary password: authenticate, but force an immediate
+  // password change before granting a full session / app access.
+  if (user.must_change_password) {
+    const changeToken = await createSession(c, user)
+    await audit(c, user.id, 'login', 'user', `${user.role} logged in with temporary password (must change)`)
+    return c.json({
+      token: changeToken,
+      must_change_password: true,
+      user: { id: user.id, full_name: user.full_name, phone: user.phone, role: user.role }
+    })
   }
   // Enforce time-based access windows (per-user override, else role template).
   const window = await resolveAccessWindow(c, user)
@@ -617,10 +671,19 @@ app.put('/api/me/password', requireAuth, async (c) => {
   const user = c.get('user') as SessionUser
   const { current_password, new_password } = await c.req.json()
   if (!new_password || String(new_password).length < 4) return c.json({ error: 'New password must be at least 4 characters' }, 400)
-  const row = await c.env.DB.prepare(`SELECT password FROM users WHERE id=?`).bind(user.id).first<any>()
-  const chk = row ? await verifyPassword(String(current_password), row.password) : { ok: false }
-  if (!row || !chk.ok) return c.json({ error: 'Current password is incorrect' }, 400)
-  await c.env.DB.prepare(`UPDATE users SET password=?, password_set=1 WHERE id=?`).bind(await hashPassword(String(new_password)), user.id).run()
+  const row = await c.env.DB.prepare(`SELECT password, must_change_password FROM users WHERE id=?`).bind(user.id).first<any>()
+  if (!row) return c.json({ error: 'Current password is incorrect' }, 400)
+  // Mandatory first-login change: the user just authenticated with the temporary
+  // password, so we skip the current-password re-prompt for this one transition.
+  if (!row.must_change_password) {
+    const chk = await verifyPassword(String(current_password), row.password)
+    if (!chk.ok) return c.json({ error: 'Current password is incorrect' }, 400)
+  }
+  // Setting a self-chosen password also completes the onboarding lifecycle:
+  // clear the mandatory-change gate, the temp flag and the expiry deadline.
+  await c.env.DB.prepare(
+    `UPDATE users SET password=?, password_set=1, must_change_password=0, is_temp_password=0, temp_password_expires_at=NULL WHERE id=?`
+  ).bind(await hashPassword(String(new_password)), user.id).run()
   await audit(c, user.id, 'update', 'profile', 'password change')
   return c.json({ ok: true })
 })
@@ -731,34 +794,58 @@ app.post('/api/signup/request-otp', async (c) => {
 // attachments are added AFTER sign-up (via /api/me/profile & the KYC upload
 // endpoints) and are enforced only when the user attempts a FINANCING purchase.
 app.post('/api/signup/verify', async (c) => {
-  const { phone, full_name, code, password, region } = await c.req.json()
+  const b = await c.req.json()
+  const { phone, full_name, code, password, region } = b
   const p = normalizePhone(phone || '')
   if (!full_name || String(full_name).trim().length < 2) return c.json({ error: 'Enter your full name' }, 400)
   if (!password || String(password).length < 4) return c.json({ error: 'Password must be at least 4 characters' }, 400)
+  // UNIFIED REGISTRATION: self-signup collects the SAME Standard Profile Data an
+  // agent collects when onboarding a farmer. National ID + County are required.
+  const national_id = String(b.national_id || '').trim()
+  const county = String(b.county || '').trim()
+  if (!national_id) return c.json({ error: 'National ID is required' }, 400)
+  if (!county) return c.json({ error: 'County is required' }, 400)
+  // Screen the free-text identity/location fields for injection / harmful content.
+  const tv = validateTextFields(b, [
+    { key: 'full_name', label: 'Full name', max: 120 },
+    { key: 'national_id', label: 'National ID', max: 40 },
+    { key: 'county', label: 'County', max: 80 }, { key: 'sub_county', label: 'Sub-county', max: 80 },
+    { key: 'ward', label: 'Ward', max: 80 }, { key: 'village', label: 'Village', max: 120 },
+    { key: 'value_chain', label: 'Value chain', max: 120 }, { key: 'value_chain_type', label: 'Value chain type', max: 120 }
+  ])
+  if (!tv.ok) return c.json({ error: tv.error }, 400)
   const v = await verifyOtp(c, p, code, 'signup')
   if (!v.ok) return c.json({ error: v.error }, 400)
   const existing = await c.env.DB.prepare(`SELECT id FROM users WHERE phone=?`).bind(p).first()
   if (existing) return c.json({ error: 'Account already exists. Please sign in.' }, 409)
+  // National ID must be unique across customers (same rule as agent onboarding).
+  const dupId = await c.env.DB.prepare(`SELECT id FROM customers WHERE national_id=?`).bind(national_id).first()
+  if (dupId) return c.json({ error: 'A profile with this National ID already exists.' }, 409)
   const role = 'customer'
   const farmerPerms = await permissionsForRole(c, role)
   // Self-registration is a server-authorized write: run under the admin RLS
-  // context so the non-superuser DB role can create the user + bare customer
-  // profile (matches every other privileged insert in this file).
+  // context so the non-superuser DB role can create the user + customer profile
+  // (matches every other privileged insert in this file).
   const userId = await withAdminContext(c, async () => {
     const r = await c.env.DB.prepare(
       `INSERT INTO users (full_name, phone, password, role, status, region, password_set, label, permissions) VALUES (?,?,?, ?, 'active', ?, 1, ?, ?)`
     ).bind(String(full_name).trim(), p, await hashPassword(String(password)), role, region || null, 'Farmer', JSON.stringify(farmerPerms)).run()
     const uid = r.meta.last_row_id
-    // Create a bare customer profile. KYC is 'not_started' until the farmer uploads
-    // their ID documents & profile data later (required before financing).
+    // Create the customer profile with the SAME standard fields an agent captures.
+    // KYC stays 'not_started' until ID documents are uploaded (required before financing).
     await c.env.DB.prepare(
-      `INSERT INTO customers (user_id, full_name, mobile, kyc_status) VALUES (?,?,?, 'not_started')`
-    ).bind(uid, String(full_name).trim(), p).run()
+      `INSERT INTO customers (user_id, full_name, mobile, national_id, county, sub_county, ward, village, value_chain_type, value_chain, onboarded_by, kyc_status)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?, 'not_started')`
+    ).bind(
+      uid, String(full_name).trim(), p, national_id, county,
+      b.sub_county || null, b.ward || null, b.village || null,
+      b.value_chain_type || null, b.value_chain || null, uid
+    ).run()
     return uid
   })
   const user = { id: userId, full_name: String(full_name).trim(), phone: p, role, region, label: 'Farmer', permissions: farmerPerms }
   await createSession(c, user)
-  await audit(c, userId, 'signup', 'user', 'customer self-registered via SMS OTP (name, phone, password)')
+  await audit(c, userId, 'signup', 'user', 'customer self-registered via SMS OTP (unified standard profile: name, phone, national ID, location)')
   return c.json({ ok: true, user })
 })
 
@@ -1437,7 +1524,7 @@ app.post('/api/mpesa/stkpush', requireAuth, async (c) => {
   const amt = Number(amount)
   if (amt <= 0) return c.json({ error: 'Invalid amount' }, 400)
   if (amt > Number(contract.outstanding || 0)) return c.json({ error: 'Amount exceeds outstanding balance' }, 400)
-  const desc = contract.payment_type === 'cash' ? 'Feed Cash Purchase' : (contract.financing_model === 'paygo' ? 'PAYGO Feed Payment' : 'Feed Murabaha Payment')
+  const desc = contract.payment_type === 'cash' ? 'Feed Cash Purchase' : (contract.financing_model === 'paygo' ? 'Feed Instalment Payment' : 'Feed Murabaha Payment')
   const payerPhone = phone || c.get('user').phone
 
   // PRIMARY PATH: route through the Farmsky Central Payment Gateway hosted at
@@ -2274,6 +2361,23 @@ app.get('/api/agents', requireAuth, requireRole('admin', 'super_admin'), async (
   const agentFallback = await loadRoleTemplate(c, 'agent')
   return c.json({ agents: results.map((a: any) => ({ ...a, permissions: parsePermissions(a.permissions, 'agent', agentFallback) })) })
 })
+// ----------------------------------------------------------------------------
+// MULTI-USER ONBOARDING — OTP VERIFICATION
+// The creator (agent/admin) verifies the NEW user's phone before the account is
+// finalised. Step 1: request an OTP to the new user's phone. Step 2: create the
+// account passing the OTP code; on success a temporary password is issued.
+// ----------------------------------------------------------------------------
+app.post('/api/onboard/request-otp', requireAuth, requireRole('admin', 'super_admin', 'agent'), async (c) => {
+  const { phone } = await c.req.json()
+  const p = normalizePhone(phone || '')
+  if (!p) return c.json({ error: 'A valid phone number is required' }, 400)
+  const dup = await c.env.DB.prepare(`SELECT id FROM users WHERE phone=?`).bind(p).first()
+  if (dup) return c.json({ error: 'A user with this phone already exists' }, 409)
+  const { sms, demo_otp } = await issueOtp(c, p, 'onboard')
+  if (!sms.simulated && !sms.success) return c.json({ error: sms.error || 'Failed to send OTP' }, 502)
+  return c.json({ ok: true, phone: p, message: sms.simulated ? 'Demo mode: use the code shown below.' : `Verification code sent to ${p}.`, demo_otp })
+})
+
 app.post('/api/agents', requireAuth, requireRole('admin', 'super_admin'), async (c) => {
   const b = await c.req.json()
   const p = normalizePhone(b.phone || '')
@@ -2281,25 +2385,55 @@ app.post('/api/agents', requireAuth, requireRole('admin', 'super_admin'), async 
   const dup = await c.env.DB.prepare(`SELECT id FROM users WHERE phone=?`).bind(p).first()
   if (dup) return c.json({ error: 'A user with this phone already exists' }, 409)
   const provided = b.password && String(b.password).length >= 4
+  // Multi-user onboarding: unless an explicit password is set, verify the new
+  // user's phone via OTP, then issue a temporary (must-change, 3h-expiry) one.
+  if (!provided) {
+    const v = await verifyOtp(c, p, String(b.otp_code || ''), 'onboard')
+    if (!v.ok) return c.json({ error: v.error || 'Phone verification required', otp_required: true }, 400)
+  }
   const pwd = provided ? String(b.password) : genPassword()
   const perms = await permissionsForRole(c, 'agent', b.permissions || {})
-  const r = await c.env.DB.prepare(`INSERT INTO users (full_name,phone,email,password,role,region,password_set,label,permissions) VALUES (?,?,?,?, 'agent', ?, ?, ?, ?)`).bind(b.full_name, p, b.email || null, await hashPassword(pwd), b.region || null, provided, b.label || 'Agent', JSON.stringify(perms)).run()
+  const creatorId = c.get('user').id
+  const r = await c.env.DB.prepare(`INSERT INTO users (full_name,phone,email,password,role,region,password_set,label,permissions,created_by) VALUES (?,?,?,?, 'agent', ?, ?, ?, ?, ?)`).bind(b.full_name, p, b.email || null, await hashPassword(pwd), b.region || null, provided, b.label || 'Agent', JSON.stringify(perms), creatorId).run()
   await c.env.DB.prepare(`INSERT INTO agents (user_id,region,permissions) VALUES (?,?,?)`).bind(r.meta.last_row_id, b.region || null, JSON.stringify(perms)).run()
-  await audit(c, c.get('user').id, 'create', 'agent', b.full_name)
-  return c.json({ id: r.meta.last_row_id, password: pwd, password_was_set_by_admin: provided })
+  await audit(c, creatorId, 'create', 'agent', b.full_name)
+  if (provided) return c.json({ id: r.meta.last_row_id, password: pwd, password_was_set_by_admin: true })
+  const t = await issueTempPassword(c, { userId: r.meta.last_row_id as number, phone: p, fullName: b.full_name })
+  return c.json({ id: r.meta.last_row_id, password: t.tempPassword, password_was_set_by_admin: false, temporary: true, expires_at: t.expiresAt, sms_simulated: !!t.sms.simulated })
 })
 app.post('/api/users/:id/reset-password', requireAuth, requireRole('admin', 'super_admin'), async (c) => {
   const id = c.req.param('id')
-  const target = await c.env.DB.prepare(`SELECT id, full_name, role FROM users WHERE id=?`).bind(id).first<any>()
+  const target = await c.env.DB.prepare(`SELECT id, full_name, phone, role FROM users WHERE id=?`).bind(id).first<any>()
   if (!target) return c.json({ error: 'User not found' }, 404)
   if (target.role === 'super_admin' && Number(id) !== c.get('user').id) return c.json({ error: 'Cannot reset another Super Admin password' }, 400)
   const body = await c.req.json().catch(() => ({}))
   const provided = body?.password && String(body.password).length >= 4
-  const pwd = provided ? String(body.password) : genPassword()
-  await c.env.DB.prepare(`UPDATE users SET password=?, password_set=1 WHERE id=?`).bind(await hashPassword(pwd), id).run()
+  // Admin-triggered reset. When no explicit password is supplied (the normal
+  // path — including recovering an expired temporary password) we reissue a
+  // fresh temporary password with the mandatory-change + 3h-expiry lifecycle.
+  if (provided) {
+    await c.env.DB.prepare(`UPDATE users SET password=?, password_set=1, must_change_password=0, is_temp_password=0, temp_password_expires_at=NULL WHERE id=?`).bind(await hashPassword(String(body.password)), id).run()
+    await c.env.DB.prepare(`DELETE FROM sessions WHERE user_id=?`).bind(id).run()
+    await audit(c, c.get('user').id, 'reset_password', target.role, target.full_name)
+    return c.json({ ok: true, new_password: String(body.password), user: target.full_name })
+  }
   await c.env.DB.prepare(`DELETE FROM sessions WHERE user_id=?`).bind(id).run()
-  await audit(c, c.get('user').id, 'reset_password', target.role, target.full_name)
-  return c.json({ ok: true, new_password: pwd, user: target.full_name })
+  const t = await issueTempPassword(c, { userId: id as any, phone: target.phone, fullName: target.full_name })
+  await audit(c, c.get('user').id, 'reset_password', target.role, `${target.full_name} (temporary)`)
+  return c.json({ ok: true, new_password: t.tempPassword, user: target.full_name, temporary: true, expires_at: t.expiresAt, sms_simulated: !!t.sms.simulated })
+})
+
+// Public: a user whose temporary password expired can ask an admin to reset it.
+// (Surfaced by the login screen when a login attempt returns temp_expired.)
+app.post('/api/onboard/request-reset', async (c) => {
+  const { phone } = await c.req.json().catch(() => ({}))
+  const p = normalizePhone(phone || '')
+  const user = await c.env.DB.prepare(`SELECT id, full_name FROM users WHERE phone=?`).bind(p).first<any>()
+  // Do not reveal account existence; always respond ok.
+  if (user) {
+    try { await audit(c, user.id, 'reset_request', 'user', `Temp-password reset requested for ${user.full_name}`) } catch {}
+  }
+  return c.json({ ok: true, message: 'Your request has been sent. An administrator will reset your password shortly.' })
 })
 app.put('/api/agents/:id', requireAuth, requireRole('admin', 'super_admin'), async (c) => {
   const id = c.req.param('id')
@@ -2330,16 +2464,25 @@ app.post('/api/users', requireAuth, requireRole('admin', 'super_admin'), async (
   const dup = await c.env.DB.prepare(`SELECT id FROM users WHERE phone=?`).bind(p).first<any>()
   if (dup) return c.json({ error: 'A user with this phone already exists' }, 409)
   const provided = b.password && String(b.password).length >= 4
+  // Multi-user onboarding: verify the new staff member's phone via OTP unless an
+  // explicit password was supplied, then issue a temporary password.
+  if (!provided) {
+    const v = await verifyOtp(c, p, String(b.otp_code || ''), 'onboard')
+    if (!v.ok) return c.json({ error: v.error || 'Phone verification required', otp_required: true }, 400)
+  }
   const pwd = provided ? String(b.password) : genPassword()
   const perms = await permissionsForRole(c, String(b.role), b.permissions || {})
   const templateRow = await c.env.DB.prepare(`SELECT label FROM role_templates WHERE role_key=?`).bind(String(b.role)).first<any>()
   const label = b.label || templateRow?.label || (String(b.role) === 'operations_finance' ? 'Operations & Finance' : String(b.role).replace(/_/g, ' '))
   const schedEnabled = boolInt(b.schedule_enabled, false) ? 1 : 0
   const schedDays = Array.isArray(b.access_days) ? JSON.stringify(b.access_days) : null
-  const r = await c.env.DB.prepare(`INSERT INTO users (full_name, phone, email, password, role, label, permissions, status, region, password_set, schedule_enabled, access_days, access_start, access_end) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).bind(b.full_name, p, b.email || null, await hashPassword(pwd), b.role, label, JSON.stringify(perms), b.status || 'active', b.region || null, provided, schedEnabled, schedDays, b.access_start || null, b.access_end || null).run()
+  const creatorId = c.get('user').id
+  const r = await c.env.DB.prepare(`INSERT INTO users (full_name, phone, email, password, role, label, permissions, status, region, password_set, schedule_enabled, access_days, access_start, access_end, created_by) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).bind(b.full_name, p, b.email || null, await hashPassword(pwd), b.role, label, JSON.stringify(perms), b.status || 'active', b.region || null, provided, schedEnabled, schedDays, b.access_start || null, b.access_end || null, creatorId).run()
   if (b.role === 'agent') await c.env.DB.prepare(`INSERT INTO agents (user_id,region,permissions) VALUES (?,?,?)`).bind(r.meta.last_row_id, b.region || null, JSON.stringify(perms)).run()
-  await audit(c, c.get('user').id, 'create', 'user', `${b.full_name} (${b.role})`)
-  return c.json({ id: r.meta.last_row_id, password: pwd, password_was_set_by_admin: provided })
+  await audit(c, creatorId, 'create', 'user', `${b.full_name} (${b.role})`)
+  if (provided) return c.json({ id: r.meta.last_row_id, password: pwd, password_was_set_by_admin: true })
+  const t = await issueTempPassword(c, { userId: r.meta.last_row_id as number, phone: p, fullName: b.full_name })
+  return c.json({ id: r.meta.last_row_id, password: t.tempPassword, password_was_set_by_admin: false, temporary: true, expires_at: t.expiresAt, sms_simulated: !!t.sms.simulated })
 })
 app.put('/api/users/:id', requireAuth, requireRole('admin', 'super_admin'), async (c) => {
   const id = c.req.param('id')
@@ -2672,6 +2815,352 @@ app.post('/api/export/email', requireAuth, requireRole('admin', 'super_admin'), 
 })
 
 // ============================================================================
+// AUTOMATED SYSTEM BACKUPS (Task 3A)
+//   Regular, automated backups of ALL user profiles, transactional records and
+//   system-wide data. A backup captures a JSON snapshot of every core table and
+//   persists it (with row counts + size) in system_backups so admins can review,
+//   download and restore-plan from it. Backups run:
+//     * on demand   — admin clicks "Back up now"
+//     * automatically — a cadence gate (default 24h) fires the next time any
+//       admin route is hit after the interval elapses (works without a external
+//       scheduler; also invokable by a real cron via POST /api/backups/run-auto)
+// ============================================================================
+
+// Tables captured in a full backup. Order groups: profiles → transactional →
+// system/config. SELECT * so schema additions are captured automatically.
+const BACKUP_TABLES: { key: string; sql: string }[] = [
+  { key: 'users', sql: 'SELECT * FROM users' },
+  { key: 'customers', sql: 'SELECT * FROM customers' },
+  { key: 'agents', sql: 'SELECT * FROM agents' },
+  { key: 'products', sql: 'SELECT * FROM products' },
+  { key: 'murabaha_contracts', sql: 'SELECT * FROM murabaha_contracts' },
+  { key: 'repayments', sql: 'SELECT * FROM repayments' },
+  { key: 'transactions', sql: 'SELECT * FROM transactions' },
+  { key: 'wallets', sql: 'SELECT * FROM wallets' },
+  { key: 'wallet_ledger', sql: 'SELECT * FROM wallet_ledger' },
+  { key: 'audit_logs', sql: 'SELECT * FROM audit_logs' }
+]
+
+const AUTO_BACKUP_INTERVAL_MS = 24 * 60 * 60 * 1000 // daily
+
+// Build a full snapshot of every backup table (admin context bypasses row-level
+// ownership scoping so the backup is complete). Missing tables are skipped
+// gracefully so the backup never hard-fails on an optional table.
+async function buildBackupSnapshot(c: any): Promise<{ payload: Record<string, any[]>; counts: Record<string, number>; total: number }> {
+  return await withAdminContext(c, async () => {
+    const payload: Record<string, any[]> = {}
+    const counts: Record<string, number> = {}
+    let total = 0
+    for (const t of BACKUP_TABLES) {
+      try {
+        const { results } = await c.env.DB.prepare(t.sql).all()
+        const rows = (results || []) as any[]
+        payload[t.key] = rows
+        counts[t.key] = rows.length
+        total += rows.length
+      } catch (_) {
+        // Table not present in this deployment — record 0 and continue.
+        payload[t.key] = []
+        counts[t.key] = 0
+      }
+    }
+    return { payload, counts, total }
+  })
+}
+
+// Create + persist a backup row. Used by both the manual and automatic paths.
+async function performBackup(c: any, triggerType: 'manual' | 'auto', createdBy: number | null) {
+  try {
+    const snap = await buildBackupSnapshot(c)
+    const serialized = JSON.stringify({ version: 1, created_at: new Date().toISOString(), data: snap.payload })
+    const size = base64Utf8(serialized).length // approximate stored size
+    const summary = Object.entries(snap.counts).map(([k, v]) => `${k}:${v}`).join(', ')
+    const r = await c.env.DB.prepare(
+      `INSERT INTO system_backups (trigger_type, summary, record_count, size_bytes, payload, status, created_by) VALUES (?,?,?,?,?, 'success', ?)`
+    ).bind(triggerType, summary, snap.total, size, serialized, createdBy).run()
+    await audit(c, createdBy, 'backup', 'system', `${triggerType} backup — ${snap.total} records`)
+    return { id: r.meta.last_row_id, record_count: snap.total, size_bytes: size, summary, counts: snap.counts }
+  } catch (e: any) {
+    try {
+      await c.env.DB.prepare(
+        `INSERT INTO system_backups (trigger_type, summary, record_count, size_bytes, payload, status, error, created_by) VALUES (?,?,0,0,NULL,'failed',?,?)`
+      ).bind(triggerType, 'backup failed', String(e?.message || e), createdBy).run()
+    } catch (_) {}
+    throw e
+  }
+}
+
+// Cadence gate: fire an automatic backup if the newest successful auto/manual
+// backup is older than AUTO_BACKUP_INTERVAL_MS (or none exists). Best-effort,
+// never throws into the calling request.
+async function maybeAutoBackup(c: any) {
+  try {
+    const last = await c.env.DB.prepare(
+      `SELECT created_at FROM system_backups WHERE status='success' ORDER BY id DESC LIMIT 1`
+    ).first<any>()
+    if (last?.created_at) {
+      const lastMs = new Date(String(last.created_at).replace(' ', 'T')).getTime()
+      if (!Number.isNaN(lastMs) && Date.now() - lastMs < AUTO_BACKUP_INTERVAL_MS) return { ran: false }
+    }
+    await performBackup(c, 'auto', null)
+    return { ran: true }
+  } catch (_) { return { ran: false } }
+}
+
+// List backups (metadata only — payloads excluded to keep the response light).
+app.get('/api/backups', requireAuth, requireRole('admin', 'super_admin'), async (c) => {
+  // Opportunistically ensure the daily automatic backup exists.
+  await maybeAutoBackup(c)
+  const { results } = await c.env.DB.prepare(
+    `SELECT b.id, b.trigger_type, b.summary, b.record_count, b.size_bytes, b.status, b.error, b.created_at, u.full_name created_by_name
+       FROM system_backups b LEFT JOIN users u ON u.id=b.created_by
+      ORDER BY b.id DESC LIMIT 100`
+  ).all()
+  return c.json({ backups: results || [], interval_hours: AUTO_BACKUP_INTERVAL_MS / 3600000 })
+})
+
+// Trigger a manual backup now.
+app.post('/api/backups', requireAuth, requireRole('admin', 'super_admin'), async (c) => {
+  try {
+    const out = await performBackup(c, 'manual', c.get('user').id)
+    return c.json({ ok: true, ...out })
+  } catch (e: any) {
+    return c.json({ error: e?.message || 'Backup failed' }, 500)
+  }
+})
+
+// Download a stored backup snapshot as a JSON file.
+app.get('/api/backups/:id/download', requireAuth, requireRole('admin', 'super_admin'), async (c) => {
+  const row = await c.env.DB.prepare(`SELECT id, payload, created_at FROM system_backups WHERE id=?`).bind(c.req.param('id')).first<any>()
+  if (!row || !row.payload) return c.json({ error: 'Backup not found' }, 404)
+  await audit(c, c.get('user').id, 'backup_download', 'system', `backup #${row.id}`)
+  return new Response(row.payload, {
+    headers: {
+      'Content-Type': 'application/json',
+      'Content-Disposition': `attachment; filename="farmsky-backup-${row.id}.json"`
+    }
+  })
+})
+
+// Endpoint a real external scheduler (cron) can hit to run the auto backup.
+// Protected by an ADMIN_TASK_TOKEN header when configured; otherwise admin-only.
+app.post('/api/backups/run-auto', async (c) => {
+  const token = c.req.header('x-admin-task-token') || ''
+  const expected = (c.env as any).ADMIN_TASK_TOKEN
+  if (expected && token === expected) {
+    const r = await maybeAutoBackup(c)
+    return c.json({ ok: true, ...r })
+  }
+  // Fall back to authenticated admin.
+  const sessionToken = getCookie(c, 'session')
+  const sess = sessionToken ? await c.env.DB.prepare(`SELECT u.role FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.token=? AND s.expires_at > ?`).bind(sessionToken, Date.now()).first<any>() : null
+  if (!sess || !['admin', 'super_admin'].includes(sess.role)) return c.json({ error: 'Unauthorized' }, 401)
+  const r = await maybeAutoBackup(c)
+  return c.json({ ok: true, ...r })
+})
+
+// ============================================================================
+// BULK USER DATA UPLOAD & STANDARDIZATION (Task 3B)
+//   Categorized import (Farmers / Agents / Partners) → parse & normalize into
+//   the standard profile fields → flag rows missing required fields as
+//   exceptions for the admin to complete → once validated, auto-dispatch the
+//   onboarding flow (create account + temporary password + phone verification
+//   details) to each user.
+// ============================================================================
+
+// Map a raw import row's arbitrary column names to our standard field set.
+// Accepts common header aliases (case/spacing/underscore-insensitive).
+function mapImportRow(raw: Record<string, any>): Record<string, string> {
+  const norm: Record<string, any> = {}
+  for (const [k, v] of Object.entries(raw)) {
+    norm[String(k).toLowerCase().replace(/[^a-z0-9]/g, '')] = v
+  }
+  const pick = (...keys: string[]) => {
+    for (const k of keys) { const v = norm[k]; if (v != null && String(v).trim() !== '') return String(v).trim() }
+    return ''
+  }
+  return {
+    full_name: pick('fullname', 'name', 'names', 'customername', 'farmername'),
+    phone: pick('phone', 'phonenumber', 'mobile', 'msisdn', 'tel', 'telephone', 'contact'),
+    national_id: pick('nationalid', 'idnumber', 'idno', 'id', 'nid'),
+    email: pick('email', 'emailaddress'),
+    county: pick('county', 'region'),
+    sub_county: pick('subcounty', 'subcounties'),
+    ward: pick('ward'),
+    village: pick('village', 'location'),
+    value_chain_type: pick('valuechaintype', 'vct', 'category', 'farmtype', 'partnertype'),
+    value_chain: pick('valuechain', 'vc', 'crop', 'produce', 'commodity'),
+    region: pick('region', 'county', 'area')
+  }
+}
+
+// Required fields per category. Rows missing any are flagged as exceptions.
+const IMPORT_REQUIRED: Record<string, string[]> = {
+  farmers: ['full_name', 'phone', 'national_id', 'county'],
+  agents: ['full_name', 'phone'],
+  partners: ['full_name', 'phone']
+}
+
+function validateImportRow(category: string, row: Record<string, string>): string[] {
+  const required = IMPORT_REQUIRED[category] || ['full_name', 'phone']
+  const issues: string[] = []
+  for (const f of required) {
+    if (!row[f] || String(row[f]).trim() === '') issues.push(`missing ${f}`)
+  }
+  // Phone must normalize to a valid Kenyan MSISDN.
+  if (row.phone) {
+    const p = normalizePhone(row.phone)
+    if (!p || p.length < 12) issues.push('invalid phone')
+  }
+  return issues
+}
+
+// Step 1 — Upload a categorized batch. The client parses the CSV/XLSX into an
+// array of row objects; we normalize + validate + stage them.
+app.post('/api/imports', requireAuth, requireRole('admin', 'super_admin'), async (c) => {
+  const { category, filename, rows } = await c.req.json()
+  const cat = String(category || '').toLowerCase()
+  if (!['farmers', 'agents', 'partners'].includes(cat)) return c.json({ error: 'category must be farmers, agents or partners' }, 400)
+  if (!Array.isArray(rows) || rows.length === 0) return c.json({ error: 'No rows to import' }, 400)
+  if (rows.length > 5000) return c.json({ error: 'Batch too large (max 5000 rows)' }, 400)
+  const creator = c.get('user').id
+  const batch = await c.env.DB.prepare(
+    `INSERT INTO import_batches (category, filename, total_rows, status, created_by) VALUES (?,?,?, 'review', ?)`
+  ).bind(cat, filename || null, rows.length, creator).run()
+  const batchId = batch.meta.last_row_id
+  let valid = 0, exceptions = 0
+  for (let i = 0; i < rows.length; i++) {
+    const mapped = mapImportRow(rows[i] || {})
+    if (mapped.phone) mapped.phone = normalizePhone(mapped.phone)
+    const issues = validateImportRow(cat, mapped)
+    const status = issues.length ? 'exception' : 'valid'
+    if (status === 'valid') valid++; else exceptions++
+    await c.env.DB.prepare(
+      `INSERT INTO import_rows (batch_id, row_number, full_name, phone, national_id, email, county, sub_county, ward, village, value_chain_type, value_chain, region, raw, status, issues)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
+    ).bind(
+      batchId, i + 1, mapped.full_name || null, mapped.phone || null, mapped.national_id || null, mapped.email || null,
+      mapped.county || null, mapped.sub_county || null, mapped.ward || null, mapped.village || null,
+      mapped.value_chain_type || null, mapped.value_chain || null, mapped.region || null,
+      JSON.stringify(rows[i] || {}), status, issues.join(', ') || null
+    ).run()
+  }
+  await c.env.DB.prepare(`UPDATE import_batches SET valid_rows=?, exception_rows=? WHERE id=?`).bind(valid, exceptions, batchId).run()
+  await audit(c, creator, 'import', cat, `batch #${batchId}: ${rows.length} rows (${exceptions} exceptions)`)
+  return c.json({ ok: true, batch_id: batchId, total: rows.length, valid, exceptions })
+})
+
+// List batches.
+app.get('/api/imports', requireAuth, requireRole('admin', 'super_admin'), async (c) => {
+  const { results } = await c.env.DB.prepare(
+    `SELECT b.*, u.full_name created_by_name FROM import_batches b LEFT JOIN users u ON u.id=b.created_by ORDER BY b.id DESC LIMIT 100`
+  ).all()
+  return c.json({ batches: results || [] })
+})
+
+// Batch detail with its rows (for exception handling review).
+app.get('/api/imports/:id', requireAuth, requireRole('admin', 'super_admin'), async (c) => {
+  const id = c.req.param('id')
+  const batch = await c.env.DB.prepare(`SELECT * FROM import_batches WHERE id=?`).bind(id).first<any>()
+  if (!batch) return c.json({ error: 'Batch not found' }, 404)
+  const { results } = await c.env.DB.prepare(`SELECT * FROM import_rows WHERE batch_id=? ORDER BY row_number`).bind(id).all()
+  return c.json({ batch, rows: results || [] })
+})
+
+// Step 2 — Exception handling: admin patches a flagged row's missing fields.
+app.put('/api/imports/rows/:rowId', requireAuth, requireRole('admin', 'super_admin'), async (c) => {
+  const rowId = c.req.param('rowId')
+  const b = await c.req.json()
+  const row = await c.env.DB.prepare(`SELECT r.*, ba.category FROM import_rows r JOIN import_batches ba ON ba.id=r.batch_id WHERE r.id=?`).bind(rowId).first<any>()
+  if (!row) return c.json({ error: 'Row not found' }, 404)
+  if (row.status === 'dispatched') return c.json({ error: 'Row already onboarded' }, 400)
+  const merged: Record<string, string> = {
+    full_name: b.full_name ?? row.full_name ?? '',
+    phone: b.phone != null ? normalizePhone(b.phone) : (row.phone || ''),
+    national_id: b.national_id ?? row.national_id ?? '',
+    email: b.email ?? row.email ?? '',
+    county: b.county ?? row.county ?? '',
+    sub_county: b.sub_county ?? row.sub_county ?? '',
+    ward: b.ward ?? row.ward ?? '',
+    village: b.village ?? row.village ?? '',
+    value_chain_type: b.value_chain_type ?? row.value_chain_type ?? '',
+    value_chain: b.value_chain ?? row.value_chain ?? '',
+    region: b.region ?? row.region ?? ''
+  }
+  const issues = validateImportRow(row.category, merged)
+  const status = issues.length ? 'exception' : 'valid'
+  await c.env.DB.prepare(
+    `UPDATE import_rows SET full_name=?, phone=?, national_id=?, email=?, county=?, sub_county=?, ward=?, village=?, value_chain_type=?, value_chain=?, region=?, status=?, issues=? WHERE id=?`
+  ).bind(merged.full_name || null, merged.phone || null, merged.national_id || null, merged.email || null,
+    merged.county || null, merged.sub_county || null, merged.ward || null, merged.village || null,
+    merged.value_chain_type || null, merged.value_chain || null, merged.region || null,
+    status, issues.join(', ') || null, rowId).run()
+  // Recompute batch counts.
+  await recomputeBatchCounts(c, row.batch_id)
+  return c.json({ ok: true, status, issues })
+})
+
+async function recomputeBatchCounts(c: any, batchId: number) {
+  const v = await c.env.DB.prepare(`SELECT COUNT(*) n FROM import_rows WHERE batch_id=? AND status='valid'`).bind(batchId).first<any>()
+  const e = await c.env.DB.prepare(`SELECT COUNT(*) n FROM import_rows WHERE batch_id=? AND status='exception'`).bind(batchId).first<any>()
+  const d = await c.env.DB.prepare(`SELECT COUNT(*) n FROM import_rows WHERE batch_id=? AND status='dispatched'`).bind(batchId).first<any>()
+  await c.env.DB.prepare(`UPDATE import_batches SET valid_rows=?, exception_rows=?, dispatched_rows=? WHERE id=?`)
+    .bind(Number(v?.n || 0), Number(e?.n || 0), Number(d?.n || 0), batchId).run()
+}
+
+// Step 3 — Automated Dispatch: once validated, create accounts for all 'valid'
+// rows and trigger the onboarding flow (temporary password + verification info
+// sent by SMS). Rows still flagged as exceptions are skipped.
+app.post('/api/imports/:id/dispatch', requireAuth, requireRole('admin', 'super_admin'), async (c) => {
+  const id = c.req.param('id')
+  const batch = await c.env.DB.prepare(`SELECT * FROM import_batches WHERE id=?`).bind(id).first<any>()
+  if (!batch) return c.json({ error: 'Batch not found' }, 404)
+  const cat = String(batch.category)
+  const roleForCategory = cat === 'agents' ? 'agent' : cat === 'partners' ? 'partner' : 'customer'
+  const { results } = await c.env.DB.prepare(`SELECT * FROM import_rows WHERE batch_id=? AND status='valid'`).bind(id).all()
+  const rows = (results || []) as any[]
+  const creator = c.get('user').id
+  let created = 0, skipped = 0
+  const errors: string[] = []
+  for (const row of rows) {
+    const phone = normalizePhone(row.phone || '')
+    if (!phone) { skipped++; continue }
+    // Skip duplicates gracefully.
+    const dup = await c.env.DB.prepare(`SELECT id FROM users WHERE phone=?`).bind(phone).first<any>()
+    if (dup) { skipped++; errors.push(`${row.full_name || phone}: already exists`); continue }
+    try {
+      const perms = await permissionsForRole(c, roleForCategory === 'agent' ? 'agent' : roleForCategory === 'partner' ? 'partner' : 'customer', {})
+      const placeholder = await hashPassword(genPassword())
+      const ur = await c.env.DB.prepare(
+        `INSERT INTO users (full_name, phone, email, password, role, region, password_set, permissions, created_by) VALUES (?,?,?,?,?,?,0,?,?)`
+      ).bind(row.full_name, phone, row.email || null, placeholder, roleForCategory, row.region || row.county || null, JSON.stringify(perms), creator).run()
+      const userId = ur.meta.last_row_id as number
+      // Farmers also get a customer profile with the standardized fields.
+      if (roleForCategory === 'customer') {
+        await c.env.DB.prepare(
+          `INSERT INTO customers (user_id, agent_id, onboarded_by, full_name, national_id, mobile, county, sub_county, ward, village, value_chain_type, value_chain, kyc_status, status)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?, 'pending', 'active')`
+        ).bind(userId, null, creator, row.full_name, row.national_id || null, phone, row.county || null, row.sub_county || null, row.ward || null, row.village || null, row.value_chain_type || null, row.value_chain || null).run()
+      } else if (roleForCategory === 'agent') {
+        await c.env.DB.prepare(`INSERT INTO agents (user_id,region,permissions) VALUES (?,?,?)`).bind(userId, row.region || row.county || null, JSON.stringify(perms)).run()
+      }
+      // Trigger the onboarding lifecycle: temp password + SMS with verification.
+      await issueTempPassword(c, { userId, phone, fullName: row.full_name })
+      await c.env.DB.prepare(`UPDATE import_rows SET status='dispatched', created_user_id=? WHERE id=?`).bind(userId, row.id).run()
+      created++
+    } catch (e: any) {
+      skipped++; errors.push(`${row.full_name || phone}: ${e?.message || 'failed'}`)
+    }
+  }
+  await recomputeBatchCounts(c, Number(id))
+  const remaining = await c.env.DB.prepare(`SELECT COUNT(*) n FROM import_rows WHERE batch_id=? AND status='exception'`).bind(id).first<any>()
+  const newStatus = Number(remaining?.n || 0) === 0 ? 'completed' : 'dispatched'
+  await c.env.DB.prepare(`UPDATE import_batches SET status=? WHERE id=?`).bind(newStatus, id).run()
+  await audit(c, creator, 'import_dispatch', cat, `batch #${id}: ${created} onboarded, ${skipped} skipped`)
+  return c.json({ ok: true, created, skipped, errors: errors.slice(0, 50), status: newStatus })
+})
+
+// ============================================================================
 // WALLET SYSTEM — double-entry ledger, earning rules, commissions, payouts
 // ============================================================================
 
@@ -2889,9 +3378,49 @@ app.delete('/api/payout-accounts/:id', requireAuth, requirePermission('view_wall
   return c.json({ ok: true })
 })
 
+// ----------------------------------------------------------------------------
+// Disburse money OUT (B2C). In PRODUCTION this satellite has no SasaPay
+// credentials of its own, so it routes the payout through the central
+// equipment gateway (which owns the credentials) — exactly like the collection
+// (pay-in) flow. Only when the gateway is NOT configured (local/standalone dev)
+// do we fall back to the direct SasaPay B2C call, which itself simulates when
+// no credentials are present. This is what takes the wallet OUT of demo mode.
+// The return shape is normalised to match the legacy sasapayB2C() result so
+// callers don't need to branch.
+// ----------------------------------------------------------------------------
+async function disburseB2C(
+  c: any,
+  opts: { amount: number; receiverNumber: string; channel: string; reason: string; reference: string }
+): Promise<{ simulated: boolean; success: boolean; error?: string; b2c_request_id?: string | null; conversation_id?: string | null; transaction_charges?: any; customer_message?: string; via_gateway?: boolean }> {
+  if (gatewayConfigured(c.env)) {
+    const g = await gatewayPayout(c.env, {
+      amount: opts.amount,
+      channelCode: opts.channel,
+      receiver_number: opts.receiverNumber,
+      reason: opts.reason,
+      origin_reference: opts.reference,
+      idempotency_key: opts.reference
+    })
+    if (!g.success) return { simulated: false, success: false, error: g.error || 'Payout rejected by gateway', via_gateway: true }
+    return {
+      simulated: !!g.simulated,
+      success: true,
+      b2c_request_id: g.b2c_request_id || null,
+      conversation_id: g.conversation_id || null,
+      transaction_charges: g.transaction_charges || '0.00',
+      customer_message: g.customer_message,
+      via_gateway: true
+    }
+  }
+  // Local/standalone dev fallback: direct provider call (simulates w/o creds).
+  const p = await sasapayB2C(c.env, opts)
+  return { ...p, via_gateway: false }
+}
+
 // ============================================================================
 // WALLET WITHDRAWAL — a wallet holder cashes out to their registered mobile /
-// bank / SasaPay destination. Debits the ledger first, then pushes B2C.
+// bank / SasaPay destination. Debits the ledger first, then pushes B2C
+// (routed through the central gateway in production; see disburseB2C).
 // ============================================================================
 app.post('/api/wallet/withdraw', requireAuth, requirePermission('view_wallet', 'manage_wallets'), async (c) => {
   const user = c.get('user') as SessionUser
@@ -2933,7 +3462,7 @@ app.post('/api/wallet/withdraw', requireAuth, requirePermission('view_wallet', '
      VALUES (?, 'withdrawal', ?,?,?, 'KES', ?,?,?,?,?, 'processing', 1, ?)`
   ).bind(reference, walletId, user.id, amount, channelCode, chan.name, receiver, recipientName, b.reason || 'Wallet withdrawal', user.id).run()
 
-  const payout = await sasapayB2C(c.env, { amount, receiverNumber: receiver, channel: channelCode, reason: b.reason || 'Wallet withdrawal', reference })
+  const payout = await disburseB2C(c, { amount, receiverNumber: receiver, channel: channelCode, reason: b.reason || 'Wallet withdrawal', reference })
 
   if (!payout.success) {
     // Reverse the debit (credit back) and mark failed.
@@ -2997,7 +3526,7 @@ app.post('/api/wallet/direct-pay', requireAuth, requirePermission('manage_wallet
      VALUES (?, 'direct_pay', ?,?,?, 'KES', ?,?,?,?,?, 'processing', 0, ?)`
   ).bind(reference, admin.id, b.user_id ? Number(b.user_id) : null, amount, channelCode, chan.name, receiver, b.account_name || null, b.reason || 'Direct payment', admin.id).run()
 
-  const payout = await sasapayB2C(c.env, { amount, receiverNumber: receiver, channel: channelCode, reason: b.reason || 'Direct payment', reference })
+  const payout = await disburseB2C(c, { amount, receiverNumber: receiver, channel: channelCode, reason: b.reason || 'Direct payment', reference })
   if (!payout.success) {
     await c.env.DB.prepare(`UPDATE wallet_withdrawals SET status='failed', result_desc=?, updated_at=CURRENT_TIMESTAMP WHERE reference=?`).bind(payout.error || 'B2C failed', reference).run()
     return c.json({ error: payout.error || 'Disbursal failed' }, 502)

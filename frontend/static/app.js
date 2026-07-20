@@ -359,9 +359,61 @@ function authSignIn() {
     const done = btnLoading('loginBtn', 'Signing in…')
     try {
       const { data } = await api.post('/login', { phone: $('phone').value, password: $('password').value })
+      // Multi-user onboarding: a temporary password forces an immediate change.
+      if (data.must_change_password) { done(); renderForceChangePassword(data.user); return }
       state.user = data.user; toast('Welcome, ' + data.user.full_name); renderApp()
-    } catch (err) { done(); toast(err.response?.data?.error || 'Login failed', false) }
+    } catch (err) {
+      done()
+      const resp = err.response?.data || {}
+      // Expired temporary password → offer to request an admin-triggered reset.
+      if (resp.temp_expired) { renderTempExpired(resp.phone || $('phone').value); return }
+      toast(resp.error || 'Login failed', false)
+    }
   }
+}
+// Mandatory password update on first login with a temporary password.
+function renderForceChangePassword(user) {
+  const f = $('authForm') || $('content')
+  f.innerHTML = `<div class="max-w-sm mx-auto">
+    <h2 class="text-xl font-bold mb-1">Set your password</h2>
+    <p class="text-sm text-slate-500 mb-4">Welcome${user && user.full_name ? ', ' + esc(user.full_name) : ''}. Your account uses a temporary password. Please choose your own secure password to continue.</p>
+    <div class="space-y-3">
+      ${passwordField('fc_new', { placeholder: 'New password (min 4 characters)' })}
+      ${passwordField('fc_confirm', { placeholder: 'Confirm new password' })}
+      <button id="fcBtn" onclick="doForceChangePassword()" class="btn w-full brand-bg text-white py-2.5 rounded-lg font-semibold">Save & Continue</button>
+    </div></div>`
+}
+window.doForceChangePassword = async () => {
+  const pw = $('fc_new').value, cf = $('fc_confirm').value
+  if (!pw || pw.length < 4) { toast('Password must be at least 4 characters', false); return }
+  if (pw !== cf) { toast('Passwords do not match', false); return }
+  const done = btnLoading('fcBtn', 'Saving…')
+  try {
+    // The session token from login (must_change) is already set; update password.
+    await api.put('/me/password', { new_password: pw })
+    const { data } = await api.get('/me')
+    state.user = data.user || data; toast('Password updated'); renderApp()
+  } catch (err) { done(); toast(err.response?.data?.error || 'Could not update password', false) }
+}
+// Login screen option shown when a temporary password has expired.
+function renderTempExpired(phone) {
+  const f = $('authForm') || $('content')
+  f.innerHTML = `<div class="max-w-sm mx-auto text-center">
+    <div class="w-14 h-14 mx-auto rounded-full bg-amber-100 text-amber-600 flex items-center justify-center text-2xl mb-3"><i class="fas fa-hourglass-end"></i></div>
+    <h2 class="text-xl font-bold mb-1">Temporary password expired</h2>
+    <p class="text-sm text-slate-500 mb-4">Your temporary password is no longer valid. Request an administrator to reset it — you'll receive a new one by SMS.</p>
+    <input id="te_phone" value="${esc(phone || '')}" placeholder="Phone" class="w-full px-3 py-2 border rounded-lg mb-3">
+    <button id="teBtn" onclick="doRequestAdminReset()" class="btn w-full brand-bg text-white py-2.5 rounded-lg font-semibold">Request admin reset</button>
+    <button onclick="renderLogin('signin')" class="btn w-full mt-2 bg-slate-100 py-2 rounded-lg text-sm">Back to sign in</button>
+  </div>`
+}
+window.doRequestAdminReset = async () => {
+  const done = btnLoading('teBtn', 'Sending…')
+  try {
+    const { data } = await api.post('/onboard/request-reset', { phone: $('te_phone').value })
+    toast(data.message || 'Request sent to admin')
+    renderLogin('signin')
+  } catch (err) { done(); toast(err.response?.data?.error || 'Failed to send request', false) }
 }
 // ---------------------------------------------------------------------------
 // KYC helpers — gallery + camera capture for ID front, ID back, selfie
@@ -519,8 +571,18 @@ function authSignUpVerify(phone, name, demoOtp) {
         <input id="su_code" type="text" inputmode="numeric" placeholder="6-digit code" value="${esc(demoOtp || '')}" class="w-full mt-1 px-4 py-2.5 border border-slate-300 rounded-lg tracking-widest" required></div>
       <div><label class="text-sm font-medium text-slate-600">Create Password</label>
         ${passwordField('su_pass', { placeholder: 'Choose a password', required: true })}</div>
-      <div class="bg-sky-50 border border-sky-200 rounded-lg p-3 text-[12px] text-sky-800 leading-relaxed">
-        <i class="fas fa-circle-info mr-1"></i>You're almost done! Your ID documents and farm details are <b>not</b> needed to sign up. You can add them later from your profile — they're only required when you apply for <b>financing</b>. Cash purchases work right away.
+
+      <div class="pt-1"><h4 class="text-sm font-semibold text-teal-700 mb-2"><i class="fas fa-id-card mr-1"></i>Standard Profile</h4>
+        <p class="text-[12px] text-slate-500 mb-2 leading-relaxed">We collect the same details for every farmer — whether you register yourself or an agent registers you. National ID and location are required; farm details help with financing later.</p>
+        <div class="grid grid-cols-2 gap-2 text-sm">
+          <input id="su_national_id" placeholder="National ID *" required class="px-3 py-2 border border-slate-300 rounded-lg col-span-2">
+          <input id="su_county" placeholder="County *" required class="px-3 py-2 border border-slate-300 rounded-lg">
+          <input id="su_sub_county" placeholder="Sub-county" class="px-3 py-2 border border-slate-300 rounded-lg">
+          <input id="su_ward" placeholder="Ward" class="px-3 py-2 border border-slate-300 rounded-lg">
+          <input id="su_village" placeholder="Village" class="px-3 py-2 border border-slate-300 rounded-lg">
+          <select id="su_vct" onchange="updateChain('su_vct','su_vc')" class="px-3 py-2 border border-slate-300 rounded-lg"><option value="">Value Chain Type</option><option value="crop">Crop</option><option value="livestock">Livestock</option></select>
+          <select id="su_vc" class="px-3 py-2 border border-slate-300 rounded-lg"><option value="">Select type first</option></select>
+        </div>
       </div>
       <button id="suvBtn" class="btn w-full brand-bg text-white py-2.5 rounded-lg font-semibold">Create Account</button>
     </form>
@@ -546,9 +608,23 @@ function authSignUpVerify(phone, name, demoOtp) {
   startResendCountdown('suResendBtn', 30, suResend)
   $('suvForm').onsubmit = async (e) => {
     e.preventDefault()
+    const nid = ($('su_national_id').value || '').trim()
+    const county = ($('su_county').value || '').trim()
+    if (!nid) { toast('National ID is required', false); return }
+    if (!county) { toast('County is required', false); return }
     const done = btnLoading('suvBtn', 'Creating account…')
     try {
-      const { data } = await api.post('/signup/verify', { phone, full_name: name, code: $('su_code').value, password: $('su_pass').value })
+      const { data } = await api.post('/signup/verify', {
+        phone, full_name: name, code: $('su_code').value, password: $('su_pass').value,
+        // Standard Profile Data — identical to what an agent collects when onboarding a farmer.
+        national_id: nid,
+        county,
+        sub_county: ($('su_sub_county').value || '').trim(),
+        ward: ($('su_ward').value || '').trim(),
+        village: ($('su_village').value || '').trim(),
+        value_chain_type: ($('su_vct').value || '').trim(),
+        value_chain: ($('su_vc').value || '').trim()
+      })
       state.user = data.user; toast('Account created. Welcome, ' + data.user.full_name); renderApp()
     } catch (err) { done(); toast(err.response?.data?.error || 'Verification failed', false) }
   }
@@ -643,7 +719,9 @@ function navItems() {
     wallets,
     { k: 'repayments', i: 'fa-money-bill-wave', t: 'Repayments' },
     { k: 'settings', i: 'fa-sliders', t: 'Financing Settings' },
-    { k: 'exports', i: 'fa-database', t: 'Data Export' }])
+    { k: 'exports', i: 'fa-database', t: 'Data Export' },
+    { k: 'imports', i: 'fa-file-arrow-up', t: 'Bulk Import' },
+    { k: 'backups', i: 'fa-shield-halved', t: 'Backups' }])
   if (r === 'operations_finance') return withAccount([...common,
     { k: 'approvals', i: 'fa-clipboard-check', t: 'Approvals' },
     financeQueue,
@@ -705,9 +783,9 @@ function renderApp() {
 }
 window.go = (r) => { state.route = r; toggleSidebar(false); renderApp() }
 function route() {
-  const titles = { dashboard: 'Dashboard', approvals: 'Financing Approvals', inventory: 'Inventory', finance_queue: 'Finance Approval Queue', customers: 'Customers', contracts: 'Purchases & Contracts', agents: 'Agent Management', users: 'User Accounts & Access', repayments: 'Repayment Performance', onboard: 'Farmer Onboarding', shop: 'Feed Shop', exports: 'Data Export & Reports', settings: 'Financing & Markup Settings', profile: 'My Account', wallet: 'My Wallet', wallets: 'Wallets & Payouts' }
+  const titles = { dashboard: 'Dashboard', approvals: 'Financing Approvals', inventory: 'Inventory', finance_queue: 'Finance Approval Queue', customers: 'Customers', contracts: 'Purchases & Contracts', agents: 'Agent Management', users: 'User Accounts & Access', repayments: 'Repayment Performance', onboard: 'Farmer Onboarding', shop: 'Feed Shop', exports: 'Data Export & Reports', imports: 'Bulk User Data Upload', backups: 'Automated System Backups', settings: 'Financing & Markup Settings', profile: 'My Account', wallet: 'My Wallet', wallets: 'Wallets & Payouts' }
   $('pageTitle').textContent = titles[state.route] || 'Dashboard'
-  const map = { dashboard: viewDashboard, approvals: viewApprovals, inventory: viewInventory, finance_queue: viewFinanceQueue, customers: viewCustomers, contracts: viewContracts, agents: viewAgents, users: viewUsers, repayments: viewRepayments, onboard: viewOnboard, shop: viewShop, exports: viewExports, settings: viewSettings, profile: viewProfile, wallet: viewMyWallet, wallets: viewWallets }
+  const map = { dashboard: viewDashboard, approvals: viewApprovals, inventory: viewInventory, finance_queue: viewFinanceQueue, customers: viewCustomers, contracts: viewContracts, agents: viewAgents, users: viewUsers, repayments: viewRepayments, onboard: viewOnboard, shop: viewShop, exports: viewExports, imports: viewImports, backups: viewBackups, settings: viewSettings, profile: viewProfile, wallet: viewMyWallet, wallets: viewWallets }
   ;(map[state.route] || viewDashboard)()
 }
 
@@ -840,7 +918,7 @@ window.buyModal = async (productId) => {
       <div class="bg-slate-50 border border-slate-200 rounded-lg p-3"><div class="text-slate-500">Cash deposit requirement</div><div class="font-semibold mt-1">${Number(p.cash_deposit_pct ?? 100)}%</div></div>
       <div class="bg-slate-50 border border-slate-200 rounded-lg p-3"><div class="text-slate-500">Financing deposit requirement</div><div class="font-semibold mt-1">${Number(p.financing_deposit_pct ?? 10)}%</div></div>
       <div class="bg-slate-50 border border-slate-200 rounded-lg p-3"><div class="text-slate-500">Financing model</div><div class="font-semibold mt-1">${'Murabaha (Sharia cost-plus)'}</div></div>
-      <div class="bg-slate-50 border border-slate-200 rounded-lg p-3"><div class="text-slate-500">Interest / finance rate</div><div class="font-semibold mt-1">${Number(p.financing_interest_pct || 0)}%</div></div>
+      <div class="bg-slate-50 border border-slate-200 rounded-lg p-3"><div class="text-slate-500">Profit / markup rate</div><div class="font-semibold mt-1">${Number(p.financing_interest_pct || 0)}%</div></div>
     </div>
     <div id="quoteBox" class="mt-4"></div>
     <div class="flex gap-2 mt-5">
@@ -872,7 +950,7 @@ window.getQuote = async (productId) => {
           <div class="flex justify-between"><span>Payment frequency</span><b>${esc(data.payment_frequency)}</b></div>
           <div class="flex justify-between"><span>Installments</span><b>${data.installment_count}</b></div>
           <div class="flex justify-between"><span>Installment amount</span><b>${fmt(data.installment_amount)}</b></div>
-          <div class="flex justify-between"><span>Interest / finance rate</span><b>${data.interest_rate_pct || 0}%</b></div>` : `
+          <div class="flex justify-between"><span>Profit / markup rate</span><b>${data.interest_rate_pct || 0}%</b></div>` : `
           <div class="flex justify-between"><span>Balance after deposit</span><b>${fmt(data.outstanding_after_deposit)}</b></div>`}
       </div>
       <p class="text-xs text-teal-700 mt-2 italic">${esc(data.disclosure_note || '')}</p>
@@ -998,7 +1076,7 @@ window.contractDetail = async (id) => {
       <div class="bg-slate-50 p-3 rounded-lg"><p class="text-xs text-slate-500">Supplier Cost</p><b>${fmt(c.supplier_cost)}</b></div>
       <div class="bg-slate-50 p-3 rounded-lg"><p class="text-xs text-slate-500">Total payable</p><b>${fmt(c.murabaha_price)}</b></div>
       <div class="bg-slate-50 p-3 rounded-lg"><p class="text-xs text-slate-500">Deposit</p><b>${Number(c.deposit_pct || 0)}% · ${fmt(c.deposit_amount || 0)}</b></div>
-      <div class="bg-slate-50 p-3 rounded-lg"><p class="text-xs text-slate-500">Interest / finance rate</p><b>${Number(c.interest_rate_pct || c.markup_pct || 0)}%</b></div>
+      <div class="bg-slate-50 p-3 rounded-lg"><p class="text-xs text-slate-500">Profit / markup rate</p><b>${Number(c.interest_rate_pct || c.markup_pct || 0)}%</b></div>
       <div class="bg-slate-50 p-3 rounded-lg"><p class="text-xs text-slate-500">Frequency</p><b>${esc(c.payment_frequency || 'monthly')}</b></div>
       <div class="bg-slate-50 p-3 rounded-lg"><p class="text-xs text-slate-500">Installment amount</p><b>${fmt(c.installment_amount || c.monthly_payment || 0)}</b></div>
       <div class="bg-teal-50 p-3 rounded-lg"><p class="text-xs text-slate-500">Outstanding</p><b>${fmt(c.outstanding)}</b></div>
@@ -1327,7 +1405,7 @@ window.viewDoc = async (id) => {
       <p><b>Product:</b> ${esc(c.product_name)} ×${c.quantity}</p>
       <p><b>Supplier Cost:</b> ${fmt(c.supplier_cost)} · <b>Markup:</b> ${c.markup_pct}%</p>
       <p><b>Murabaha Price (fixed):</b> ${fmt(c.murabaha_price)}</p>
-      <p class="text-xs italic text-slate-500 pt-2">Compliant with Murabaha principles. No interest, penalties, or compounding applied.</p>
+      <p class="text-xs italic text-slate-500 pt-2">Compliant with Murabaha principles. No riba, penalties, or compounding applied.</p>
     </div>
     <button onclick="window.print()" class="btn mt-4 bg-slate-800 text-white px-5 py-2 rounded-lg text-sm"><i class="fas fa-print mr-1"></i>Print / Save PDF</button>
     <button onclick="closeModal()" class="btn mt-4 ml-2 bg-slate-100 px-5 py-2 rounded-lg text-sm">Close</button>
@@ -1371,7 +1449,7 @@ function productForm(prefix, p = {}) {
   const finDis = canFin ? '' : 'disabled'
   const finNote = canFin ? '' : `
     <div style="grid-column:1 / -1" class="bg-amber-50 border border-amber-200 rounded-xl px-4 py-3 text-xs text-amber-800 mb-1">
-      <i class="fas fa-lock mr-1"></i>Commercial markups, financing rates, PAYGO &amp; legal agreements are set by an authorized finance user.
+      <i class="fas fa-lock mr-1"></i>Commercial markups, financing rates &amp; legal agreements are set by an authorized finance user.
       Complete the basic inventory details below — an admin or finance officer supplies the financial components before the product goes live.
     </div>`
   return `
@@ -1416,18 +1494,18 @@ function productForm(prefix, p = {}) {
       <div><label class="field-label">Financing markup %</label><input id="${prefix}_crm" ${finDis} type="number" value="${Number(p.credit_markup_pct || 20)}" placeholder="Financing markup %" class="px-3 py-2 border rounded-lg ${finDis ? 'bg-slate-100 text-slate-400' : ''}"></div>
       <div><label class="field-label">TransUnion product code</label><input id="${prefix}_tu" ${finDis} value="${esc(p.transunion_product_code || '')}" placeholder="TransUnion product code" class="px-3 py-2 border rounded-lg ${finDis ? 'bg-slate-100 text-slate-400' : ''}"></div>
       <div><label class="field-label">Financing model</label><select id="${prefix}_fin_model" ${finDis} class="px-3 py-2 border rounded-lg ${finDis ? 'bg-slate-100 text-slate-400' : ''}">
-        <option value="murabaha" selected>Murabaha (Sharia cost-plus, no interest)</option>
+        <option value="murabaha" selected>Murabaha (Sharia cost-plus profit)</option>
       </select></div>
-      <div><label class="field-label">Interest / finance rate %</label><input id="${prefix}_int" ${finDis} type="number" value="${Number(p.financing_interest_pct || 0)}" placeholder="Interest rate %" class="px-3 py-2 border rounded-lg ${finDis ? 'bg-slate-100 text-slate-400' : ''}"></div>
+      <div><label class="field-label">Profit / markup rate %</label><input id="${prefix}_int" ${finDis} type="number" value="${Number(p.financing_interest_pct || 0)}" placeholder="Profit / markup rate %" class="px-3 py-2 border rounded-lg ${finDis ? 'bg-slate-100 text-slate-400' : ''}"></div>
       <div><label class="field-label">Repayment frequency</label><select id="${prefix}_freq" ${finDis} class="px-3 py-2 border rounded-lg ${finDis ? 'bg-slate-100 text-slate-400' : ''}">
         ${['daily','weekly','monthly'].map(v => `<option value="${v}" ${(p.financing_frequency || 'monthly') === v ? 'selected' : ''}>${v}</option>`).join('')}
       </select></div>
       <div><label class="field-label">Financing deposit %</label><input id="${prefix}_fin_dep" ${finDis} type="number" value="${Number(p.financing_deposit_pct ?? 10)}" placeholder="Financing deposit %" class="px-3 py-2 border rounded-lg ${finDis ? 'bg-slate-100 text-slate-400' : ''}"></div>
       <div><label class="field-label">Minimum term (months)</label><input id="${prefix}_tmin" ${finDis} type="number" value="${Number(p.financing_term_min_months || 3)}" placeholder="Minimum term (months)" class="px-3 py-2 border rounded-lg ${finDis ? 'bg-slate-100 text-slate-400' : ''}"></div>
       <div><label class="field-label">Maximum term (months)</label><input id="${prefix}_tmax" ${finDis} type="number" value="${Number(p.financing_term_max_months || 12)}" placeholder="Maximum term (months)" class="px-3 py-2 border rounded-lg ${finDis ? 'bg-slate-100 text-slate-400' : ''}"></div>
-      <div style="grid-column:1 / -1"><label class="field-label">Financing / PAYGO terms summary</label><textarea id="${prefix}_fin_terms" ${finDis} placeholder="Financing / PAYGO terms summary" class="px-3 py-2 border rounded-lg min-h-24 ${finDis ? 'bg-slate-100 text-slate-400' : ''}">${esc(p.financing_terms_text || '')}</textarea></div>
+      <div style="grid-column:1 / -1"><label class="field-label">Financing terms summary</label><textarea id="${prefix}_fin_terms" ${finDis} placeholder="Financing terms summary" class="px-3 py-2 border rounded-lg min-h-24 ${finDis ? 'bg-slate-100 text-slate-400' : ''}">${esc(p.financing_terms_text || '')}</textarea></div>
       <div style="grid-column:1 / -1" class="border rounded-xl p-3 bg-slate-50">
-        <div class="font-medium text-slate-700 mb-2">Financing / PAYGO agreement</div>
+        <div class="font-medium text-slate-700 mb-2">Financing agreement</div>
         <input id="${prefix}_fin_doc" ${finDis} value="${esc(p.financing_terms_doc_url || '')}" placeholder="Financing agreement URL / uploaded file data" class="w-full px-3 py-2 border rounded-lg text-xs ${finDis ? 'bg-slate-100 text-slate-400' : ''}">
         <div class="flex items-center justify-between gap-2 mt-2">
           <label class="btn ${finDis ? 'bg-slate-200 text-slate-400 cursor-not-allowed' : 'bg-white cursor-pointer'} px-3 py-2 rounded-lg text-xs border"><i class="fas fa-file-upload mr-1"></i>Upload<input type="file" ${finDis} accept="image/*,application/pdf" class="hidden" onchange="pickFileDataUrl(this,'${prefix}_fin_doc','${prefix}_fin_doc_name')"></label>
@@ -1497,7 +1575,7 @@ async function viewInventory() {
       <td class="px-4 py-3"><div class="font-medium">${esc(p.name)}</div><div class="text-xs text-slate-500">${esc(p.sku)} · ${esc(p.category || 'Feed')}</div></td>
       <td class="px-4 py-3">${financeStatusBadge(p.finance_status)}</td>
       <td class="px-4 py-3">${esc((p.payment_option_mode || 'both').replace('_', ' '))}</td>
-      <td class="px-4 py-3">${esc(p.financing_model === 'paygo' ? 'PAYGO' : 'Interest financing')}<div class="text-xs text-slate-400">${Number(p.financing_interest_pct || 0)}% · ${esc(p.financing_frequency || 'monthly')}</div></td>
+      <td class="px-4 py-3">${esc(p.financing_model === 'paygo' ? 'Instalment plan' : 'Financing')}<div class="text-xs text-slate-400">${Number(p.financing_interest_pct || 0)}% · ${esc(p.financing_frequency || 'monthly')}</div></td>
       <td class="px-4 py-3 text-right">${Number(p.cash_deposit_pct ?? 100)}%</td>
       <td class="px-4 py-3 text-right">${Number(p.financing_deposit_pct ?? 10)}%</td>
       <td class="px-4 py-3 text-right">${p.quantity} ${esc(p.unit)}</td>
@@ -1565,7 +1643,7 @@ window.doRestock = async (id) => {
 
 // ---------------------------------------------------------------------------
 // FINANCE APPROVAL QUEUE (Instruction 3 & 4) — authorized finance users supply
-// the markup / rate / PAYGO / agreement components for drafted products, then
+// the markup / rate / financing / agreement components for drafted products, then
 // publish them to the storefront. Also surfaces the hidden-product audit feed.
 // ---------------------------------------------------------------------------
 async function viewFinanceQueue() {
@@ -1625,9 +1703,9 @@ window.financeModal = async (id) => {
     <div class="responsive-grid cols-2 text-sm">
       <div><label class="field-label">Financing markup %</label><input id="fz_crm" type="number" value="${Number(p.credit_markup_pct || 20)}" class="px-3 py-2 border rounded-lg"></div>
       <div><label class="field-label">Financing model</label><select id="fz_model" class="px-3 py-2 border rounded-lg">
-        <option value="murabaha" selected>Murabaha (Sharia cost-plus, no interest)</option>
+        <option value="murabaha" selected>Murabaha (Sharia cost-plus profit)</option>
       </select></div>
-      <div><label class="field-label">Interest / finance rate %</label><input id="fz_int" type="number" value="${Number(p.financing_interest_pct || 0)}" class="px-3 py-2 border rounded-lg"></div>
+      <div><label class="field-label">Profit / markup rate %</label><input id="fz_int" type="number" value="${Number(p.financing_interest_pct || 0)}" class="px-3 py-2 border rounded-lg"></div>
       <div><label class="field-label">Repayment frequency</label><select id="fz_freq" class="px-3 py-2 border rounded-lg">
         ${['daily','weekly','monthly'].map(v => `<option value="${v}" ${(p.financing_frequency || 'monthly') === v ? 'selected' : ''}>${v}</option>`).join('')}
       </select></div>
@@ -1637,7 +1715,7 @@ window.financeModal = async (id) => {
       <div><label class="field-label">Payment availability</label><select id="fz_mode" class="px-3 py-2 border rounded-lg">
         <option value="both">Cash + Financing</option><option value="financing">Financing only</option><option value="cash">Cash only</option>
       </select></div>
-      <div style="grid-column:1 / -1"><label class="field-label">Financing / PAYGO terms summary</label><textarea id="fz_terms" class="px-3 py-2 border rounded-lg min-h-20">${esc(p.financing_terms_text || '')}</textarea></div>
+      <div style="grid-column:1 / -1"><label class="field-label">Financing terms summary</label><textarea id="fz_terms" class="px-3 py-2 border rounded-lg min-h-20">${esc(p.financing_terms_text || '')}</textarea></div>
       <div style="grid-column:1 / -1"><label class="field-label">Financing agreement URL / file</label><input id="fz_doc" value="${esc(p.financing_terms_doc_url || '')}" placeholder="Agreement URL or uploaded file data" class="px-3 py-2 border rounded-lg text-xs"></div>
       <div style="grid-column:1 / -1"><label class="field-label">Finance notes (optional)</label><input id="fz_notes" value="${esc(p.finance_notes || '')}" class="px-3 py-2 border rounded-lg text-xs"></div>
     </div>
@@ -2362,11 +2440,13 @@ window.captureGPS = () => {
     p => { $('lat').value = p.coords.latitude.toFixed(4); $('lng').value = p.coords.longitude.toFixed(4); toast('GPS captured') },
     () => { $('lat').value = '-0.7167'; $('lng').value = '36.4333'; toast('Using demo coords (permission denied)') })
 }
-window.updateChain = () => {
+window.updateChain = (typeId = 'vct', chainId = 'vc') => {
   const crops = ['Maize', 'Beans', 'Wheat', 'Rice', 'Sorghum', 'Tomatoes', 'Onion', 'Avocado', 'Mango', 'Coffee', 'Tea', 'Other']
   const ls = ['Dairy', 'Beef', 'Goat', 'Sheep', 'Poultry', 'Fish', 'Pig', 'Camel']
-  const list = $('vct').value === 'crop' ? crops : $('vct').value === 'livestock' ? ls : []
-  $('vc').innerHTML = list.length ? list.map(x => `<option>${x}</option>`).join('') : '<option value="">Select type first</option>'
+  const typeEl = $(typeId), chainEl = $(chainId)
+  if (!typeEl || !chainEl) return
+  const list = typeEl.value === 'crop' ? crops : typeEl.value === 'livestock' ? ls : []
+  chainEl.innerHTML = list.length ? list.map(x => `<option>${x}</option>`).join('') : '<option value="">Select type first</option>'
 }
 
 // ---------------------------------------------------------------------------
@@ -2389,43 +2469,78 @@ async function viewAgents() {
 }
 window.addAgentModal = () => {
   showModal(`<h3 class="font-bold mb-1">Onboard New Agent</h3>
-    <p class="text-xs text-slate-500 mb-3">Create the agent's login. Set a password now, or leave blank to auto-generate one.</p>
+    <p class="text-xs text-slate-500 mb-3">Enter the agent's details and verify their phone. On successful verification a temporary password is texted to them; they set their own password on first login.</p>
     <div class="space-y-3 text-sm">
     <input id="ag_name" placeholder="Full Name" class="w-full px-3 py-2 border rounded-lg">
-    <input id="ag_phone" placeholder="Phone (07XX XXX XXX)" class="w-full px-3 py-2 border rounded-lg">
+    <div class="flex gap-2">
+      <input id="ag_phone" placeholder="Phone (07XX XXX XXX)" class="flex-1 px-3 py-2 border rounded-lg">
+      <button id="ag_otp_btn" onclick="requestOnboardOtp('ag')" class="btn px-3 bg-slate-100 rounded-lg text-xs whitespace-nowrap">Send code</button>
+    </div>
+    <div id="ag_otp_wrap" class="hidden">
+      <input id="ag_otp" placeholder="Enter the 6-digit code sent to the agent" class="w-full px-3 py-2 border rounded-lg">
+      <p id="ag_otp_hint" class="text-xs text-emerald-600 mt-1"></p>
+    </div>
     <input id="ag_email" placeholder="Email (optional)" class="w-full px-3 py-2 border rounded-lg">
     <input id="ag_region" placeholder="Region" class="w-full px-3 py-2 border rounded-lg">
-    <input id="ag_pwd" placeholder="Password (optional — auto-generated if blank)" class="w-full px-3 py-2 border rounded-lg">
+    <details class="text-xs text-slate-500"><summary class="cursor-pointer">Set a password manually instead (skips OTP)</summary>
+      <input id="ag_pwd" placeholder="Password (leave blank to text a temporary one)" class="w-full px-3 py-2 border rounded-lg mt-2">
+    </details>
   </div><div class="flex gap-2 mt-4"><button onclick="doAddAgent()" class="btn flex-1 brand-bg text-white py-2 rounded-lg text-sm">Create Agent</button><button onclick="closeModal()" class="btn px-4 bg-slate-100 rounded-lg text-sm">Cancel</button></div>`)
+}
+// Request an onboarding OTP to the new user's phone (shared by agent + user modals).
+window.requestOnboardOtp = async (prefix) => {
+  const phone = $(prefix + '_phone').value.trim()
+  if (!phone) { toast('Enter the phone number first', false); return }
+  const btn = $(prefix + '_otp_btn'); btnLoading(btn)
+  try {
+    const { data } = await api.post('/onboard/request-otp', { phone })
+    $(prefix + '_otp_wrap').classList.remove('hidden')
+    $(prefix + '_otp_hint').textContent = data.demo_otp ? ('Demo mode code: ' + data.demo_otp) : (data.message || 'Code sent.')
+    toast('Verification code sent')
+  } catch (err) { toast(err.response?.data?.error || 'Failed to send code', false) }
+  finally { btnReset(btn, 'Send code') }
 }
 window.doAddAgent = async () => {
   try {
     const body = { full_name: $('ag_name').value, phone: $('ag_phone').value, email: $('ag_email').value, region: $('ag_region').value }
-    if ($('ag_pwd').value) body.password = $('ag_pwd').value
+    const manualPwd = $('ag_pwd') && $('ag_pwd').value
+    if (manualPwd) { body.password = manualPwd }
+    else {
+      const otp = $('ag_otp') ? $('ag_otp').value.trim() : ''
+      if (!otp) { toast('Verify the agent\\'s phone first (send + enter the code), or set a password manually', false); return }
+      body.otp_code = otp
+    }
     const { data } = await api.post('/agents', body)
     closeModal()
-    showCredential('Agent Created', body.full_name, body.phone || '', data.password, data.password_was_set_by_admin)
+    showCredential('Agent Created', body.full_name, body.phone || '', data.password, data.password_was_set_by_admin, data.temporary, data.expires_at, data.sms_simulated)
     viewAgents()
   } catch (err) { toast(err.response?.data?.error || 'Failed', false) }
 }
 // Reusable credential dialog (shows password to admin to share with the user)
-window.showCredential = (title, name, phone, password, wasSet) => {
+window.showCredential = (title, name, phone, password, wasSet, temporary, expiresAt, smsSimulated) => {
+  const label = wasSet ? 'Password (as you set it)' : (temporary ? 'Temporary password' : 'Auto-generated password')
+  const tempNotice = temporary
+    ? `<div class="bg-amber-50 border border-amber-200 rounded-xl p-3 mb-3 text-left">
+         <p class="text-xs text-amber-700 font-semibold mb-1"><i class="fas fa-triangle-exclamation mr-1"></i>Do not share this password. It expires within 3 hours.</p>
+         <p class="text-xs text-amber-600">The user must change it on their first login.${smsSimulated ? ' (SMS is in demo mode — share it manually.)' : ' It has also been texted to them.'}</p>
+       </div>`
+    : `<p class="text-xs text-slate-400 mb-4">Share this with the user securely. They can change it later via "Forgot password".</p>`
   showModal(`<div class="text-center">
     <div class="w-14 h-14 mx-auto rounded-full bg-emerald-100 text-emerald-600 flex items-center justify-center text-2xl mb-3"><i class="fas fa-key"></i></div>
     <h3 class="text-lg font-bold mb-1">${esc(title)}</h3>
     <p class="text-sm text-slate-600 mb-3">${esc(name)}${phone ? ' · ' + esc(phone) : ''}</p>
     <div class="bg-slate-50 border border-slate-200 rounded-xl p-4 mb-3">
-      <p class="text-xs text-slate-500 mb-1">${wasSet ? 'Password (as you set it)' : 'Auto-generated password'}</p>
+      <p class="text-xs text-slate-500 mb-1">${label}</p>
       <p class="text-2xl font-bold tracking-widest text-slate-800">${esc(password)}</p>
     </div>
-    <p class="text-xs text-slate-400 mb-4">Share this with the user securely. They can change it later via "Forgot password".</p>
+    ${tempNotice}
     <button onclick="closeModal()" class="btn w-full brand-bg text-white py-2.5 rounded-lg text-sm">Done</button></div>`)
 }
 window.resetUserPassword = async (id, name) => {
-  if (!confirm('Reset password for "' + name + '"? A new password will be generated and their current sessions ended.')) return
+  if (!confirm('Reset password for "' + name + '"? A new temporary password will be generated (expires in 3 hours, must be changed on next login) and their current sessions ended.')) return
   try {
     const { data } = await api.post(`/users/${id}/reset-password`, {})
-    showCredential('Password Reset', name, '', data.new_password, false)
+    showCredential('Password Reset', name, '', data.new_password, false, data.temporary, data.expires_at, data.sms_simulated)
   } catch (err) { toast(err.response?.data?.error || 'Failed', false) }
 }
 window.editAgentModal = (id) => {
@@ -2582,10 +2697,20 @@ window.addUserModal = async () => {
       <input id="nu_name" placeholder="Full Name" class="w-full px-3 py-2 border rounded-lg">
       <input id="nu_phone" placeholder="Phone" class="w-full px-3 py-2 border rounded-lg">
       <input id="nu_email" placeholder="Email (optional)" class="w-full px-3 py-2 border rounded-lg">
+      <div class="flex gap-2">
+        <button id="nu_otp_btn" type="button" onclick="requestOnboardOtp('nu')" class="btn px-3 bg-slate-100 rounded-lg text-xs whitespace-nowrap">Send code</button>
+        <span class="text-xs text-slate-400 self-center">Verify the user's phone (a temporary password is texted on verification)</span>
+      </div>
+      <div id="nu_otp_wrap" class="hidden">
+        <input id="nu_otp" placeholder="Enter the 6-digit code sent to the user" class="w-full px-3 py-2 border rounded-lg">
+        <p id="nu_otp_hint" class="text-xs text-emerald-600 mt-1"></p>
+      </div>
       <select id="nu_role" class="w-full px-3 py-2 border rounded-lg">${userRoleOptions(defaultRole)}</select>
       <input id="nu_label" placeholder="Label (for example: Western Cluster Agent)" class="w-full px-3 py-2 border rounded-lg">
       <input id="nu_region" placeholder="Region" class="w-full px-3 py-2 border rounded-lg">
-      <input id="nu_pwd" placeholder="Password (optional — auto-generated if blank)" class="w-full px-3 py-2 border rounded-lg">
+      <details class="text-xs text-slate-500"><summary class="cursor-pointer">Set a password manually instead (skips OTP)</summary>
+        <input id="nu_pwd" placeholder="Password (leave blank to text a temporary one)" class="w-full px-3 py-2 border rounded-lg mt-2">
+      </details>
       <div><div class="field-label">Permission check-boxes</div><div id="nu_perm_box" class="responsive-grid cols-2">${permissionChecklist('nu_perm', templatePermissions(defaultRole), !allowCustomPerms)}</div><div class="help-text">${allowCustomPerms ? 'Toggle the exact permissions to assign to this user.' : 'Only Super Admin can customize the check-box selection. Admin users see role-based defaults.'}</div></div>
       ${allowCustomPerms ? `<div><div class="field-label">Time-Based Access Control (login window)</div>${scheduleEditor('nu', {}, false)}<div class="help-text">Optional. Overrides the role login window for this user.</div></div>` : ''}
     </div>
@@ -2595,11 +2720,17 @@ window.addUserModal = async () => {
 window.doAddUser = async () => {
   try {
     const body = { full_name: $('nu_name').value, phone: $('nu_phone').value, email: $('nu_email').value, role: $('nu_role').value, label: $('nu_label').value, region: $('nu_region').value }
-    if ($('nu_pwd').value) body.password = $('nu_pwd').value
+    const manualPwd = $('nu_pwd') && $('nu_pwd').value
+    if (manualPwd) { body.password = manualPwd }
+    else {
+      const otp = $('nu_otp') ? $('nu_otp').value.trim() : ''
+      if (!otp) { toast('Verify the user\\'s phone first (send + enter the code), or set a password manually', false); return }
+      body.otp_code = otp
+    }
     if (state.user.role === 'super_admin') { body.permissions = selectedPermissions('nu_perm'); Object.assign(body, collectSchedule('nu')) }
     const { data } = await api.post('/users', body)
     closeModal()
-    showCredential('User Created', body.full_name, body.phone, data.password, data.password_was_set_by_admin)
+    showCredential('User Created', body.full_name, body.phone, data.password, data.password_was_set_by_admin, data.temporary, data.expires_at, data.sms_simulated)
     viewUsers()
   } catch (err) { toast(err.response?.data?.error || 'Failed', false) }
 }
@@ -3140,6 +3271,202 @@ window.sendExportEmail = async () => {
     const d = err.response?.data
     toast(d?.message || d?.error || 'Email failed', false)
   }
+}
+
+// ---------------------------------------------------------------------------
+// AUTOMATED SYSTEM BACKUPS (Task 3A)
+// ---------------------------------------------------------------------------
+async function viewBackups() {
+  $('content').innerHTML = `<div id="bk_wrap"><p class="text-sm text-slate-400"><i class="fas fa-spinner fa-spin mr-1"></i>Loading backups…</p></div>`
+  await refreshBackups()
+}
+async function refreshBackups() {
+  try {
+    const { data } = await api.get('/backups')
+    const rows = data.backups || []
+    const list = rows.length ? rows.map(b => `
+      <tr class="border-b">
+        <td class="py-2 px-2 text-xs">#${b.id}</td>
+        <td class="py-2 px-2"><span class="px-2 py-0.5 rounded-full text-xs ${b.trigger_type === 'auto' ? 'bg-sky-100 text-sky-700' : 'bg-slate-100 text-slate-700'}">${esc(b.trigger_type)}</span></td>
+        <td class="py-2 px-2 text-xs">${b.record_count}</td>
+        <td class="py-2 px-2 text-xs">${(b.size_bytes/1024).toFixed(1)} KB</td>
+        <td class="py-2 px-2 text-xs">${b.status === 'success' ? '<span class="text-emerald-600">success</span>' : '<span class="text-red-600">' + esc(b.error || 'failed') + '</span>'}</td>
+        <td class="py-2 px-2 text-xs text-slate-500">${esc(String(b.created_at || '').slice(0,19))}</td>
+        <td class="py-2 px-2 text-right">${b.status === 'success' ? `<button onclick="downloadBackup(${b.id})" class="btn text-xs bg-slate-800 text-white px-2 py-1 rounded"><i class="fas fa-download mr-1"></i>JSON</button>` : ''}</td>
+      </tr>`).join('') : `<tr><td colspan="7" class="py-6 text-center text-sm text-slate-400">No backups yet.</td></tr>`
+    $('bk_wrap').innerHTML = `
+      <div class="bg-white rounded-2xl border border-slate-200 p-5 mb-4">
+        <div class="flex items-center justify-between flex-wrap gap-2">
+          <div>
+            <h3 class="font-bold text-slate-800"><i class="fas fa-shield-halved text-teal-600 mr-2"></i>Automated System Backups</h3>
+            <p class="text-xs text-slate-500 mt-1">Regular automated snapshots of all user profiles, transactional records and system-wide data. Automatic backups run every ${data.interval_hours || 24} hours.</p>
+          </div>
+          <button id="bkNowBtn" onclick="runBackupNow()" class="btn brand-bg text-white px-4 py-2 rounded-lg text-sm"><i class="fas fa-play mr-1"></i>Back up now</button>
+        </div>
+      </div>
+      <div class="bg-white rounded-2xl border border-slate-200 p-5 overflow-x-auto">
+        <table class="w-full text-left"><thead><tr class="text-xs text-slate-400 border-b">
+          <th class="py-2 px-2">ID</th><th class="py-2 px-2">Trigger</th><th class="py-2 px-2">Records</th><th class="py-2 px-2">Size</th><th class="py-2 px-2">Status</th><th class="py-2 px-2">Created</th><th class="py-2 px-2"></th>
+        </tr></thead><tbody>${list}</tbody></table>
+      </div>`
+  } catch (err) { $('bk_wrap').innerHTML = `<p class="text-sm text-red-500">${esc(err.response?.data?.error || 'Failed to load backups')}</p>` }
+}
+window.runBackupNow = async () => {
+  const done = btnLoading('bkNowBtn', 'Backing up…')
+  try {
+    const { data } = await api.post('/backups', {})
+    toast(`Backup created — ${data.record_count} records`)
+    await refreshBackups()
+  } catch (err) { done(); toast(err.response?.data?.error || 'Backup failed', false) }
+}
+window.downloadBackup = async (id) => {
+  try {
+    const res = await api.get(`/backups/${id}/download`, { responseType: 'blob' })
+    triggerDownload(res.data, `farmsky-backup-${id}.json`)
+    toast('Download started')
+  } catch (err) { toast('Download failed', false) }
+}
+
+// ---------------------------------------------------------------------------
+// BULK USER DATA UPLOAD & STANDARDIZATION (Task 3B)
+// ---------------------------------------------------------------------------
+let _importRows = null  // parsed rows staged for upload
+async function viewImports() {
+  $('content').innerHTML = `<div id="im_wrap"></div>`
+  await renderImportHome()
+}
+async function renderImportHome() {
+  let batches = []
+  try { const { data } = await api.get('/imports'); batches = data.batches || [] } catch (_) {}
+  const rows = batches.length ? batches.map(b => `
+    <tr class="border-b">
+      <td class="py-2 px-2 text-xs">#${b.id}</td>
+      <td class="py-2 px-2 text-xs capitalize">${esc(b.category)}</td>
+      <td class="py-2 px-2 text-xs">${esc(b.filename || '—')}</td>
+      <td class="py-2 px-2 text-xs">${b.total_rows}</td>
+      <td class="py-2 px-2 text-xs text-emerald-600">${b.valid_rows}</td>
+      <td class="py-2 px-2 text-xs text-amber-600">${b.exception_rows}</td>
+      <td class="py-2 px-2 text-xs text-sky-600">${b.dispatched_rows}</td>
+      <td class="py-2 px-2 text-xs"><span class="px-2 py-0.5 rounded-full bg-slate-100 text-slate-700">${esc(b.status)}</span></td>
+      <td class="py-2 px-2 text-right"><button onclick="openImportBatch(${b.id})" class="btn text-xs bg-slate-800 text-white px-2 py-1 rounded">Review</button></td>
+    </tr>`).join('') : `<tr><td colspan="9" class="py-6 text-center text-sm text-slate-400">No import batches yet.</td></tr>`
+  $('im_wrap').innerHTML = `
+    <div class="bg-white rounded-2xl border border-slate-200 p-5 mb-4">
+      <h3 class="font-bold text-slate-800 mb-1"><i class="fas fa-file-arrow-up text-teal-600 mr-2"></i>Upload a categorized file</h3>
+      <p class="text-xs text-slate-500 mb-3">Import Farmers, Agents or Partners from CSV/XLSX. Columns are auto-mapped to standard fields (Full Name, Phone, National ID, Location, Value Chain). Rows missing required fields are flagged for you to complete before onboarding is dispatched.</p>
+      <div class="grid gap-3 sm:grid-cols-3">
+        <select id="im_category" class="px-3 py-2 border rounded-lg text-sm">
+          <option value="farmers">Farmers</option><option value="agents">Agents</option><option value="partners">Partners</option>
+        </select>
+        <input id="im_file" type="file" accept=".csv,.xlsx,.xls" onchange="parseImportFile()" class="px-3 py-2 border rounded-lg text-sm sm:col-span-2">
+      </div>
+      <div id="im_preview" class="mt-3"></div>
+    </div>
+    <div class="bg-white rounded-2xl border border-slate-200 p-5 overflow-x-auto">
+      <h3 class="font-bold text-slate-800 mb-2 text-sm">Recent batches</h3>
+      <table class="w-full text-left"><thead><tr class="text-xs text-slate-400 border-b">
+        <th class="py-2 px-2">ID</th><th class="py-2 px-2">Category</th><th class="py-2 px-2">File</th><th class="py-2 px-2">Total</th><th class="py-2 px-2">Valid</th><th class="py-2 px-2">Exceptions</th><th class="py-2 px-2">Onboarded</th><th class="py-2 px-2">Status</th><th class="py-2 px-2"></th>
+      </tr></thead><tbody>${rows}</tbody></table>
+    </div>`
+}
+window.parseImportFile = () => {
+  const f = $('im_file').files[0]
+  if (!f) return
+  const reader = new FileReader()
+  reader.onload = (e) => {
+    try {
+      const wb = XLSX.read(e.target.result, { type: 'array' })
+      const ws = wb.Sheets[wb.SheetNames[0]]
+      _importRows = XLSX.utils.sheet_to_json(ws, { defval: '' })
+      const n = _importRows.length
+      $('im_preview').innerHTML = n
+        ? `<div class="flex items-center justify-between bg-emerald-50 border border-emerald-200 rounded-lg p-3">
+             <span class="text-sm text-emerald-700"><i class="fas fa-check-circle mr-1"></i>${n} rows parsed from <b>${esc(f.name)}</b></span>
+             <button id="imUpBtn" onclick="uploadImport('${esc(f.name)}')" class="btn brand-bg text-white px-4 py-2 rounded-lg text-sm">Upload & validate</button>
+           </div>`
+        : `<p class="text-sm text-amber-600">No rows found in the file.</p>`
+    } catch (err) { $('im_preview').innerHTML = `<p class="text-sm text-red-500">Could not parse file. Use a valid CSV or XLSX.</p>` }
+  }
+  reader.readAsArrayBuffer(f)
+}
+window.uploadImport = async (filename) => {
+  if (!_importRows || !_importRows.length) return toast('Choose a file first', false)
+  const done = btnLoading('imUpBtn', 'Uploading…')
+  try {
+    const { data } = await api.post('/imports', { category: $('im_category').value, filename, rows: _importRows })
+    toast(`Uploaded — ${data.valid} valid, ${data.exceptions} need attention`)
+    _importRows = null
+    openImportBatch(data.batch_id)
+  } catch (err) { done(); toast(err.response?.data?.error || 'Upload failed', false) }
+}
+window.openImportBatch = async (id) => {
+  $('content').innerHTML = `<div id="im_wrap"><p class="text-sm text-slate-400"><i class="fas fa-spinner fa-spin mr-1"></i>Loading batch…</p></div>`
+  try {
+    const { data } = await api.get('/imports/' + id)
+    const b = data.batch
+    const rowsHtml = (data.rows || []).map(r => {
+      const isEx = r.status === 'exception'
+      const isDone = r.status === 'dispatched'
+      return `<tr class="border-b ${isEx ? 'bg-amber-50' : ''}">
+        <td class="py-2 px-2 text-xs">${r.row_number}</td>
+        <td class="py-2 px-2 text-xs">${esc(r.full_name || '—')}</td>
+        <td class="py-2 px-2 text-xs">${esc(r.phone || '—')}</td>
+        <td class="py-2 px-2 text-xs">${esc(r.national_id || '—')}</td>
+        <td class="py-2 px-2 text-xs">${esc(r.county || '—')}</td>
+        <td class="py-2 px-2 text-xs">${isDone ? '<span class="text-sky-600">onboarded</span>' : isEx ? '<span class="text-amber-600">' + esc(r.issues || 'exception') + '</span>' : '<span class="text-emerald-600">valid</span>'}</td>
+        <td class="py-2 px-2 text-right">${isEx ? `<button onclick="fixImportRow(${r.id})" class="btn text-xs bg-amber-500 text-white px-2 py-1 rounded">Fix</button>` : ''}</td>
+      </tr>`
+    }).join('')
+    _importBatchRows = data.rows || []
+    $('im_wrap').innerHTML = `
+      <button onclick="viewImports()" class="text-sm text-slate-500 mb-3"><i class="fas fa-arrow-left mr-1"></i>All batches</button>
+      <div class="bg-white rounded-2xl border border-slate-200 p-5 mb-4 flex items-center justify-between flex-wrap gap-2">
+        <div>
+          <h3 class="font-bold text-slate-800 capitalize">Batch #${b.id} · ${esc(b.category)}</h3>
+          <p class="text-xs text-slate-500 mt-1">${b.total_rows} rows · <span class="text-emerald-600">${b.valid_rows} valid</span> · <span class="text-amber-600">${b.exception_rows} exceptions</span> · <span class="text-sky-600">${b.dispatched_rows} onboarded</span></p>
+        </div>
+        <button id="dispatchBtn" onclick="dispatchImport(${b.id})" ${b.valid_rows ? '' : 'disabled'} class="btn brand-bg text-white px-4 py-2 rounded-lg text-sm ${b.valid_rows ? '' : 'opacity-50'}"><i class="fas fa-paper-plane mr-1"></i>Onboard ${b.valid_rows} valid users</button>
+      </div>
+      <div class="bg-white rounded-2xl border border-slate-200 p-5 overflow-x-auto">
+        <table class="w-full text-left"><thead><tr class="text-xs text-slate-400 border-b">
+          <th class="py-2 px-2">#</th><th class="py-2 px-2">Name</th><th class="py-2 px-2">Phone</th><th class="py-2 px-2">National ID</th><th class="py-2 px-2">County</th><th class="py-2 px-2">Status</th><th class="py-2 px-2"></th>
+        </tr></thead><tbody>${rowsHtml}</tbody></table>
+      </div>`
+  } catch (err) { $('im_wrap').innerHTML = `<p class="text-sm text-red-500">${esc(err.response?.data?.error || 'Failed to load batch')}</p>` }
+}
+let _importBatchRows = []
+window.fixImportRow = (rowId) => {
+  const r = _importBatchRows.find(x => x.id === rowId)
+  if (!r) return
+  showModal(`<h3 class="font-bold mb-1">Complete missing details</h3>
+    <p class="text-xs text-amber-600 mb-3">Issues: ${esc(r.issues || '')}</p>
+    <div class="space-y-2 text-sm">
+      <input id="fx_full_name" value="${esc(r.full_name || '')}" placeholder="Full Name" class="w-full px-3 py-2 border rounded-lg">
+      <input id="fx_phone" value="${esc(r.phone || '')}" placeholder="Phone" class="w-full px-3 py-2 border rounded-lg">
+      <input id="fx_national_id" value="${esc(r.national_id || '')}" placeholder="National ID" class="w-full px-3 py-2 border rounded-lg">
+      <input id="fx_county" value="${esc(r.county || '')}" placeholder="County" class="w-full px-3 py-2 border rounded-lg">
+      <input id="fx_value_chain" value="${esc(r.value_chain || '')}" placeholder="Value chain (optional)" class="w-full px-3 py-2 border rounded-lg">
+    </div>
+    <div class="flex gap-2 mt-4"><button onclick="saveImportRow(${rowId})" class="btn flex-1 brand-bg text-white py-2 rounded-lg text-sm">Save</button><button onclick="closeModal()" class="btn px-4 bg-slate-100 rounded-lg text-sm">Cancel</button></div>`)
+}
+window.saveImportRow = async (rowId) => {
+  const body = { full_name: $('fx_full_name').value, phone: $('fx_phone').value, national_id: $('fx_national_id').value, county: $('fx_county').value, value_chain: $('fx_value_chain').value }
+  try {
+    const r = _importBatchRows.find(x => x.id === rowId)
+    const { data } = await api.put('/imports/rows/' + rowId, body)
+    closeModal()
+    toast(data.status === 'valid' ? 'Row fixed — now valid' : 'Saved, still has issues: ' + (data.issues || []).join(', '))
+    openImportBatch(r.batch_id)
+  } catch (err) { toast(err.response?.data?.error || 'Failed', false) }
+}
+window.dispatchImport = async (id) => {
+  if (!confirm('Onboard all valid users in this batch? Each will receive a temporary password and verification details by SMS.')) return
+  const done = btnLoading('dispatchBtn', 'Onboarding…')
+  try {
+    const { data } = await api.post(`/imports/${id}/dispatch`, {})
+    toast(`Onboarded ${data.created} users (${data.skipped} skipped)`)
+    openImportBatch(id)
+  } catch (err) { done(); toast(err.response?.data?.error || 'Dispatch failed', false) }
 }
 
 // ---------------------------------------------------------------------------

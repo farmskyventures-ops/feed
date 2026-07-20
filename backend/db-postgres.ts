@@ -23,7 +23,9 @@ const TABLES_WITH_NUMERIC_ID = new Set([
   'users', 'agents', 'customers', 'suppliers', 'products', 'stock_movements',
   'murabaha_contracts', 'repayments', 'invoices', 'transactions', 'approvals',
   'transunion_checks', 'id_verifications', 'audit_logs', 'tickets', 'otp_codes',
-  'payment_intents', 'change_requests'
+  'payment_intents', 'change_requests',
+  // Task 3A/3B onboarding + backup tables (need last_row_id after INSERT).
+  'system_backups', 'import_batches', 'import_rows'
 ])
 
 function convertPlaceholders(sql: string): string {

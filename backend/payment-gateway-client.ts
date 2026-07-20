@@ -190,6 +190,64 @@ export async function processPayment(
   }
 }
 
+export interface PayoutOptions {
+  amount: number
+  channelCode: string        // SasaPay channel/network code for the destination
+  receiver_number: string    // mobile / bank / wallet number to pay
+  reason?: string
+  origin_reference?: string  // our own wallet_withdrawals reference for reconciliation
+  idempotency_key?: string   // dedupes a double payout on retry
+}
+
+export interface PayoutResult extends GatewayResult {
+  b2c_request_id?: string | null
+  conversation_id?: string | null
+  transaction_charges?: string
+}
+
+/**
+ * Disburse money OUT through the central gateway (B2C). The satellite has
+ * already debited its own internal wallet ledger; this moves the real funds
+ * using the HOST's SasaPay credentials, so production withdrawals are no longer
+ * simulated/demo. The gateway exposes this at POST /payout. Settlement is
+ * asynchronous (host reconciles via its own B2C callback); we return
+ * status 'PENDING' (or 'SUCCESS' when simulated in local dev).
+ */
+export async function payoutPayment(env: GatewayEnv, opts: PayoutOptions): Promise<PayoutResult> {
+  if (!gatewayConfigured(env)) return { success: false, error: 'gateway_not_configured' }
+  try {
+    const key = clientKey(env)
+    const secret = String(env.FARMSKY_PAYMENTS_HMAC_SECRET)
+    const body = JSON.stringify({
+      amount: opts.amount,
+      channelCode: opts.channelCode,
+      receiver_number: opts.receiver_number,
+      reason: opts.reason,
+      origin_reference: opts.origin_reference
+    })
+    const { timestamp, nonce, signature } = await signRequest(secret, key, body)
+    const headers: Record<string, string> = {
+      'Content-Type': 'application/json',
+      'X-Farmsky-Client': key,
+      'X-Farmsky-Timestamp': timestamp,
+      'X-Farmsky-Nonce': nonce,
+      'X-Farmsky-Signature': signature
+    }
+    if (opts.idempotency_key) headers['Idempotency-Key'] = opts.idempotency_key
+    const res = await fetch(`${baseUrl(env)}/payout`, { method: 'POST', headers, body })
+    const text = await res.text()
+    let json: PayoutResult = {} as PayoutResult
+    try { json = text ? JSON.parse(text) : ({} as PayoutResult) } catch { /* non-JSON */ }
+    if (!res.ok) {
+      const detail = json.error || (text ? text.slice(0, 160) : `gateway_http_${res.status}`)
+      return { success: false, status: String(res.status), error: detail }
+    }
+    return { success: true, ...json }
+  } catch (err: any) {
+    return { success: false, error: `gateway_connection_failed: ${err?.message || err}` }
+  }
+}
+
 /**
  * Check status of a transaction.
  */
