@@ -956,7 +956,7 @@ window.getQuote = async (productId) => {
       <p class="text-xs text-teal-700 mt-2 italic">${esc(data.disclosure_note || '')}</p>
       ${data.terms_text ? `<div class="mt-3 text-xs text-slate-600 bg-white/70 rounded-lg p-3 border border-teal-100"><b>Terms summary:</b> ${esc(data.terms_text)}</div>` : ''}
       ${data.terms_document_url ? `<p class="mt-2 text-xs"><a href="${esc(data.terms_document_url)}" target="_blank" class="text-teal-700 underline">Open uploaded agreement</a></p>` : ''}
-      <label class="flex items-center gap-2 mt-3 text-sm"><input type="checkbox" id="consent"> I consent to these configured cash / financing terms.</label>
+      <label class="flex items-center gap-2 mt-3 text-sm"><input type="checkbox" id="consent"> I consent to these cash/financing terms.</label>
       <button onclick="submitBuy(${productId}, event)" class="btn w-full mt-3 brand-bg text-white py-2.5 rounded-lg text-sm">${financing ? 'Submit Financing Application' : 'Confirm Cash Purchase'}</button>
     </div>`
 }
