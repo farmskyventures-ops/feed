@@ -97,10 +97,10 @@ function safeJson<T = any>(value: any, fallback: T): T {
 // Fallback permissions when role catalog has not loaded yet.
 function builtinDefaults(role: string): Record<string, boolean> {
   if (['super_admin', 'admin'].includes(role)) {
-    return { view: true, edit: true, delete: true, deactivate: true, approve: true, dispatch: true, add_farmer: true, view_farmers: true, view_credit_purchases: true, manage_users: true, request_admin_action: true, can_manage_inventory: true, can_manage_finance_settings: true, view_wallet: true, manage_wallets: true }
+    return { view: true, edit: true, delete: true, deactivate: true, approve: true, dispatch: true, add_farmer: true, view_farmers: true, view_credit_purchases: true, manage_users: true, request_admin_action: true, can_manage_inventory: true, can_manage_finance_settings: true, view_wallet: true, manage_wallets: true, can_manage_contracts: true, can_delete_users: true }
   }
   if (role === 'operations_finance') {
-    return { view: true, approve: true, dispatch: true, view_farmers: true, view_credit_purchases: true, request_admin_action: true, can_manage_finance_settings: true }
+    return { view: true, approve: true, dispatch: true, view_farmers: true, view_credit_purchases: true, request_admin_action: true, can_manage_finance_settings: true, can_manage_contracts: true }
   }
   if (role === 'agent') {
     return { view: true, add_farmer: true, view_farmers: true, view_credit_purchases: true, can_manage_inventory: true, view_wallet: true }
@@ -819,6 +819,9 @@ app.post('/api/signup/verify', async (c) => {
   const existing = await c.env.DB.prepare(`SELECT id FROM users WHERE phone=?`).bind(p).first()
   if (existing) return c.json({ error: 'Account already exists. Please sign in.' }, 409)
   // National ID must be unique across customers (same rule as agent onboarding).
+  // App-level pre-check for a friendly message; a database UNIQUE index
+  // (uq_customers_national_id, migration 0017) is the authoritative guard and
+  // is caught below if two requests race.
   const dupId = await c.env.DB.prepare(`SELECT id FROM customers WHERE national_id=?`).bind(national_id).first()
   if (dupId) return c.json({ error: 'A profile with this National ID already exists.' }, 409)
   const role = 'customer'
@@ -826,7 +829,9 @@ app.post('/api/signup/verify', async (c) => {
   // Self-registration is a server-authorized write: run under the admin RLS
   // context so the non-superuser DB role can create the user + customer profile
   // (matches every other privileged insert in this file).
-  const userId = await withAdminContext(c, async () => {
+  let userId: any
+  try {
+  userId = await withAdminContext(c, async () => {
     const r = await c.env.DB.prepare(
       `INSERT INTO users (full_name, phone, password, role, status, region, password_set, label, permissions) VALUES (?,?,?, ?, 'active', ?, 1, ?, ?)`
     ).bind(String(full_name).trim(), p, await hashPassword(String(password)), role, region || null, 'Farmer', JSON.stringify(farmerPerms)).run()
@@ -843,6 +848,20 @@ app.post('/api/signup/verify', async (c) => {
     ).run()
     return uid
   })
+  } catch (err: any) {
+    // Surface the database-level UNIQUE constraint violations as clean 409s.
+    const msg = String(err?.message || err || '')
+    if (/uq_customers_national_id|national_id/i.test(msg) && /unique|duplicate|23505/i.test(msg)) {
+      return c.json({ error: 'A profile with this National ID already exists.' }, 409)
+    }
+    if (/uq_users_phone|users_phone|phone/i.test(msg) && /unique|duplicate|23505/i.test(msg)) {
+      return c.json({ error: 'Account already exists. Please sign in.' }, 409)
+    }
+    if (/unique|duplicate|23505/i.test(msg)) {
+      return c.json({ error: 'This National ID or phone number is already registered.' }, 409)
+    }
+    throw err
+  }
   const user = { id: userId, full_name: String(full_name).trim(), phone: p, role, region, label: 'Farmer', permissions: farmerPerms }
   await createSession(c, user)
   await audit(c, userId, 'signup', 'user', 'customer self-registered via SMS OTP (unified standard profile: name, phone, national ID, location)')
@@ -1402,6 +1421,76 @@ app.post('/api/murabaha/:id/dispatch', requireAuth, requireRole('admin', 'super_
   if (!['active', 'completed', 'awaiting_cash_balance'].includes(contract.status)) return c.json({ error: 'Only approved or paid purchases can be dispatched' }, 400)
   await c.env.DB.prepare(`UPDATE murabaha_contracts SET dispatch_status='dispatched', dispatched_at=CURRENT_TIMESTAMP, dispatched_by=? WHERE id=?`).bind(c.get('user').id, id).run()
   await audit(c, c.get('user').id, 'dispatch', 'contract', contract.contract_ref)
+  return c.json({ ok: true })
+})
+
+// ----------------------------------------------------------------------------
+// FEATURE 1 — CONTRACT CONTROLS (edit + cancel)
+//   Available ONLY to administrators or users explicitly granted the
+//   `can_manage_contracts` permission. Edit updates commercial terms; cancel
+//   moves a contract to the 'cancelled' status (a precondition for deleting
+//   the associated user under Feature 2).
+// ----------------------------------------------------------------------------
+function canManageContracts(user: SessionUser) {
+  return ['admin', 'super_admin'].includes(user.role) || hasPermission(user, 'can_manage_contracts')
+}
+
+// Edit a contract's editable commercial fields.
+app.put('/api/murabaha/:id', requireAuth, async (c) => {
+  const user = c.get('user') as SessionUser
+  if (!canManageContracts(user)) return c.json({ error: 'You do not have permission to edit contracts.' }, 403)
+  const id = c.req.param('id')
+  const contract = await c.env.DB.prepare(`SELECT * FROM murabaha_contracts WHERE id=?`).bind(id).first<any>()
+  if (!contract) return c.json({ error: 'Not found' }, 404)
+  if (contract.status === 'cancelled') return c.json({ error: 'A cancelled contract cannot be edited.' }, 400)
+  const b = await c.req.json()
+  // Only a curated set of commercial fields may be amended here. Identity and
+  // ownership links (customer_id, product_id) are immutable via this route.
+  const price = b.murabaha_price !== undefined ? numberVal(b.murabaha_price, contract.murabaha_price) : contract.murabaha_price
+  const paid = numberVal(contract.amount_paid, 0)
+  const outstanding = roundMoney(Math.max(0, price - paid))
+  await c.env.DB.prepare(
+    `UPDATE murabaha_contracts SET
+       murabaha_price=?,
+       outstanding=?,
+       deposit_pct=COALESCE(?, deposit_pct),
+       deposit_amount=COALESCE(?, deposit_amount),
+       installment_amount=COALESCE(?, installment_amount),
+       payment_frequency=COALESCE(?, payment_frequency),
+       term_months=COALESCE(?, term_months),
+       terms_text=COALESCE(?, terms_text)
+     WHERE id=?`
+  ).bind(
+    price, outstanding,
+    b.deposit_pct !== undefined ? numberVal(b.deposit_pct, contract.deposit_pct) : null,
+    b.deposit_amount !== undefined ? numberVal(b.deposit_amount, contract.deposit_amount) : null,
+    b.installment_amount !== undefined ? numberVal(b.installment_amount, contract.installment_amount) : null,
+    b.payment_frequency ?? null,
+    b.term_months !== undefined ? numberVal(b.term_months, contract.term_months) : null,
+    b.terms_text ?? null,
+    id
+  ).run()
+  await audit(c, user.id, 'edit', 'contract', contract.contract_ref)
+  return c.json({ ok: true })
+})
+
+// Cancel a contract.
+app.post('/api/murabaha/:id/cancel', requireAuth, async (c) => {
+  const user = c.get('user') as SessionUser
+  if (!canManageContracts(user)) return c.json({ error: 'You do not have permission to cancel contracts.' }, 403)
+  const id = c.req.param('id')
+  const { reason } = await c.req.json().catch(() => ({}))
+  const contract = await c.env.DB.prepare(`SELECT * FROM murabaha_contracts WHERE id=?`).bind(id).first<any>()
+  if (!contract) return c.json({ error: 'Not found' }, 404)
+  if (contract.status === 'cancelled') return c.json({ error: 'Contract is already cancelled.' }, 400)
+  if (contract.status === 'completed') return c.json({ error: 'A completed contract cannot be cancelled.' }, 400)
+  await c.env.DB.prepare(`UPDATE murabaha_contracts SET status='cancelled' WHERE id=?`).bind(id).run()
+  // Return the allocated stock to inventory if it was already committed.
+  if (contract.ownership_recorded) {
+    await c.env.DB.prepare(`UPDATE products SET quantity = quantity + ? WHERE id=?`).bind(contract.quantity, contract.product_id).run()
+    await c.env.DB.prepare(`INSERT INTO stock_movements (product_id,movement_type,quantity,reference) VALUES (?, 'cancellation_return', ?, ?)`).bind(contract.product_id, contract.quantity, contract.contract_ref).run()
+  }
+  await audit(c, user.id, 'cancel', 'contract', `${contract.contract_ref}${reason ? ' — ' + String(reason).slice(0, 200) : ''}`)
   return c.json({ ok: true })
 })
 
@@ -2512,15 +2601,53 @@ app.put('/api/users/:id/status', requireAuth, requireRole('admin', 'super_admin'
   await audit(c, c.get('user').id, status === 'active' ? 'activate' : 'deactivate', 'user', String(id))
   return c.json({ ok: true })
 })
-app.delete('/api/users/:id', requireAuth, requireRole('admin', 'super_admin'), async (c) => {
+// FEATURE 2 — CONDITIONAL USER DELETION
+//   Allowed for administrators OR any user explicitly granted the
+//   `can_delete_users` permission. A user may only be removed once ALL of
+//   their associated contracts are cancelled (no active/pending/completed
+//   obligations linger). Users with no contracts at all can be deleted.
+app.delete('/api/users/:id', requireAuth, async (c) => {
+  const actor = c.get('user') as SessionUser
+  if (!(['admin', 'super_admin'].includes(actor.role) || hasPermission(actor, 'can_delete_users'))) {
+    return c.json({ error: 'You do not have permission to delete users.' }, 403)
+  }
   const id = c.req.param('id')
-  if (Number(id) === c.get('user').id) return c.json({ error: 'You cannot delete your own account' }, 400)
+  if (Number(id) === actor.id) return c.json({ error: 'You cannot delete your own account' }, 400)
   const u = await c.env.DB.prepare(`SELECT role FROM users WHERE id=?`).bind(id).first<any>()
+  if (!u) return c.json({ error: 'Not found' }, 404)
   if (u?.role === 'super_admin') return c.json({ error: 'Cannot delete a Super Admin account' }, 400)
+  // Precondition: the user's associated contracts must ALL be cancelled.
+  // Contracts link to the user via their customer profile (customers.user_id).
+  const cust = await c.env.DB.prepare(`SELECT id FROM customers WHERE user_id=?`).bind(id).first<any>()
+  if (cust?.id) {
+    const notCancelled = await c.env.DB.prepare(
+      `SELECT COUNT(*)::int n FROM murabaha_contracts WHERE customer_id=? AND status <> 'cancelled'`
+    ).bind(cust.id).first<any>()
+    if (Number(notCancelled?.n || 0) > 0) {
+      return c.json({ error: "User cannot be deleted: their associated contract(s) must be cancelled first." }, 400)
+    }
+  }
   await c.env.DB.prepare(`DELETE FROM sessions WHERE user_id=?`).bind(id).run()
   await c.env.DB.prepare(`DELETE FROM agents WHERE user_id=?`).bind(id).run()
+  await c.env.DB.prepare(`DELETE FROM profile_amendments WHERE user_id=?`).bind(id).run()
+  // Remove the linked customer profile (all its contracts are cancelled) and
+  // its dependent records so the user row can be deleted cleanly.
+  if (cust?.id) {
+    // The (cancelled) contracts and their children must go first to satisfy FKs.
+    const { results: contracts } = await c.env.DB.prepare(`SELECT id FROM murabaha_contracts WHERE customer_id=?`).bind(cust.id).all<any>()
+    for (const ct of (contracts || [])) {
+      await c.env.DB.prepare(`DELETE FROM repayments WHERE contract_id=?`).bind(ct.id).run()
+      await c.env.DB.prepare(`DELETE FROM transactions WHERE contract_id=?`).bind(ct.id).run()
+      await c.env.DB.prepare(`DELETE FROM approvals WHERE contract_id=?`).bind(ct.id).run()
+      await c.env.DB.prepare(`DELETE FROM invoices WHERE contract_id=?`).bind(ct.id).run()
+    }
+    await c.env.DB.prepare(`DELETE FROM murabaha_contracts WHERE customer_id=?`).bind(cust.id).run()
+    await c.env.DB.prepare(`DELETE FROM transunion_checks WHERE customer_id=?`).bind(cust.id).run()
+    await c.env.DB.prepare(`DELETE FROM id_verifications WHERE customer_id=?`).bind(cust.id).run()
+    await c.env.DB.prepare(`DELETE FROM customers WHERE id=?`).bind(cust.id).run()
+  }
   await c.env.DB.prepare(`DELETE FROM users WHERE id=?`).bind(id).run()
-  await audit(c, c.get('user').id, 'delete', 'user', String(id))
+  await audit(c, actor.id, 'delete', 'user', String(id))
   return c.json({ ok: true })
 })
 // ----------------------------------------------------------------------------
@@ -2653,6 +2780,109 @@ app.post('/api/change-requests', requireAuth, async (c) => {
   await c.env.DB.prepare(`INSERT INTO change_requests (requester_id, entity_type, entity_id, requested_action, reason) VALUES (?,?,?,?,?)`).bind(user.id, entity_type, entity_id || null, requested_action, reason || '').run()
   await audit(c, user.id, 'request_admin_action', entity_type || 'entity', `${requested_action || 'request'} ${entity_id || ''}`)
   return c.json({ ok: true })
+})
+
+// ----------------------------------------------------------------------------
+// FEATURE 4 — PROFILE AMENDMENT WORKFLOW
+//   The National ID and phone number are permanently locked on the profile
+//   screen. To change them a user submits a dedicated amendment request which
+//   lands on a pending dashboard; an administrator (or a user with the
+//   `manage_users` permission) reviews and accepts / rejects it. On accept
+//   the new values are applied to the user + customer records.
+// ----------------------------------------------------------------------------
+function canReviewAmendments(user: SessionUser) {
+  return ['admin', 'super_admin'].includes(user.role) || hasPermission(user, 'manage_users')
+}
+
+// Submit an amendment request (any authenticated user).
+app.post('/api/profile-amendments', requireAuth, async (c) => {
+  const user = c.get('user') as SessionUser
+  const b = await c.req.json()
+  const newNid = b.new_national_id !== undefined && b.new_national_id !== null ? String(b.new_national_id).trim() : ''
+  const newPhoneRaw = b.new_phone !== undefined && b.new_phone !== null ? String(b.new_phone).trim() : ''
+  const newPhone = newPhoneRaw ? normalizePhone(newPhoneRaw) : ''
+  const reason = String(b.reason || '').trim()
+  if (!newNid && !newPhone) return c.json({ error: 'Provide a new National ID and/or a new phone number.' }, 400)
+  if (reason.length < 4) return c.json({ error: 'Please give a reason for the change (at least 4 characters).' }, 400)
+  const tv = validateTextFields({ new_national_id: newNid, reason }, [
+    { key: 'new_national_id', label: 'National ID', max: 40 },
+    { key: 'reason', label: 'Reason', max: 500 }
+  ])
+  if (!tv.ok) return c.json({ error: tv.error }, 400)
+  // Prevent a second open request while one is already pending.
+  const open = await c.env.DB.prepare(`SELECT id FROM profile_amendments WHERE user_id=? AND status='pending'`).bind(user.id).first<any>()
+  if (open) return c.json({ error: 'You already have a pending amendment request awaiting review.' }, 400)
+  const cust = await c.env.DB.prepare(`SELECT id, national_id, mobile FROM customers WHERE user_id=?`).bind(user.id).first<any>()
+  const field = newNid && newPhone ? 'both' : (newNid ? 'national_id' : 'phone')
+  await c.env.DB.prepare(
+    `INSERT INTO profile_amendments (user_id, customer_id, field, current_national_id, current_phone, new_national_id, new_phone, reason)
+     VALUES (?,?,?,?,?,?,?,?)`
+  ).bind(user.id, cust?.id || null, field, cust?.national_id || null, cust?.mobile || user.phone || null, newNid || null, newPhone || null, reason).run()
+  await audit(c, user.id, 'request', 'profile_amendment', `${field} change requested`)
+  return c.json({ ok: true })
+})
+
+// List MY amendment requests.
+app.get('/api/profile-amendments/mine', requireAuth, async (c) => {
+  const user = c.get('user') as SessionUser
+  const { results } = await c.env.DB.prepare(`SELECT * FROM profile_amendments WHERE user_id=? ORDER BY created_at DESC`).bind(user.id).all()
+  return c.json({ amendments: results })
+})
+
+// List all amendment requests for the review dashboard (default: pending).
+app.get('/api/profile-amendments', requireAuth, async (c) => {
+  const user = c.get('user') as SessionUser
+  if (!canReviewAmendments(user)) return c.json({ error: 'Forbidden' }, 403)
+  const status = c.req.query('status') || 'pending'
+  let q = `SELECT pa.*, u.full_name AS requester_name, u.role AS requester_role, r.full_name AS reviewer_name
+           FROM profile_amendments pa
+           JOIN users u ON u.id = pa.user_id
+           LEFT JOIN users r ON r.id = pa.reviewed_by`
+  const binds: any[] = []
+  if (status !== 'all') { q += ` WHERE pa.status=?`; binds.push(status) }
+  q += ` ORDER BY pa.created_at DESC`
+  const { results } = await c.env.DB.prepare(q).bind(...binds).all()
+  return c.json({ amendments: results })
+})
+
+// Approve / reject an amendment request.
+app.post('/api/profile-amendments/:id/decision', requireAuth, async (c) => {
+  const actor = c.get('user') as SessionUser
+  if (!canReviewAmendments(actor)) return c.json({ error: 'Forbidden' }, 403)
+  const id = c.req.param('id')
+  const { action, notes } = await c.req.json()
+  const amend = await c.env.DB.prepare(`SELECT * FROM profile_amendments WHERE id=?`).bind(id).first<any>()
+  if (!amend) return c.json({ error: 'Not found' }, 404)
+  if (amend.status !== 'pending') return c.json({ error: 'This request has already been reviewed.' }, 400)
+  if (action === 'approve') {
+    // Uniqueness re-check at approval time (values may have been taken since).
+    if (amend.new_national_id) {
+      const dup = await c.env.DB.prepare(`SELECT id FROM customers WHERE national_id=? AND user_id<>?`).bind(amend.new_national_id, amend.user_id).first<any>()
+      if (dup) return c.json({ error: 'Cannot approve: that National ID is already in use.' }, 409)
+    }
+    if (amend.new_phone) {
+      const dup = await c.env.DB.prepare(`SELECT id FROM users WHERE phone=? AND id<>?`).bind(amend.new_phone, amend.user_id).first<any>()
+      if (dup) return c.json({ error: 'Cannot approve: that phone number is already in use.' }, 409)
+    }
+    await withAdminContext(c, async () => {
+      if (amend.new_phone) {
+        await c.env.DB.prepare(`UPDATE users SET phone=? WHERE id=?`).bind(amend.new_phone, amend.user_id).run()
+        if (amend.customer_id) await c.env.DB.prepare(`UPDATE customers SET mobile=? WHERE id=?`).bind(amend.new_phone, amend.customer_id).run()
+      }
+      if (amend.new_national_id && amend.customer_id) {
+        await c.env.DB.prepare(`UPDATE customers SET national_id=? WHERE id=?`).bind(amend.new_national_id, amend.customer_id).run()
+      }
+    })
+    await c.env.DB.prepare(`UPDATE profile_amendments SET status='approved', reviewed_by=?, review_notes=?, reviewed_at=CURRENT_TIMESTAMP WHERE id=?`).bind(actor.id, notes || null, id).run()
+    // Force re-login so the session carries the new phone/identity.
+    await c.env.DB.prepare(`DELETE FROM sessions WHERE user_id=?`).bind(amend.user_id).run()
+  } else if (action === 'reject') {
+    await c.env.DB.prepare(`UPDATE profile_amendments SET status='rejected', reviewed_by=?, review_notes=?, reviewed_at=CURRENT_TIMESTAMP WHERE id=?`).bind(actor.id, notes || null, id).run()
+  } else {
+    return c.json({ error: 'Action must be approve or reject.' }, 400)
+  }
+  await audit(c, actor.id, action, 'profile_amendment', String(id))
+  return c.json({ ok: true, action })
 })
 
 // Repayment performance

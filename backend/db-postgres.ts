@@ -25,7 +25,9 @@ const TABLES_WITH_NUMERIC_ID = new Set([
   'transunion_checks', 'id_verifications', 'audit_logs', 'tickets', 'otp_codes',
   'payment_intents', 'change_requests',
   // Task 3A/3B onboarding + backup tables (need last_row_id after INSERT).
-  'system_backups', 'import_batches', 'import_rows'
+  'system_backups', 'import_batches', 'import_rows',
+  // Feature 4 — profile amendment requests (need last_row_id after INSERT).
+  'profile_amendments'
 ])
 
 function convertPlaceholders(sql: string): string {

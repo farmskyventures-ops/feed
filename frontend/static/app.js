@@ -716,6 +716,7 @@ function navItems() {
     { k: 'contracts', i: 'fa-file-signature', t: 'Purchases' },
     { k: 'agents', i: 'fa-user-tie', t: 'Agents' },
     { k: 'users', i: 'fa-user-gear', t: 'User Accounts' },
+    { k: 'amendments', i: 'fa-id-card-clip', t: 'Pending Amendments' },
     wallets,
     { k: 'repayments', i: 'fa-money-bill-wave', t: 'Repayments' },
     { k: 'settings', i: 'fa-sliders', t: 'Financing Settings' },
@@ -783,9 +784,9 @@ function renderApp() {
 }
 window.go = (r) => { state.route = r; toggleSidebar(false); renderApp() }
 function route() {
-  const titles = { dashboard: 'Dashboard', approvals: 'Financing Approvals', inventory: 'Inventory', finance_queue: 'Finance Approval Queue', customers: 'Customers', contracts: 'Purchases & Contracts', agents: 'Agent Management', users: 'User Accounts & Access', repayments: 'Repayment Performance', onboard: 'Farmer Onboarding', shop: 'Feed Shop', exports: 'Data Export & Reports', imports: 'Bulk User Data Upload', backups: 'Automated System Backups', settings: 'Financing & Markup Settings', profile: 'My Account', wallet: 'My Wallet', wallets: 'Wallets & Payouts' }
+  const titles = { dashboard: 'Dashboard', approvals: 'Financing Approvals', inventory: 'Inventory', finance_queue: 'Finance Approval Queue', customers: 'Customers', contracts: 'Purchases & Contracts', agents: 'Agent Management', users: 'User Accounts & Access', amendments: 'Pending Profile Amendments', repayments: 'Repayment Performance', onboard: 'Farmer Onboarding', shop: 'Feed Shop', exports: 'Data Export & Reports', imports: 'Bulk User Data Upload', backups: 'Automated System Backups', settings: 'Financing & Markup Settings', profile: 'My Account', wallet: 'My Wallet', wallets: 'Wallets & Payouts' }
   $('pageTitle').textContent = titles[state.route] || 'Dashboard'
-  const map = { dashboard: viewDashboard, approvals: viewApprovals, inventory: viewInventory, finance_queue: viewFinanceQueue, customers: viewCustomers, contracts: viewContracts, agents: viewAgents, users: viewUsers, repayments: viewRepayments, onboard: viewOnboard, shop: viewShop, exports: viewExports, imports: viewImports, backups: viewBackups, settings: viewSettings, profile: viewProfile, wallet: viewMyWallet, wallets: viewWallets }
+  const map = { dashboard: viewDashboard, approvals: viewApprovals, inventory: viewInventory, finance_queue: viewFinanceQueue, customers: viewCustomers, contracts: viewContracts, agents: viewAgents, users: viewUsers, amendments: viewAmendments, repayments: viewRepayments, onboard: viewOnboard, shop: viewShop, exports: viewExports, imports: viewImports, backups: viewBackups, settings: viewSettings, profile: viewProfile, wallet: viewMyWallet, wallets: viewWallets }
   ;(map[state.route] || viewDashboard)()
 }
 
@@ -1009,9 +1010,58 @@ async function viewContracts() {
         <td class="px-4 py-3 text-right">${fmt(c.murabaha_price)}</td>
         <td class="px-4 py-3 text-right">${fmt(c.outstanding)}</td>
         <td class="px-4 py-3">${badge(c.status)}</td>
-        <td class="px-4 py-3"><button onclick="contractDetail(${c.id})" class="text-teal-600 hover:underline text-xs">View</button></td>
+        <td class="px-4 py-3 whitespace-nowrap text-right">
+          <button onclick="contractDetail(${c.id})" class="text-teal-600 hover:underline text-xs">View</button>
+          ${canManageContracts() ? `<button onclick="editContractModal(${c.id})" class="text-indigo-600 hover:underline text-xs ml-2">Edit</button>${(c.status !== 'cancelled' && c.status !== 'completed') ? `<button onclick="cancelContract(${c.id},'${esc(c.contract_ref)}')" class="text-red-600 hover:underline text-xs ml-2">Cancel</button>` : ''}` : ''}
+        </td>
       </tr>`).join('') || '<tr><td colspan="8" class="text-center py-8 text-slate-400">No contracts</td></tr>'}</tbody>
     </table></div>`
+}
+// FEATURE 1 — contract-management privilege check (admin OR can_manage_contracts).
+function canManageContracts() {
+  if (!state.user) return false
+  if (['super_admin', 'admin'].includes(state.user.role)) return true
+  return canDo('can_manage_contracts')
+}
+window.editContractModal = async (id) => {
+  let c
+  try { c = (await api.get('/murabaha/' + id)).data.contract }
+  catch (err) { return toast(err.response?.data?.error || 'Failed to load contract', false) }
+  showModal(`<h3 class="text-lg font-bold mb-1"><i class="fas fa-pen-to-square text-indigo-600 mr-2"></i>Edit Contract</h3>
+    <p class="text-xs text-slate-500 mb-4">${esc(c.contract_ref)} · ${esc(c.customer_name || '')}</p>
+    <div class="responsive-grid cols-2 text-sm">
+      <div><label class="field-label">Total payable</label><input id="ec_price" type="number" value="${Number(c.murabaha_price || 0)}" class="px-3 py-2 border rounded-lg w-full"></div>
+      <div><label class="field-label">Deposit %</label><input id="ec_deposit_pct" type="number" value="${Number(c.deposit_pct || 0)}" class="px-3 py-2 border rounded-lg w-full"></div>
+      <div><label class="field-label">Deposit amount</label><input id="ec_deposit_amount" type="number" value="${Number(c.deposit_amount || 0)}" class="px-3 py-2 border rounded-lg w-full"></div>
+      <div><label class="field-label">Installment amount</label><input id="ec_installment" type="number" value="${Number(c.installment_amount || c.monthly_payment || 0)}" class="px-3 py-2 border rounded-lg w-full"></div>
+      <div><label class="field-label">Frequency</label><select id="ec_freq" class="px-3 py-2 border rounded-lg w-full"><option value="daily" ${c.payment_frequency==='daily'?'selected':''}>Daily</option><option value="weekly" ${c.payment_frequency==='weekly'?'selected':''}>Weekly</option><option value="monthly" ${(!c.payment_frequency||c.payment_frequency==='monthly')?'selected':''}>Monthly</option></select></div>
+      <div><label class="field-label">Term (months)</label><input id="ec_term" type="number" value="${Number(c.term_months || 0)}" class="px-3 py-2 border rounded-lg w-full"></div>
+    </div>
+    <div class="mt-3"><label class="field-label">Terms text</label><textarea id="ec_terms" rows="2" class="px-3 py-2 border rounded-lg w-full">${esc(c.terms_text || '')}</textarea></div>
+    <div class="flex gap-2 mt-4">
+      <button id="ec_save" onclick="saveContractEdit(${id})" class="btn flex-1 brand-bg text-white py-2.5 rounded-lg text-sm"><i class="fas fa-save mr-1"></i>Save Changes</button>
+      <button onclick="closeModal()" class="btn px-4 bg-slate-100 rounded-lg text-sm">Cancel</button>
+    </div>`)
+}
+window.saveContractEdit = async (id) => {
+  const body = {
+    murabaha_price: ($('ec_price') || {}).value,
+    deposit_pct: ($('ec_deposit_pct') || {}).value,
+    deposit_amount: ($('ec_deposit_amount') || {}).value,
+    installment_amount: ($('ec_installment') || {}).value,
+    payment_frequency: ($('ec_freq') || {}).value,
+    term_months: ($('ec_term') || {}).value,
+    terms_text: ($('ec_terms') || {}).value
+  }
+  const done = btnLoading('ec_save', 'Saving…')
+  try { await api.put('/murabaha/' + id, body); done(); closeModal(); toast('Contract updated'); viewContracts() }
+  catch (err) { done(); toast(err.response?.data?.error || 'Failed to update contract', false) }
+}
+window.cancelContract = async (id, ref) => {
+  const reason = prompt("Cancel contract " + (ref || '') + "? Optionally enter a reason:", '')
+  if (reason === null) return
+  try { await api.post('/murabaha/' + id + '/cancel', { reason }); toast('Contract cancelled'); closeModal(); viewContracts() }
+  catch (err) { toast(err.response?.data?.error || 'Failed to cancel contract', false) }
 }
 window.contractDetail = async (id) => {
   const { data } = await api.get('/murabaha/' + id)
@@ -1095,6 +1145,7 @@ window.contractDetail = async (id) => {
       ${canDispatch ? `<button onclick="dispatchContract(${c.id})" class="btn flex-1 bg-emerald-600 text-white py-2.5 rounded-lg text-sm"><i class="fas fa-truck mr-1"></i>Dispatch Feedt</button>` : ''}
       ${canRequest ? `<button onclick="requestChangeModal('contract', ${c.id}, 'amend contract')" class="btn flex-1 bg-amber-500 text-white py-2.5 rounded-lg text-sm"><i class="fas fa-paper-plane mr-1"></i>Request Admin Change</button>` : ''}
       <button onclick="viewDoc(${c.id})" class="btn flex-1 bg-slate-800 text-white py-2.5 rounded-lg text-sm"><i class="fas fa-file-pdf mr-1"></i>Documents</button>
+      ${canManageContracts() ? `<button onclick="closeModal();editContractModal(${c.id})" class="btn flex-1 bg-indigo-600 text-white py-2.5 rounded-lg text-sm"><i class="fas fa-pen-to-square mr-1"></i>Edit</button>${(c.status !== 'cancelled' && c.status !== 'completed') ? `<button onclick="cancelContract(${c.id},'${esc(c.contract_ref)}')" class="btn flex-1 bg-red-600 text-white py-2.5 rounded-lg text-sm"><i class="fas fa-ban mr-1"></i>Cancel Contract</button>` : ''}` : ''}
       <button onclick="closeModal()" class="btn px-4 bg-slate-100 rounded-lg text-sm">Close</button>
     </div>`)
 }
@@ -2848,6 +2899,19 @@ async function viewProfile() {
         <p class="text-sm text-slate-500"><i class="fas fa-circle-info text-teal-600 mr-2"></i>As a <b>${esc(roleLabel(u.role))}</b>, you can update your profile picture and password here. Your account details are managed by an administrator.</p>
       </div>`}
 
+      <!-- FEATURE 4: Amendment request for locked identity fields -->
+      <div class="card p-6">
+        <h3 class="font-bold text-slate-800 mb-1"><i class="fas fa-id-card-clip text-amber-600 mr-2"></i>Request National ID / Phone Change</h3>
+        <p class="text-xs text-slate-500 mb-4">Your <b>National ID</b> and <b>Phone number</b> are locked. To change them, submit a request below with a reason. An administrator will review and approve or reject it.</p>
+        <div id="amendStatus" class="mb-3"></div>
+        <div class="responsive-grid cols-2 text-sm">
+          ${isFarmer ? `<div><label class="field-label">New National ID</label><input id="am_national_id" placeholder="Leave blank to keep current" class="px-3 py-2 border rounded-lg w-full"></div>` : ''}
+          <div><label class="field-label">New Phone number</label><input id="am_phone" placeholder="e.g. 07XXXXXXXX (leave blank to keep)" class="px-3 py-2 border rounded-lg w-full"></div>
+          <div class="${isFarmer ? 'col-span-2' : ''}"><label class="field-label">Reason for change</label><textarea id="am_reason" rows="2" placeholder="Explain why this change is needed" class="px-3 py-2 border rounded-lg w-full"></textarea></div>
+        </div>
+        <div class="flex gap-2 mt-4"><button id="am_submit" onclick="submitAmendment()" class="btn bg-amber-600 hover:bg-amber-700 text-white px-5 py-2 rounded-lg text-sm"><i class="fas fa-paper-plane mr-1"></i>Submit Request</button></div>
+      </div>
+
       <!-- Change password (everyone) -->
       <div class="card p-6">
         <h3 class="font-bold text-slate-800 mb-1"><i class="fas fa-key text-teal-600 mr-2"></i>Change Password</h3>
@@ -2859,6 +2923,7 @@ async function viewProfile() {
         <div class="flex gap-2 mt-4"><button onclick="changeMyPassword()" class="btn brand-bg text-white px-5 py-2 rounded-lg text-sm"><i class="fas fa-lock mr-1"></i>Update Password</button></div>
       </div>
     </div>`
+  loadMyAmendments()
 }
 window.saveAvatar = async () => {
   const data = ($('pf_avatar_data') || {}).value || ''
@@ -2906,6 +2971,87 @@ window.changeMyPassword = async () => {
     if ($('pf_new_pw')) $('pf_new_pw').value = ''
     toast('Password updated')
   } catch (err) { toast(err.response?.data?.error || 'Failed', false) }
+}
+// FEATURE 4 — submit + display my amendment requests.
+window.submitAmendment = async () => {
+  const body = {
+    new_national_id: ($('am_national_id') || {}).value || '',
+    new_phone: ($('am_phone') || {}).value || '',
+    reason: ($('am_reason') || {}).value || ''
+  }
+  if (!body.new_national_id && !body.new_phone) return toast('Enter a new National ID and/or phone number.', false)
+  if (!body.reason || body.reason.trim().length < 4) return toast('Please give a reason (at least 4 characters).', false)
+  const done = btnLoading('am_submit', 'Submitting…')
+  try {
+    await api.post('/profile-amendments', body)
+    done()
+    if ($('am_national_id')) $('am_national_id').value = ''
+    if ($('am_phone')) $('am_phone').value = ''
+    if ($('am_reason')) $('am_reason').value = ''
+    toast('Amendment request submitted for review')
+    loadMyAmendments()
+  } catch (err) { done(); toast(err.response?.data?.error || 'Failed to submit request', false) }
+}
+async function loadMyAmendments() {
+  const box = $('amendStatus')
+  if (!box) return
+  try {
+    const { data } = await api.get('/profile-amendments/mine')
+    const list = data.amendments || []
+    if (!list.length) { box.innerHTML = ''; return }
+    box.innerHTML = list.slice(0, 5).map(a => {
+      const tone = a.status === 'approved' ? 'emerald' : a.status === 'rejected' ? 'red' : 'amber'
+      const parts = []
+      if (a.new_national_id) parts.push('National ID → ' + esc(a.new_national_id))
+      if (a.new_phone) parts.push('Phone → ' + esc(a.new_phone))
+      return `<div class="text-xs p-2 rounded-lg bg-${tone}-50 border border-${tone}-200 mb-2">
+        <span class="font-semibold text-${tone}-800 uppercase">${esc(a.status)}</span>
+        <span class="text-slate-600 ml-1">${parts.join(' · ')}</span>
+        ${a.review_notes ? `<div class="text-slate-500 mt-0.5">Note: ${esc(a.review_notes)}</div>` : ''}
+      </div>`
+    }).join('')
+  } catch (err) { box.innerHTML = '' }
+}
+
+// ---------------------------------------------------------------------------
+// FEATURE 4 — PENDING AMENDMENTS ADMIN DASHBOARD
+// ---------------------------------------------------------------------------
+async function viewAmendments() {
+  let data
+  try { data = (await api.get('/profile-amendments?status=pending')).data }
+  catch (err) { $('content').innerHTML = `<div class="card p-6 text-red-600 text-sm">${esc(err.response?.data?.error || 'Failed to load amendment requests')}</div>`; return }
+  const list = data.amendments || []
+  $('content').innerHTML = `
+    <div class="card table-card">
+      <div class="px-4 py-3 border-b border-slate-100 text-sm text-slate-500"><i class="fas fa-inbox text-amber-600 mr-2"></i>Pending identity-change requests awaiting your review.</div>
+      <table class="w-full text-sm">
+        <thead class="bg-slate-50 text-slate-500 text-xs uppercase"><tr>
+          <th class="text-left px-4 py-3">Requester</th><th class="text-left px-4 py-3">Field(s)</th>
+          <th class="text-left px-4 py-3">Current</th><th class="text-left px-4 py-3">Requested</th>
+          <th class="text-left px-4 py-3">Reason</th><th class="text-left px-4 py-3">Submitted</th><th></th></tr></thead>
+        <tbody>${list.map(a => `<tr class="border-t border-slate-100 align-top">
+          <td class="px-4 py-3"><div class="font-medium">${esc(a.requester_name || '')}</div><div class="text-xs text-slate-400">${esc(roleLabel(a.requester_role || ''))}</div></td>
+          <td class="px-4 py-3 text-xs">${esc((a.field || '').replace('_', ' '))}</td>
+          <td class="px-4 py-3 text-xs text-slate-500">${a.current_national_id ? 'ID: ' + esc(a.current_national_id) + '<br>' : ''}${a.current_phone ? 'Tel: ' + esc(a.current_phone) : ''}</td>
+          <td class="px-4 py-3 text-xs">${a.new_national_id ? '<b>ID: ' + esc(a.new_national_id) + '</b><br>' : ''}${a.new_phone ? '<b>Tel: ' + esc(a.new_phone) + '</b>' : ''}</td>
+          <td class="px-4 py-3 text-xs max-w-xs">${esc(a.reason || '')}</td>
+          <td class="px-4 py-3 text-xs text-slate-400">${esc((a.created_at || '').slice(0, 16).replace('T', ' '))}</td>
+          <td class="px-4 py-3 whitespace-nowrap text-right">
+            <button onclick="decideAmendment(${a.id},'approve')" class="text-emerald-600 hover:underline text-xs mr-2">Approve</button>
+            <button onclick="decideAmendment(${a.id},'reject')" class="text-red-600 hover:underline text-xs">Reject</button>
+          </td></tr>`).join('') || '<tr><td colspan="7" class="text-center py-8 text-slate-400">No pending amendment requests</td></tr>'}</tbody>
+      </table></div>`
+}
+window.decideAmendment = async (id, action) => {
+  let notes = ''
+  if (action === 'reject') {
+    notes = prompt('Reason for rejecting this request (optional):', '')
+    if (notes === null) return
+  } else {
+    if (!confirm('Approve this identity change? The new value will be applied and the user will need to sign in again.')) return
+  }
+  try { await api.post('/profile-amendments/' + id + '/decision', { action, notes }); toast(action === 'approve' ? 'Request approved' : 'Request rejected'); viewAmendments() }
+  catch (err) { toast(err.response?.data?.error || 'Failed to process request', false) }
 }
 
 // ---------------------------------------------------------------------------
