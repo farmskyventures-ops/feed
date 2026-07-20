@@ -2601,14 +2601,17 @@ app.put('/api/users/:id/status', requireAuth, requireRole('admin', 'super_admin'
   await audit(c, c.get('user').id, status === 'active' ? 'activate' : 'deactivate', 'user', String(id))
   return c.json({ ok: true })
 })
-// FEATURE 2 — CONDITIONAL USER DELETION
-//   Allowed for administrators OR any user explicitly granted the
-//   `can_delete_users` permission. A user may only be removed once ALL of
-//   their associated contracts are cancelled (no active/pending/completed
-//   obligations linger). Users with no contracts at all can be deleted.
+// USER DELETION
+//   * Administrators (admin / super_admin): may delete ANY user regardless of
+//     contract status. All data related to that user — their customer profile,
+//     every contract (any status) and all dependent records — is cascaded and
+//     removed automatically.
+//   * Non-admin managers with the `can_delete_users` permission: may only
+//     delete a user once ALL of their associated contracts are cancelled.
 app.delete('/api/users/:id', requireAuth, async (c) => {
   const actor = c.get('user') as SessionUser
-  if (!(['admin', 'super_admin'].includes(actor.role) || hasPermission(actor, 'can_delete_users'))) {
+  const isAdmin = ['admin', 'super_admin'].includes(actor.role)
+  if (!(isAdmin || hasPermission(actor, 'can_delete_users'))) {
     return c.json({ error: 'You do not have permission to delete users.' }, 403)
   }
   const id = c.req.param('id')
@@ -2616,10 +2619,11 @@ app.delete('/api/users/:id', requireAuth, async (c) => {
   const u = await c.env.DB.prepare(`SELECT role FROM users WHERE id=?`).bind(id).first<any>()
   if (!u) return c.json({ error: 'Not found' }, 404)
   if (u?.role === 'super_admin') return c.json({ error: 'Cannot delete a Super Admin account' }, 400)
-  // Precondition: the user's associated contracts must ALL be cancelled.
   // Contracts link to the user via their customer profile (customers.user_id).
   const cust = await c.env.DB.prepare(`SELECT id FROM customers WHERE user_id=?`).bind(id).first<any>()
-  if (cust?.id) {
+  // Non-admin managers must first ensure ALL the user's contracts are cancelled.
+  // Administrators bypass this precondition and cascade-delete everything.
+  if (!isAdmin && cust?.id) {
     const notCancelled = await c.env.DB.prepare(
       `SELECT COUNT(*)::int n FROM murabaha_contracts WHERE customer_id=? AND status <> 'cancelled'`
     ).bind(cust.id).first<any>()
@@ -2627,27 +2631,34 @@ app.delete('/api/users/:id', requireAuth, async (c) => {
       return c.json({ error: "User cannot be deleted: their associated contract(s) must be cancelled first." }, 400)
     }
   }
-  await c.env.DB.prepare(`DELETE FROM sessions WHERE user_id=?`).bind(id).run()
-  await c.env.DB.prepare(`DELETE FROM agents WHERE user_id=?`).bind(id).run()
-  await c.env.DB.prepare(`DELETE FROM profile_amendments WHERE user_id=?`).bind(id).run()
-  // Remove the linked customer profile (all its contracts are cancelled) and
-  // its dependent records so the user row can be deleted cleanly.
-  if (cust?.id) {
-    // The (cancelled) contracts and their children must go first to satisfy FKs.
-    const { results: contracts } = await c.env.DB.prepare(`SELECT id FROM murabaha_contracts WHERE customer_id=?`).bind(cust.id).all<any>()
-    for (const ct of (contracts || [])) {
-      await c.env.DB.prepare(`DELETE FROM repayments WHERE contract_id=?`).bind(ct.id).run()
-      await c.env.DB.prepare(`DELETE FROM transactions WHERE contract_id=?`).bind(ct.id).run()
-      await c.env.DB.prepare(`DELETE FROM approvals WHERE contract_id=?`).bind(ct.id).run()
-      await c.env.DB.prepare(`DELETE FROM invoices WHERE contract_id=?`).bind(ct.id).run()
+  await withAdminContext(c, async () => {
+    await c.env.DB.prepare(`DELETE FROM sessions WHERE user_id=?`).bind(id).run()
+    await c.env.DB.prepare(`DELETE FROM agents WHERE user_id=?`).bind(id).run()
+    await c.env.DB.prepare(`DELETE FROM profile_amendments WHERE user_id=?`).bind(id).run()
+    // Change-requests raised by this user reference users(id) via a FK.
+    await c.env.DB.prepare(`DELETE FROM change_requests WHERE requester_id=?`).bind(id).run()
+    // If this user onboarded farmers (customers.agent_id -> users.id), detach
+    // that link so those farmer records are not FK-blocked or orphaned wrongly.
+    await c.env.DB.prepare(`UPDATE customers SET agent_id=NULL WHERE agent_id=?`).bind(id).run()
+    // Remove the linked customer profile and ALL its dependent records so the
+    // user row can be deleted cleanly (admins delete regardless of status).
+    if (cust?.id) {
+      // Contracts and their children must go first to satisfy FKs.
+      const { results: contracts } = await c.env.DB.prepare(`SELECT id FROM murabaha_contracts WHERE customer_id=?`).bind(cust.id).all<any>()
+      for (const ct of (contracts || [])) {
+        await c.env.DB.prepare(`DELETE FROM repayments WHERE contract_id=?`).bind(ct.id).run()
+        await c.env.DB.prepare(`DELETE FROM transactions WHERE contract_id=?`).bind(ct.id).run()
+        await c.env.DB.prepare(`DELETE FROM approvals WHERE contract_id=?`).bind(ct.id).run()
+        await c.env.DB.prepare(`DELETE FROM invoices WHERE contract_id=?`).bind(ct.id).run()
+      }
+      await c.env.DB.prepare(`DELETE FROM murabaha_contracts WHERE customer_id=?`).bind(cust.id).run()
+      await c.env.DB.prepare(`DELETE FROM transunion_checks WHERE customer_id=?`).bind(cust.id).run()
+      await c.env.DB.prepare(`DELETE FROM id_verifications WHERE customer_id=?`).bind(cust.id).run()
+      await c.env.DB.prepare(`DELETE FROM customers WHERE id=?`).bind(cust.id).run()
     }
-    await c.env.DB.prepare(`DELETE FROM murabaha_contracts WHERE customer_id=?`).bind(cust.id).run()
-    await c.env.DB.prepare(`DELETE FROM transunion_checks WHERE customer_id=?`).bind(cust.id).run()
-    await c.env.DB.prepare(`DELETE FROM id_verifications WHERE customer_id=?`).bind(cust.id).run()
-    await c.env.DB.prepare(`DELETE FROM customers WHERE id=?`).bind(cust.id).run()
-  }
-  await c.env.DB.prepare(`DELETE FROM users WHERE id=?`).bind(id).run()
-  await audit(c, actor.id, 'delete', 'user', String(id))
+    await c.env.DB.prepare(`DELETE FROM users WHERE id=?`).bind(id).run()
+  })
+  await audit(c, actor.id, 'delete', 'user', `${id}${isAdmin ? ' (admin cascade)' : ''}`)
   return c.json({ ok: true })
 })
 // ----------------------------------------------------------------------------

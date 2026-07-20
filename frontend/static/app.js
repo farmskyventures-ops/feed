@@ -2738,10 +2738,16 @@ window.deleteRoleTemplate = async (key) => {
     closeModal(); toast('Role category deleted'); viewUsers()
   } catch (err) { toast(err.response?.data?.error || 'Failed', false) }
 }
+// Both Admin and Super Admin may dynamically assign per-user permission
+// check-boxes (the global permission catalog / role templates stay
+// Super-Admin-only via the "Manage Roles & Permissions" editor).
+function canAssignUserPerms() {
+  return !!state.user && ['admin', 'super_admin'].includes(state.user.role)
+}
 window.addUserModal = async () => {
   await ensurePermissionMeta()
   const defaultRole = getRoleTemplate('agent')?.role_key || 'agent'
-  const allowCustomPerms = state.user.role === 'super_admin'
+  const allowCustomPerms = canAssignUserPerms()
   showModal(`<h3 class="font-bold mb-1">Create User Account</h3>
     <p class="text-xs text-slate-500 mb-3">Choose the user category, label, and permission check-boxes that should apply.</p>
     <div class="space-y-3 text-sm">
@@ -2778,7 +2784,7 @@ window.doAddUser = async () => {
       if (!otp) { toast("Verify the user's phone first (send + enter the code), or set a password manually", false); return }
       body.otp_code = otp
     }
-    if (state.user.role === 'super_admin') { body.permissions = selectedPermissions('nu_perm'); Object.assign(body, collectSchedule('nu')) }
+    if (canAssignUserPerms()) { body.permissions = selectedPermissions('nu_perm'); Object.assign(body, collectSchedule('nu')) }
     const { data } = await api.post('/users', body)
     closeModal()
     showCredential('User Created', body.full_name, body.phone, data.password, data.password_was_set_by_admin, data.temporary, data.expires_at, data.sms_simulated)
@@ -2788,7 +2794,7 @@ window.doAddUser = async () => {
 window.editUserModal = async (id) => {
   await ensurePermissionMeta()
   const u = _users.find(x => x.id === id)
-  const allowCustomPerms = state.user.role === 'super_admin'
+  const allowCustomPerms = canAssignUserPerms()
   showModal(`<h3 class="font-bold mb-3">Edit User</h3><div class="space-y-3 text-sm">
     <input id="eu_name" value="${esc(u.full_name)}" placeholder="Full Name" class="w-full px-3 py-2 border rounded-lg">
     <input id="eu_phone" value="${esc(u.phone)}" placeholder="Phone" class="w-full px-3 py-2 border rounded-lg">
@@ -2807,7 +2813,7 @@ window.doEditUser = async (id) => {
   try {
     const body = { full_name: $('eu_name').value, phone: $('eu_phone').value, email: $('eu_email').value, role: $('eu_role').value, label: $('eu_label').value, region: $('eu_region').value }
     if ($('eu_pwd').value) body.password = $('eu_pwd').value
-    if (state.user.role === 'super_admin') { body.permissions = selectedPermissions('eu_perm'); Object.assign(body, collectSchedule('eu')) }
+    if (canAssignUserPerms()) { body.permissions = selectedPermissions('eu_perm'); Object.assign(body, collectSchedule('eu')) }
     await api.put('/users/' + id, body)
     closeModal(); toast('User updated'); viewUsers()
   } catch (err) { toast(err.response?.data?.error || 'Failed', false) }
