@@ -2507,7 +2507,7 @@ window.doAddAgent = async () => {
     if (manualPwd) { body.password = manualPwd }
     else {
       const otp = $('ag_otp') ? $('ag_otp').value.trim() : ''
-      if (!otp) { toast('Verify the agent\\'s phone first (send + enter the code), or set a password manually', false); return }
+      if (!otp) { toast("Verify the agent's phone first (send + enter the code), or set a password manually", false); return }
       body.otp_code = otp
     }
     const { data } = await api.post('/agents', body)
@@ -2724,7 +2724,7 @@ window.doAddUser = async () => {
     if (manualPwd) { body.password = manualPwd }
     else {
       const otp = $('nu_otp') ? $('nu_otp').value.trim() : ''
-      if (!otp) { toast('Verify the user\\'s phone first (send + enter the code), or set a password manually', false); return }
+      if (!otp) { toast("Verify the user's phone first (send + enter the code), or set a password manually", false); return }
       body.otp_code = otp
     }
     if (state.user.role === 'super_admin') { body.permissions = selectedPermissions('nu_perm'); Object.assign(body, collectSchedule('nu')) }
