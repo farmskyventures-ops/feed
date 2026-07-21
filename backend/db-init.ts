@@ -7,7 +7,8 @@ const SERIAL_TABLES = [
   'murabaha_contracts', 'repayments', 'invoices', 'transactions', 'approvals',
   'transunion_checks', 'id_verifications', 'audit_logs', 'tickets', 'otp_codes',
   'payment_intents', 'change_requests', 'permission_catalog', 'role_templates',
-  'profile_amendments'
+  'profile_amendments',
+  'merchant_keys', 'merchant_checkouts'
 ]
 
 function splitStatements(sql: string): string[] {

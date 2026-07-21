@@ -294,8 +294,96 @@ window.submitChangeRequest = async (entityType, entityId) => {
 // AUTH
 // ---------------------------------------------------------------------------
 async function init() {
-  try { const { data } = await api.get('/me'); state.user = data.user; renderApp() }
+  try {
+    const { data } = await api.get('/me'); state.user = data.user
+    try { const cfg = await api.get('/cross/config'); state.crossApp = cfg.data } catch (_) { state.crossApp = null }
+    renderApp()
+  }
   catch { renderLogin() }
+}
+
+// Cross-platform navigation (Phase 2): open the sibling marketplace with a
+// single-sign-on handoff token so the user is not asked to log in again.
+async function shopCrossApp() {
+  try {
+    const { data } = await api.get('/cross/handoff')
+    if (data && data.url) { window.open(data.url, '_blank'); }
+    else toast('Cross-app navigation is not configured', true)
+  } catch (e) { toast('Cross-app navigation unavailable', true) }
+}
+
+// =====================================================================
+// Phase 5 — reusable multi-parameter client-side filter toolbar.
+// Any list view can render filterToolbar({...}) then, on input, call the
+// supplied re-render. rowMatchesFilters() applies keyword + select + date
+// range filters uniformly. State is kept per-view in _filterState.
+// =====================================================================
+let _filterState = {}
+function filterToolbar(viewKey, opts) {
+  // opts: { search:true, selects:[{key,label,options:[{v,t}]}], dates:true }
+  _filterState[viewKey] = _filterState[viewKey] || {}
+  const st = _filterState[viewKey]
+  const parts = []
+  if (opts.search !== false) {
+    parts.push(`<input id="flt_${viewKey}_q" value="${esc(st.q || '')}" oninput="onFilterChange('${viewKey}')" placeholder="Search…" class="px-3 py-2 border border-slate-300 rounded-lg text-sm w-48">`)
+  }
+  ;(opts.selects || []).forEach(sel => {
+    const cur = st[sel.key] || ''
+    parts.push(`<select id="flt_${viewKey}_${sel.key}" onchange="onFilterChange('${viewKey}')" class="px-3 py-2 border border-slate-300 rounded-lg text-sm">
+      <option value="">${esc(sel.label)}: All</option>
+      ${sel.options.map(o => `<option value="${esc(o.v)}" ${cur === o.v ? 'selected' : ''}>${esc(o.t)}</option>`).join('')}
+    </select>`)
+  })
+  if (opts.dates) {
+    parts.push(`<input id="flt_${viewKey}_from" type="date" value="${esc(st.from || '')}" onchange="onFilterChange('${viewKey}')" class="px-3 py-2 border border-slate-300 rounded-lg text-sm" title="From date">`)
+    parts.push(`<input id="flt_${viewKey}_to" type="date" value="${esc(st.to || '')}" onchange="onFilterChange('${viewKey}')" class="px-3 py-2 border border-slate-300 rounded-lg text-sm" title="To date">`)
+  }
+  parts.push(`<button onclick="clearFilters('${viewKey}')" class="btn px-3 py-2 bg-slate-100 rounded-lg text-sm"><i class="fas fa-xmark mr-1"></i>Clear</button>`)
+  return `<div class="flex flex-wrap items-center gap-2 mb-4">${parts.join('')}</div>`
+}
+window.onFilterChange = (viewKey) => {
+  const st = _filterState[viewKey] = _filterState[viewKey] || {}
+  const q = $('flt_' + viewKey + '_q'); if (q) st.q = q.value
+  const from = $('flt_' + viewKey + '_from'); if (from) st.from = from.value
+  const to = $('flt_' + viewKey + '_to'); if (to) st.to = to.value
+  document.querySelectorAll(`[id^="flt_${viewKey}_"]`).forEach(el => {
+    const key = el.id.replace('flt_' + viewKey + '_', '')
+    if (!['q', 'from', 'to'].includes(key)) st[key] = el.value
+  })
+  if (typeof window['_rerender_' + viewKey] === 'function') window['_rerender_' + viewKey]()
+}
+window.clearFilters = (viewKey) => { _filterState[viewKey] = {}; if (typeof window['_rerender_' + viewKey] === 'function') window['_rerender_' + viewKey]() }
+function rowMatchesFilters(viewKey, row, cfg) {
+  // cfg: { text:[fields], selects:{key:field}, date:field }
+  const st = _filterState[viewKey] || {}
+  if (st.q) {
+    const hay = (cfg.text || []).map(f => String(row[f] ?? '')).join(' ').toLowerCase()
+    if (!hay.includes(String(st.q).toLowerCase())) return false
+  }
+  for (const [key, field] of Object.entries(cfg.selects || {})) {
+    if (st[key] && String(row[field] ?? '') !== String(st[key])) return false
+  }
+  if (cfg.date && (st.from || st.to)) {
+    const d = String(row[cfg.date] || '').slice(0, 10)
+    if (st.from && d < st.from) return false
+    if (st.to && d > st.to) return false
+  }
+  return true
+}
+
+// Renders the "Shop Equipment" / "Shop Feeds" banner when configured.
+function crossAppBanner() {
+  const cfg = state.crossApp
+  if (!cfg || !cfg.cross_app_configured) return ''
+  const isFeed = String(cfg.app_type) === 'feed'
+  const label = isFeed ? 'Shop Equipment' : 'Shop Feeds'
+  const icon = isFeed ? 'fa-tractor' : 'fa-wheat-awn'
+  const blurb = isFeed ? 'Browse and finance farm equipment on Farmsky Equipment.' : 'Browse and finance animal feeds on Farmsky Feed.'
+  return `<div class="card p-4 mb-6 flex items-center justify-between bg-gradient-to-r from-teal-50 to-emerald-50 border border-teal-100">
+    <div><p class="font-semibold text-slate-800"><i class="fas ${icon} text-teal-600 mr-2"></i>${label}</p>
+      <p class="text-sm text-slate-500">${blurb} No second login required.</p></div>
+    <button onclick="shopCrossApp()" class="btn brand-bg text-white px-5 py-2.5 rounded-lg text-sm whitespace-nowrap"><i class="fas fa-arrow-up-right-from-square mr-1"></i>${label}</button>
+  </div>`
 }
 let _authTab = 'signin'
 let _smsLive = false
@@ -717,6 +805,7 @@ function navItems() {
     { k: 'agents', i: 'fa-user-tie', t: 'Agents' },
     { k: 'users', i: 'fa-user-gear', t: 'User Accounts' },
     { k: 'amendments', i: 'fa-id-card-clip', t: 'Pending Amendments' },
+    { k: 'ledger', i: 'fa-book', t: 'Payment Ledger' },
     wallets,
     { k: 'repayments', i: 'fa-money-bill-wave', t: 'Repayments' },
     { k: 'settings', i: 'fa-sliders', t: 'Financing Settings' },
@@ -784,9 +873,9 @@ function renderApp() {
 }
 window.go = (r) => { state.route = r; toggleSidebar(false); renderApp() }
 function route() {
-  const titles = { dashboard: 'Dashboard', approvals: 'Financing Approvals', inventory: 'Inventory', finance_queue: 'Finance Approval Queue', customers: 'Customers', contracts: 'Purchases & Contracts', agents: 'Agent Management', users: 'User Accounts & Access', amendments: 'Pending Profile Amendments', repayments: 'Repayment Performance', onboard: 'Farmer Onboarding', shop: 'Feed Shop', exports: 'Data Export & Reports', imports: 'Bulk User Data Upload', backups: 'Automated System Backups', settings: 'Financing & Markup Settings', profile: 'My Account', wallet: 'My Wallet', wallets: 'Wallets & Payouts' }
+  const titles = { dashboard: 'Dashboard', approvals: 'Financing Approvals', inventory: 'Inventory', finance_queue: 'Finance Approval Queue', customers: 'Customers', contracts: 'Purchases & Contracts', agents: 'Agent Management', users: 'User Accounts & Access', amendments: 'Pending Profile Amendments', ledger: 'Unified Payment Ledger', repayments: 'Repayment Performance', onboard: 'Farmer Onboarding', shop: 'Feed Shop', exports: 'Data Export & Reports', imports: 'Bulk User Data Upload', backups: 'Automated System Backups', settings: 'Financing & Markup Settings', profile: 'My Account', wallet: 'My Wallet', wallets: 'Wallets & Payouts' }
   $('pageTitle').textContent = titles[state.route] || 'Dashboard'
-  const map = { dashboard: viewDashboard, approvals: viewApprovals, inventory: viewInventory, finance_queue: viewFinanceQueue, customers: viewCustomers, contracts: viewContracts, agents: viewAgents, users: viewUsers, amendments: viewAmendments, repayments: viewRepayments, onboard: viewOnboard, shop: viewShop, exports: viewExports, imports: viewImports, backups: viewBackups, settings: viewSettings, profile: viewProfile, wallet: viewMyWallet, wallets: viewWallets }
+  const map = { dashboard: viewDashboard, approvals: viewApprovals, inventory: viewInventory, finance_queue: viewFinanceQueue, customers: viewCustomers, contracts: viewContracts, agents: viewAgents, users: viewUsers, amendments: viewAmendments, ledger: viewLedger, repayments: viewRepayments, onboard: viewOnboard, shop: viewShop, exports: viewExports, imports: viewImports, backups: viewBackups, settings: viewSettings, profile: viewProfile, wallet: viewMyWallet, wallets: viewWallets }
   ;(map[state.route] || viewDashboard)()
 }
 
@@ -803,9 +892,10 @@ function statCard(icon, label, value, color) {
 async function viewDashboard() {
   $('content').innerHTML = '<div class="text-slate-400">Loading...</div>'
   const { data } = await api.get('/dashboard')
+  const banner = crossAppBanner()
   if (data.role === 'customer') {
     let next = data.next_payment ? `<div class="card p-5"><p class="text-xs text-slate-500 uppercase">Next Payment</p><p class="text-2xl font-bold mt-1">${fmt(data.next_payment.amount_due - data.next_payment.amount_paid)}</p><p class="text-sm text-slate-500">Due ${data.next_payment.due_date}</p></div>` : '<div class="card p-5"><p class="text-slate-500">No upcoming payments</p></div>'
-    $('content').innerHTML = `<div class="grid grid-cols-1 md:grid-cols-4 gap-4 mb-6">
+    $('content').innerHTML = `${banner}<div class="grid grid-cols-1 md:grid-cols-4 gap-4 mb-6">
       ${statCard('fa-file-signature', 'Active Purchases', data.active_contracts, 'bg-teal-50 text-teal-600')}
       ${statCard('fa-money-bill-wave', 'Total Outstanding', fmt(data.total_outstanding), 'bg-amber-50 text-amber-600')}
       ${statCard('fa-circle-check', 'Completed', data.completed_contracts, 'bg-emerald-50 text-emerald-600')}
@@ -816,7 +906,7 @@ async function viewDashboard() {
       <button onclick="go('contracts')" class="btn bg-slate-100 px-5 py-2.5 rounded-lg text-sm"><i class="fas fa-list mr-1"></i>My Purchases</button>
     </div>`
   } else if (data.role === 'agent') {
-    $('content').innerHTML = `<div class="grid grid-cols-1 md:grid-cols-4 gap-4 mb-6">
+    $('content').innerHTML = `${banner}<div class="grid grid-cols-1 md:grid-cols-4 gap-4 mb-6">
       ${statCard('fa-users', 'Farmers Added', data.customers_onboarded, 'bg-teal-50 text-teal-600')}
       ${statCard('fa-file-signature', 'Active Contracts', data.active_contracts, 'bg-blue-50 text-blue-600')}
       ${statCard('fa-clock', 'Pending Approvals', data.pending_approvals, 'bg-amber-50 text-amber-600')}
@@ -828,7 +918,7 @@ async function viewDashboard() {
     </div>
     <div class="card p-6"><button onclick="go('onboard')" class="btn brand-bg text-white px-5 py-2.5 rounded-lg text-sm"><i class="fas fa-user-plus mr-1"></i>Add New Farmer</button></div>`
   } else {
-    $('content').innerHTML = `<div class="grid grid-cols-1 md:grid-cols-4 gap-4 mb-6">
+    $('content').innerHTML = `${banner}<div class="grid grid-cols-1 md:grid-cols-4 gap-4 mb-6">
       ${statCard('fa-chart-line', 'Total Sales', fmt(data.total_sales), 'bg-teal-50 text-teal-600')}
       ${statCard('fa-hand-holding-dollar', 'Feed Financed', fmt(data.feed_financed), 'bg-blue-50 text-blue-600')}
       ${statCard('fa-money-bill', 'Cash Sales', fmt(data.cash_sales), 'bg-emerald-50 text-emerald-600')}
@@ -842,6 +932,58 @@ async function viewDashboard() {
       ${data.top_products.map(p => `<div class="flex justify-between py-2 border-b border-slate-100 last:border-0"><span>${esc(p.name)}</span><span class="font-semibold">${p.sales} sales</span></div>`).join('') || '<p class="text-slate-400">No data</p>'}
     </div>`
   }
+}
+
+// ---------------------------------------------------------------------------
+// UNIFIED PAYMENT LEDGER (Phase 2) — one ledger across equipment_app + feed_app,
+// filterable by inventory_type (category), origin_platform, status, method.
+// ---------------------------------------------------------------------------
+let _ledger = []
+async function viewLedger() {
+  $('content').innerHTML = '<div class="text-slate-400">Loading ledger…</div>'
+  let data
+  try { const res = await api.get('/ledger'); data = res.data }
+  catch (e) { $('content').innerHTML = '<div class="card p-6 text-slate-500">Payment ledger is not available. This ledger unifies Equipment and Feed transactions and is populated once payments are processed through the central gateway.</div>'; return }
+  _ledger = data.transactions || []
+  window._rerender_ledger = () => {
+    const rows = _ledger.filter(t => rowMatchesFilters('ledger', t, {
+      text: ['transaction_ref', 'phone', 'description'],
+      selects: { inventory_type: 'inventory_type', origin_platform: 'origin_platform', status: 'status', method: 'payment_method' },
+      date: 'created_at'
+    }))
+    const total = rows.reduce((s, t) => s + (t.status === 'SUCCESS' ? Number(t.amount) : 0), 0)
+    $('ledgerBody').innerHTML = rows.map(t => `<tr class="border-t border-slate-100">
+      <td class="px-4 py-3 font-mono text-xs">${esc(t.transaction_ref)}</td>
+      <td class="px-4 py-3"><span class="px-2 py-0.5 rounded text-xs ${t.inventory_type === 'equipment' ? 'bg-blue-50 text-blue-600' : 'bg-emerald-50 text-emerald-600'}">${esc(t.inventory_type || '—')}</span></td>
+      <td class="px-4 py-3 text-xs">${esc(t.origin_platform || t.origin_app || '—')}</td>
+      <td class="px-4 py-3 uppercase text-xs">${esc(t.payment_method || '')}</td>
+      <td class="px-4 py-3">${esc(t.phone || '')}</td>
+      <td class="px-4 py-3 text-right font-semibold">${fmt(t.amount)}</td>
+      <td class="px-4 py-3">${ledgerStatusBadge(t.status)}</td>
+      <td class="px-4 py-3 text-xs text-slate-500">${esc(String(t.created_at || '').slice(0, 16))}</td>
+    </tr>`).join('') || '<tr><td colspan="8" class="text-center py-8 text-slate-400">No matching transactions</td></tr>'
+    const cnt = $('ledgerCount'); if (cnt) cnt.textContent = `${rows.length} txn(s) · KES ${total.toLocaleString()} settled`
+  }
+  $('content').innerHTML = `
+    <div class="text-sm text-slate-500 mb-4"><i class="fas fa-book text-teal-600 mr-1"></i>Unified across Equipment &amp; Feed · <span id="ledgerCount"></span></div>
+    ${filterToolbar('ledger', { search: true, dates: true, selects: [
+      { key: 'inventory_type', label: 'Category', options: [{ v: 'equipment', t: 'Equipment' }, { v: 'feed', t: 'Feed' }] },
+      { key: 'origin_platform', label: 'Origin', options: [{ v: 'equipment_app', t: 'Equipment App' }, { v: 'feed_app', t: 'Feed App' }] },
+      { key: 'status', label: 'Status', options: [{ v: 'SUCCESS', t: 'Success' }, { v: 'PENDING', t: 'Pending' }, { v: 'FAILED', t: 'Failed' }] },
+      { key: 'method', label: 'Method', options: [{ v: 'mpesa', t: 'M-Pesa' }, { v: 'sasapay', t: 'SasaPay' }, { v: 'buni', t: 'Buni' }] }
+    ] })}
+    <div class="card table-card"><table class="w-full text-sm">
+      <thead class="bg-slate-50 text-slate-500 text-xs uppercase"><tr>
+        <th class="text-left px-4 py-3">Ref</th><th class="text-left px-4 py-3">Category</th><th class="text-left px-4 py-3">Origin</th>
+        <th class="text-left px-4 py-3">Method</th><th class="text-left px-4 py-3">Phone</th><th class="text-right px-4 py-3">Amount</th>
+        <th class="text-left px-4 py-3">Status</th><th class="text-left px-4 py-3">Created</th></tr></thead>
+      <tbody id="ledgerBody"></tbody>
+    </table></div>`
+  window._rerender_ledger()
+}
+function ledgerStatusBadge(s) {
+  const m = { SUCCESS: 'bg-emerald-50 text-emerald-600', PENDING: 'bg-amber-50 text-amber-600', FAILED: 'bg-red-50 text-red-600', EXPIRED: 'bg-slate-100 text-slate-500' }
+  return `<span class="px-2 py-0.5 rounded text-xs ${m[s] || 'bg-slate-100 text-slate-500'}">${esc(s || 'PENDING')}</span>`
 }
 
 // ---------------------------------------------------------------------------
@@ -996,13 +1138,16 @@ window.submitBuy = async (productId, ev) => {
 // ---------------------------------------------------------------------------
 async function viewContracts() {
   const { data } = await api.get('/murabaha')
-  $('content').innerHTML = `<div class="card table-card">
-    <table class="w-full text-sm">
-      <thead class="bg-slate-50 text-slate-500 text-xs uppercase"><tr>
-        <th class="text-left px-4 py-3">Ref</th><th class="text-left px-4 py-3">Customer</th><th class="text-left px-4 py-3">Product</th>
-        <th class="text-left px-4 py-3">Type</th><th class="text-right px-4 py-3">Price</th><th class="text-right px-4 py-3">Outstanding</th>
-        <th class="text-left px-4 py-3">Status</th><th></th></tr></thead>
-      <tbody>${data.contracts.map(c => `<tr class="border-t border-slate-100">
+  const _contracts = data.contracts || []
+  const statuses = [...new Set(_contracts.map(c => c.status).filter(Boolean))].map(s => ({ v: s, t: s }))
+  const ptypes = [...new Set(_contracts.map(c => c.payment_type).filter(Boolean))].map(s => ({ v: s, t: s }))
+  window._rerender_contracts = () => {
+    const rows = _contracts.filter(c => rowMatchesFilters('contracts', c, {
+      text: ['contract_ref', 'customer_name', 'product_name'],
+      selects: { status: 'status', ptype: 'payment_type' },
+      date: 'created_at'
+    }))
+    $('contractsBody').innerHTML = rows.map(c => `<tr class="border-t border-slate-100">
         <td class="px-4 py-3 font-mono text-xs">${esc(c.contract_ref)}</td>
         <td class="px-4 py-3">${esc(c.customer_name)}</td>
         <td class="px-4 py-3">${esc(c.product_name)} ×${c.quantity}</td>
@@ -1014,8 +1159,26 @@ async function viewContracts() {
           <button onclick="contractDetail(${c.id})" class="text-teal-600 hover:underline text-xs">View</button>
           ${canManageContracts() ? `<button onclick="editContractModal(${c.id})" class="text-indigo-600 hover:underline text-xs ml-2">Edit</button>${(c.status !== 'cancelled' && c.status !== 'completed') ? `<button onclick="cancelContract(${c.id},'${esc(c.contract_ref)}')" class="text-red-600 hover:underline text-xs ml-2">Cancel</button>` : ''}` : ''}
         </td>
-      </tr>`).join('') || '<tr><td colspan="8" class="text-center py-8 text-slate-400">No contracts</td></tr>'}</tbody>
+      </tr>`).join('') || '<tr><td colspan="8" class="text-center py-8 text-slate-400">No matching contracts</td></tr>'
+    const cnt = $('contractsCount'); if (cnt) cnt.textContent = rows.length + ' contract(s)'
+  }
+  $('content').innerHTML = `
+  <div class="flex items-center justify-between mb-4">
+    <div class="text-sm text-slate-500"><span id="contractsCount">${_contracts.length} contract(s)</span></div>
+  </div>
+  ${filterToolbar('contracts', { search: true, dates: true, selects: [
+    { key: 'status', label: 'Status', options: statuses },
+    { key: 'ptype', label: 'Payment', options: ptypes }
+  ] })}
+  <div class="card table-card">
+    <table class="w-full text-sm">
+      <thead class="bg-slate-50 text-slate-500 text-xs uppercase"><tr>
+        <th class="text-left px-4 py-3">Ref</th><th class="text-left px-4 py-3">Customer</th><th class="text-left px-4 py-3">Product</th>
+        <th class="text-left px-4 py-3">Type</th><th class="text-right px-4 py-3">Price</th><th class="text-right px-4 py-3">Outstanding</th>
+        <th class="text-left px-4 py-3">Status</th><th></th></tr></thead>
+      <tbody id="contractsBody"></tbody>
     </table></div>`
+  window._rerender_contracts()
 }
 // FEATURE 1 — contract-management privilege check (admin OR can_manage_contracts).
 function canManageContracts() {
@@ -1614,14 +1777,14 @@ async function viewInventory() {
   const addBtn = canInv
     ? `<button onclick="addProductModal()" class="btn brand-bg text-white px-4 py-2 rounded-lg text-sm"><i class="fas fa-plus mr-1"></i>Add inventory</button>`
     : `<span class="text-xs text-slate-400">Read-only view · you are not authorized to add inventory</span>`
-  $('content').innerHTML = `
-  <div class="flex items-center justify-between mb-4">
-    <div class="text-sm text-slate-500">${isAdmin ? 'Full Feed catalog' : 'Feed you have listed'} · ${data.products.length} item(s)</div>
-    <div class="action-bar">${addBtn}</div>
-  </div>
-  <div class="card table-card"><table class="w-full text-sm">
-    <thead class="bg-slate-50 text-slate-500 text-xs uppercase"><tr><th class="text-left px-4 py-3">Image</th><th class="text-left px-4 py-3">Feed</th><th class="text-left px-4 py-3">Status</th><th class="text-left px-4 py-3">Payment Options</th><th class="text-left px-4 py-3">Financing</th><th class="text-right px-4 py-3">Cash Dep.</th><th class="text-right px-4 py-3">Fin. Dep.</th><th class="text-right px-4 py-3">Qty</th><th></th></tr></thead>
-    <tbody>${data.products.map(p => `<tr class="border-t border-slate-100">
+  // Distinct categories for the filter dropdown.
+  const cats = [...new Set(data.products.map(p => p.category).filter(Boolean))].map(c => ({ v: c, t: c }))
+  window._rerender_inventory = () => {
+    const rows = _products.filter(p => rowMatchesFilters('inventory', p, {
+      text: ['name', 'sku', 'category'],
+      selects: { category: 'category', status: 'finance_status', scope: 'app_scope' }
+    }))
+    $('invBody').innerHTML = rows.map(p => `<tr class="border-t border-slate-100">
       <td class="px-4 py-2">${prodImg(p, 'w-10 h-10 rounded-lg')}</td>
       <td class="px-4 py-3"><div class="font-medium">${esc(p.name)}</div><div class="text-xs text-slate-500">${esc(p.sku)} · ${esc(p.category || 'Feed')}</div></td>
       <td class="px-4 py-3">${financeStatusBadge(p.finance_status)}</td>
@@ -1635,8 +1798,24 @@ async function viewInventory() {
         ${canInv ? `<button onclick="restockModal(${p.id},'${esc(p.name)}')" class="text-slate-500 hover:underline text-xs mr-2">Restock</button>` : ''}
         ${p.finance_status === 'pending_finance' && canFin ? `<button onclick="financeModal(${p.id})" class="text-amber-600 hover:underline text-xs mr-2"><i class="fas fa-hand-holding-dollar mr-1"></i>Set finance</button>` : ''}
         ${isDelete ? `<button onclick="deleteProduct(${p.id},'${esc(p.name)}')" class="text-red-600 hover:underline text-xs">Delete</button>` : ''}
-      </td></tr>`).join('') || '<tr><td colspan="9" class="text-center py-8 text-slate-400">No inventory records</td></tr>'}</tbody>
+      </td></tr>`).join('') || '<tr><td colspan="9" class="text-center py-8 text-slate-400">No matching records</td></tr>'
+    const cnt = $('invCount'); if (cnt) cnt.textContent = rows.length + ' item(s)'
+  }
+  $('content').innerHTML = `
+  <div class="flex items-center justify-between mb-4">
+    <div class="text-sm text-slate-500">${isAdmin ? 'Full Feed catalog' : 'Feed you have listed'} · <span id="invCount">${data.products.length} item(s)</span></div>
+    <div class="action-bar">${addBtn}</div>
+  </div>
+  ${filterToolbar('inventory', { search: true, selects: [
+    { key: 'category', label: 'Category', options: cats },
+    { key: 'status', label: 'Status', options: [{ v: 'financed', t: 'Financed' }, { v: 'pending_finance', t: 'Pending finance' }, { v: 'cash_only', t: 'Cash only' }] },
+    { key: 'scope', label: 'Scope', options: [{ v: 'equipment', t: 'Equipment' }, { v: 'feed', t: 'Feed' }, { v: 'both', t: 'Both' }] }
+  ] })}
+  <div class="card table-card"><table class="w-full text-sm">
+    <thead class="bg-slate-50 text-slate-500 text-xs uppercase"><tr><th class="text-left px-4 py-3">Image</th><th class="text-left px-4 py-3">Feed</th><th class="text-left px-4 py-3">Status</th><th class="text-left px-4 py-3">Payment Options</th><th class="text-left px-4 py-3">Financing</th><th class="text-right px-4 py-3">Cash Dep.</th><th class="text-right px-4 py-3">Fin. Dep.</th><th class="text-right px-4 py-3">Qty</th><th></th></tr></thead>
+    <tbody id="invBody"></tbody>
   </table></div>`
+  window._rerender_inventory()
 }
 window.pickImage = (input, targetId, previewId) => {
   const file = input.files[0]; if (!file) return
@@ -2301,9 +2480,15 @@ async function viewCustomers() {
   const actionBar = canDo('add_farmer') || isAdmin
     ? `<div class="action-bar"><button onclick="viewOnboard()" class="btn brand-bg text-white px-4 py-2 rounded-lg text-sm"><i class="fas fa-user-plus mr-1"></i>Add Farmer</button></div>`
     : ''
-  $('content').innerHTML = `${actionBar}<div class="card table-card"><table class="w-full text-sm">
-    <thead class="bg-slate-50 text-slate-500 text-xs uppercase"><tr><th class="text-left px-4 py-3">Farmer</th><th class="text-left px-4 py-3">Mobile</th><th class="text-left px-4 py-3">County</th><th class="text-left px-4 py-3">Value Chain</th><th class="text-left px-4 py-3">KYC</th><th class="text-left px-4 py-3">Profile Status</th><th class="text-left px-4 py-3">Risk</th><th></th></tr></thead>
-    <tbody>${_customers.map(c => `<tr class="border-t border-slate-100">
+  const counties = [...new Set(_customers.map(c => c.county).filter(Boolean))].map(v => ({ v, t: v }))
+  const chains = [...new Set(_customers.map(c => c.value_chain).filter(Boolean))].map(v => ({ v, t: v }))
+  const kycs = [...new Set(_customers.map(c => c.kyc_status).filter(Boolean))].map(v => ({ v, t: v }))
+  window._rerender_customers = () => {
+    const rows = _customers.filter(c => rowMatchesFilters('customers', c, {
+      text: ['full_name', 'national_id', 'mobile'],
+      selects: { county: 'county', chain: 'value_chain', kyc: 'kyc_status', status: 'status' }
+    }))
+    $('customersBody').innerHTML = rows.map(c => `<tr class="border-t border-slate-100">
       <td class="px-4 py-3"><div class="font-medium">${esc(c.full_name)}</div><div class="text-xs text-slate-400">ID ${esc(c.national_id || '—')}</div></td>
       <td class="px-4 py-3">${esc(c.mobile || '—')}</td>
       <td class="px-4 py-3">${esc(c.county || '—')}</td>
@@ -2316,8 +2501,22 @@ async function viewCustomers() {
         ${canEditFarmers ? `<button onclick="editCustomerModal(${c.id})" class="text-teal-600 hover:underline text-xs mr-2">Edit</button>` : ''}
         ${c.kyc_status !== 'verified' ? `<button onclick="completeRegistration(${c.id})" class="text-blue-600 hover:underline text-xs mr-2"><i class="fas fa-id-card mr-1"></i>Complete Registration</button>` : ''}
         ${isAdmin ? `${(c.status || 'active') === 'active' ? `<button onclick="setCustomerStatus(${c.id},'suspended','${esc(c.full_name)}')" class="text-amber-600 hover:underline text-xs mr-2">Suspend</button>` : `<button onclick="setCustomerStatus(${c.id},'active','${esc(c.full_name)}')" class="text-emerald-600 hover:underline text-xs mr-2">Activate</button>`}<button onclick="deleteCustomer(${c.id},'${esc(c.full_name)}')" class="text-red-600 hover:underline text-xs">Delete</button>` : ''}
-      </td></tr>`).join('') || '<tr><td colspan="8" class="text-center py-8 text-slate-400">No customers</td></tr>'}</tbody>
+      </td></tr>`).join('') || '<tr><td colspan="8" class="text-center py-8 text-slate-400">No matching customers</td></tr>'
+    const cnt = $('customersCount'); if (cnt) cnt.textContent = rows.length + ' farmer(s)'
+  }
+  $('content').innerHTML = `${actionBar}
+  <div class="text-sm text-slate-500 mb-3"><span id="customersCount">${_customers.length} farmer(s)</span></div>
+  ${filterToolbar('customers', { search: true, selects: [
+    { key: 'county', label: 'County', options: counties },
+    { key: 'chain', label: 'Value Chain', options: chains },
+    { key: 'kyc', label: 'KYC', options: kycs },
+    { key: 'status', label: 'Status', options: [{ v: 'active', t: 'Active' }, { v: 'suspended', t: 'Suspended' }] }
+  ] })}
+  <div class="card table-card"><table class="w-full text-sm">
+    <thead class="bg-slate-50 text-slate-500 text-xs uppercase"><tr><th class="text-left px-4 py-3">Farmer</th><th class="text-left px-4 py-3">Mobile</th><th class="text-left px-4 py-3">County</th><th class="text-left px-4 py-3">Value Chain</th><th class="text-left px-4 py-3">KYC</th><th class="text-left px-4 py-3">Profile Status</th><th class="text-left px-4 py-3">Risk</th><th></th></tr></thead>
+    <tbody id="customersBody"></tbody>
   </table></div>`
+  window._rerender_customers()
 }
 window.custDetail = async (id) => {
   const { data } = await api.get('/customers/' + id)
@@ -2627,11 +2826,13 @@ async function viewUsers() {
   const accessButton = state.user.role === 'super_admin'
     ? `<button onclick="openAccessManager()" class="btn bg-slate-100 px-4 py-2 rounded-lg text-sm"><i class="fas fa-shield-halved mr-1"></i>Manage Roles & Permissions</button>`
     : ''
-  $('content').innerHTML = `
-    <div class="action-bar">${accessButton}<button onclick="addUserModal()" class="btn brand-bg text-white px-4 py-2 rounded-lg text-sm"><i class="fas fa-user-plus mr-1"></i>Create User</button></div>
-    <div class="card table-card"><table class="w-full text-sm">
-      <thead class="bg-slate-50 text-slate-500 text-xs uppercase"><tr><th class="text-left px-4 py-3">Name</th><th class="text-left px-4 py-3">Label</th><th class="text-left px-4 py-3">Role</th><th class="text-left px-4 py-3">Phone</th><th class="text-left px-4 py-3">Permissions</th><th class="text-left px-4 py-3">Status</th><th></th></tr></thead>
-      <tbody>${data.users.map(u => `<tr class="border-t border-slate-100">
+  const roleOpts = [...new Set(_users.map(u => u.role).filter(Boolean))].map(r => ({ v: r, t: roleLabel(r) }))
+  window._rerender_users = () => {
+    const rows = _users.filter(u => rowMatchesFilters('users', u, {
+      text: ['full_name', 'label', 'phone'],
+      selects: { role: 'role', status: 'status' }
+    }))
+    $('usersBody').innerHTML = rows.map(u => `<tr class="border-t border-slate-100">
         <td class="px-4 py-3 font-medium">${esc(u.full_name)}</td>
         <td class="px-4 py-3">${esc(u.label || '—')}</td>
         <td class="px-4 py-3">${esc(roleLabel(u.role))}</td>
@@ -2643,8 +2844,21 @@ async function viewUsers() {
           <button onclick="resetUserPassword(${u.id},'${esc(u.full_name)}')" class="text-blue-600 hover:underline text-xs mr-2">Reset Password</button>
           ${u.status === 'active' ? `<button onclick="setUserStatus(${u.id},'suspended','users','${esc(u.full_name)}')" class="text-amber-600 hover:underline text-xs mr-2">Deactivate</button>` : `<button onclick="setUserStatus(${u.id},'active','users','${esc(u.full_name)}')" class="text-emerald-600 hover:underline text-xs mr-2">Activate</button>`}
           <button onclick="deleteUser(${u.id},'${esc(u.full_name)}','users')" class="text-red-600 hover:underline text-xs">Delete</button>
-        </td></tr>`).join('')}</tbody>
+        </td></tr>`).join('') || '<tr><td colspan="7" class="text-center py-8 text-slate-400">No matching users</td></tr>'
+    const cnt = $('usersCount'); if (cnt) cnt.textContent = rows.length + ' user(s)'
+  }
+  $('content').innerHTML = `
+    <div class="action-bar">${accessButton}<button onclick="addUserModal()" class="btn brand-bg text-white px-4 py-2 rounded-lg text-sm"><i class="fas fa-user-plus mr-1"></i>Create User</button></div>
+    <div class="text-sm text-slate-500 mb-3"><span id="usersCount">${_users.length} user(s)</span></div>
+    ${filterToolbar('users', { search: true, selects: [
+      { key: 'role', label: 'Role', options: roleOpts },
+      { key: 'status', label: 'Status', options: [{ v: 'active', t: 'Active' }, { v: 'suspended', t: 'Suspended' }] }
+    ] })}
+    <div class="card table-card"><table class="w-full text-sm">
+      <thead class="bg-slate-50 text-slate-500 text-xs uppercase"><tr><th class="text-left px-4 py-3">Name</th><th class="text-left px-4 py-3">Label</th><th class="text-left px-4 py-3">Role</th><th class="text-left px-4 py-3">Phone</th><th class="text-left px-4 py-3">Permissions</th><th class="text-left px-4 py-3">Status</th><th></th></tr></thead>
+      <tbody id="usersBody"></tbody>
     </table></div>`
+  window._rerender_users()
 }
 window.openAccessManager = async (editRoleKey = '') => {
   await ensurePermissionMeta()
@@ -2834,10 +3048,27 @@ window.deleteUser = async (id, name, back) => {
 // ---------------------------------------------------------------------------
 async function viewRepayments() {
   const { data } = await api.get('/repayments')
-  $('content').innerHTML = `<div class="card table-card"><table class="w-full text-sm">
+  const _repayments = data.repayments || []
+  const statuses = [...new Set(_repayments.map(r => r.status).filter(Boolean))].map(v => ({ v, t: v }))
+  window._rerender_repayments = () => {
+    const rows = _repayments.filter(r => rowMatchesFilters('repayments', r, {
+      text: ['contract_ref', 'customer'],
+      selects: { status: 'status' },
+      date: 'due_date'
+    }))
+    $('repaymentsBody').innerHTML = rows.map(r => `<tr class="border-t border-slate-100"><td class="px-4 py-3 font-mono text-xs">${esc(r.contract_ref)}</td><td class="px-4 py-3">${esc(r.customer)}</td><td class="px-4 py-3">#${r.installment_no}</td><td class="px-4 py-3">${r.due_date}</td><td class="px-4 py-3 text-right">${fmt(r.amount_due)}</td><td class="px-4 py-3 text-right">${fmt(r.amount_paid)}</td><td class="px-4 py-3">${badge(r.status)}</td></tr>`).join('') || '<tr><td colspan="7" class="text-center py-8 text-slate-400">No matching repayments</td></tr>'
+    const cnt = $('repaymentsCount'); if (cnt) cnt.textContent = rows.length + ' repayment(s)'
+  }
+  $('content').innerHTML = `
+  <div class="text-sm text-slate-500 mb-3"><span id="repaymentsCount">${_repayments.length} repayment(s)</span></div>
+  ${filterToolbar('repayments', { search: true, dates: true, selects: [
+    { key: 'status', label: 'Status', options: statuses }
+  ] })}
+  <div class="card table-card"><table class="w-full text-sm">
     <thead class="bg-slate-50 text-slate-500 text-xs uppercase"><tr><th class="text-left px-4 py-3">Contract</th><th class="text-left px-4 py-3">Customer</th><th class="text-left px-4 py-3">Inst.</th><th class="text-left px-4 py-3">Due Date</th><th class="text-right px-4 py-3">Amount</th><th class="text-right px-4 py-3">Paid</th><th class="text-left px-4 py-3">Status</th></tr></thead>
-    <tbody>${data.repayments.map(r => `<tr class="border-t border-slate-100"><td class="px-4 py-3 font-mono text-xs">${esc(r.contract_ref)}</td><td class="px-4 py-3">${esc(r.customer)}</td><td class="px-4 py-3">#${r.installment_no}</td><td class="px-4 py-3">${r.due_date}</td><td class="px-4 py-3 text-right">${fmt(r.amount_due)}</td><td class="px-4 py-3 text-right">${fmt(r.amount_paid)}</td><td class="px-4 py-3">${badge(r.status)}</td></tr>`).join('') || '<tr><td colspan="7" class="text-center py-8 text-slate-400">No repayments</td></tr>'}</tbody>
+    <tbody id="repaymentsBody"></tbody>
   </table></div>`
+  window._rerender_repayments()
 }
 
 // ---------------------------------------------------------------------------

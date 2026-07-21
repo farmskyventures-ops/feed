@@ -81,7 +81,16 @@ const ENV = {
   FARMSKY_PAYMENTS_CLIENT_KEY: process.env.FARMSKY_PAYMENTS_CLIENT_KEY || process.env.PAYMENT_CLIENT_KEY,
   FARMSKY_PAYMENTS_HMAC_SECRET: process.env.FARMSKY_PAYMENTS_HMAC_SECRET || process.env.PAYMENT_HMAC_SECRET,
   // Session signing secret
-  SESSION_SECRET: process.env.SESSION_SECRET
+  SESSION_SECRET: process.env.SESSION_SECRET,
+  // Cross-platform (Equipment <-> Feed) configuration
+  APP_TYPE: process.env.APP_TYPE,
+  PUBLIC_BASE_URL: process.env.PUBLIC_BASE_URL,
+  CROSS_APP_URL: process.env.CROSS_APP_URL,
+  CROSS_APP_HMAC_SECRET: process.env.CROSS_APP_HMAC_SECRET,
+  // Phase 4 — standardized auth hashing (must match sibling app)
+  AUTH_HASH_ITERATIONS: process.env.AUTH_HASH_ITERATIONS,
+  AUTH_HASH_KEYLEN: process.env.AUTH_HASH_KEYLEN,
+  AUTH_PEPPER: process.env.AUTH_PEPPER
 }
 
 const root = new Hono()

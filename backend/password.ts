@@ -10,11 +10,42 @@
 // re-hash on next successful login (upgrade-on-login).
 // =====================================================================
 
-const ITERATIONS = 210_000            // OWASP 2023 guidance for PBKDF2-SHA256
-const KEYLEN = 32                     // 256-bit derived key
+// =====================================================================
+// Phase 4 — standardized, env-driven hashing parameters.
+// These env vars MUST be set to the SAME values in both the Equipment
+// and Feed apps so a password hashed by one verifies on the other:
+//   AUTH_HASH_ITERATIONS  (default 210000)  PBKDF2 rounds / "salt rounds"
+//   AUTH_HASH_KEYLEN      (default 32)       derived key length in bytes
+//   AUTH_PEPPER           (default '')       server-side secret appended to
+//                                            every password before hashing.
+// Reading process.env keeps Node + Workers behaviour identical (Workers
+// injects vars onto globalThis; process may be undefined there).
+// =====================================================================
+function envNum(name: string, dflt: number): number {
+  try {
+    const v = (typeof process !== 'undefined' && process.env) ? process.env[name] : (globalThis as any)?.[name]
+    const n = Number(v)
+    return Number.isFinite(n) && n > 0 ? n : dflt
+  } catch { return dflt }
+}
+function envStr(name: string, dflt: string): string {
+  try {
+    const v = (typeof process !== 'undefined' && process.env) ? process.env[name] : (globalThis as any)?.[name]
+    return (v == null || v === '') ? dflt : String(v)
+  } catch { return dflt }
+}
+
+const ITERATIONS = envNum('AUTH_HASH_ITERATIONS', 210_000)  // OWASP 2023 guidance for PBKDF2-SHA256
+const KEYLEN = envNum('AUTH_HASH_KEYLEN', 32)               // 256-bit derived key
+const PEPPER = envStr('AUTH_PEPPER', '')                    // shared server-side secret (both apps)
 const PREFIX = 'pbkdf2'
 
 const enc = new TextEncoder()
+
+/** Apply the shared server-side pepper before deriving/verifying. */
+function withPepper(password: string): string {
+  return PEPPER ? `${password}${PEPPER}` : password
+}
 
 function toB64(bytes: Uint8Array): string {
   let bin = ''
@@ -54,7 +85,7 @@ export function isHashed(stored: string | null | undefined): boolean {
 /** Produce a salted PBKDF2 hash string for storage. */
 export async function hashPassword(password: string): Promise<string> {
   const salt = crypto.getRandomValues(new Uint8Array(16))
-  const hash = await derive(String(password), salt, ITERATIONS)
+  const hash = await derive(withPepper(String(password)), salt, ITERATIONS)
   return `${PREFIX}$${ITERATIONS}$${toB64(salt)}$${toB64(hash)}`
 }
 
@@ -80,7 +111,7 @@ export async function verifyPassword(password: string, stored: string | null | u
     const iterations = Number(parts[1]) || ITERATIONS
     const salt = fromB64(parts[2])
     const expected = fromB64(parts[3])
-    const actual = await derive(pw, salt, iterations)
+    const actual = await derive(withPepper(pw), salt, iterations)
     return { ok: timingSafeEqual(actual, expected), legacy: false }
   }
   // Legacy plaintext comparison (constant-time-ish on the bytes).

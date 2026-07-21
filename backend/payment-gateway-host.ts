@@ -43,11 +43,34 @@ import { stkPush, stkQuery, normalizePhone } from './mpesa'
 import { sasapayStkPush, sasapayQuery } from './sasapay'
 import { buniStkPush, buniQuery } from './buni'
 import { verifySignature } from './payment-gateway-shared'
+import { getCookie } from 'hono/cookie'
 import type { Bindings } from './types'
 
 export type PaymentMethod = 'mpesa' | 'sasapay' | 'buni'
 
 const gateway = new Hono<{ Bindings: Bindings }>()
+
+// ----------------------------------------------------------------------------
+// Phase 6 (Zero-Trust RBAC) — the /admin/* endpoints expose the payment ledger
+// and destructive recovery tools. They MUST be reachable only by an
+// authenticated admin / super_admin session on THIS host. This middleware
+// runs before any /admin route handler and denies everyone else.
+// ----------------------------------------------------------------------------
+gateway.use('/admin/*', async (c, next) => {
+  const token = getCookie(c, 'session') || c.req.header('Authorization')?.replace('Bearer ', '')
+  if (!token) return c.json({ error: 'Unauthorized' }, 401)
+  const row = await c.env.DB.prepare(
+    `SELECT u.role, u.status, s.expires_at
+       FROM sessions s JOIN users u ON u.id = s.user_id WHERE s.token = ?`
+  ).bind(token).first<any>()
+  if (!row || Number(row.expires_at) < Date.now() || row.status !== 'active') {
+    return c.json({ error: 'Unauthorized' }, 401)
+  }
+  if (!['admin', 'super_admin'].includes(row.role)) {
+    return c.json({ error: 'Forbidden — payment administration requires an admin role' }, 403)
+  }
+  await next()
+})
 
 // ----------------------------------------------------------------------------
 // Helpers
