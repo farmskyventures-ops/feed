@@ -823,9 +823,11 @@ function navItems() {
     { k: 'customers', i: 'fa-users', t: 'My Farmers' },
     ...(canDo('can_manage_inventory') ? [{ k: 'inventory', i: 'fa-boxes-stacked', t: 'My Inventory' }] : []),
     { k: 'contracts', i: 'fa-file-signature', t: 'Credit Purchases' },
+    { k: 'marketplace', i: 'fa-globe', t: 'Equipment Marketplace' },
     myWallet])
   if (r === 'customer') return withAccount([...common,
     { k: 'shop', i: 'fa-store', t: 'Shop' },
+    { k: 'marketplace', i: 'fa-globe', t: 'Equipment Marketplace' },
     { k: 'contracts', i: 'fa-file-signature', t: 'My Purchases' }])
   if (r === 'support') return withAccount([...common,
     { k: 'customers', i: 'fa-users', t: 'Customers' },
@@ -873,9 +875,9 @@ function renderApp() {
 }
 window.go = (r) => { state.route = r; toggleSidebar(false); renderApp() }
 function route() {
-  const titles = { dashboard: 'Dashboard', approvals: 'Financing Approvals', inventory: 'Inventory', finance_queue: 'Finance Approval Queue', customers: 'Customers', contracts: 'Purchases & Contracts', agents: 'Agent Management', users: 'User Accounts & Access', amendments: 'Pending Profile Amendments', ledger: 'Unified Payment Ledger', repayments: 'Repayment Performance', onboard: 'Farmer Onboarding', shop: 'Feed Shop', exports: 'Data Export & Reports', imports: 'Bulk User Data Upload', backups: 'Automated System Backups', settings: 'Financing & Markup Settings', profile: 'My Account', wallet: 'My Wallet', wallets: 'Wallets & Payouts' }
+  const titles = { dashboard: 'Dashboard', approvals: 'Financing Approvals', inventory: 'Inventory', finance_queue: 'Finance Approval Queue', customers: 'Customers', contracts: 'Purchases & Contracts', agents: 'Agent Management', users: 'User Accounts & Access', amendments: 'Pending Profile Amendments', ledger: 'Unified Payment Ledger', repayments: 'Repayment Performance', onboard: 'Farmer Onboarding', shop: 'Feed Shop', marketplace: 'Equipment Marketplace', exports: 'Data Export & Reports', imports: 'Bulk User Data Upload', backups: 'Automated System Backups', settings: 'Financing & Markup Settings', profile: 'My Account', wallet: 'My Wallet', wallets: 'Wallets & Payouts' }
   $('pageTitle').textContent = titles[state.route] || 'Dashboard'
-  const map = { dashboard: viewDashboard, approvals: viewApprovals, inventory: viewInventory, finance_queue: viewFinanceQueue, customers: viewCustomers, contracts: viewContracts, agents: viewAgents, users: viewUsers, amendments: viewAmendments, ledger: viewLedger, repayments: viewRepayments, onboard: viewOnboard, shop: viewShop, exports: viewExports, imports: viewImports, backups: viewBackups, settings: viewSettings, profile: viewProfile, wallet: viewMyWallet, wallets: viewWallets }
+  const map = { dashboard: viewDashboard, approvals: viewApprovals, inventory: viewInventory, finance_queue: viewFinanceQueue, customers: viewCustomers, contracts: viewContracts, agents: viewAgents, users: viewUsers, amendments: viewAmendments, ledger: viewLedger, repayments: viewRepayments, onboard: viewOnboard, shop: viewShop, marketplace: viewMarketplace, exports: viewExports, imports: viewImports, backups: viewBackups, settings: viewSettings, profile: viewProfile, wallet: viewMyWallet, wallets: viewWallets }
   ;(map[state.route] || viewDashboard)()
 }
 
@@ -1431,6 +1433,162 @@ window.doValidateCheckoutAccount = async () => {
     const { data } = await api.post('/sasapay/validate-account', { channel_code: code, account_number: acc })
     if (nm) { nm.className = 'text-xs text-emerald-700 mt-1'; nm.textContent = data.account_name ? ('✓ ' + data.account_name) : '✓ Account verified' }
   } catch (err) { if (nm) { nm.className = 'text-xs text-red-600 mt-1'; nm.textContent = err.response?.data?.error || 'Could not verify account.' } }
+}
+
+// =====================================================================
+// NATIVE CROSS-MARKETPLACE PURCHASING (Feed side)
+// ---------------------------------------------------------------------
+// Lets a signed-in Feed user browse AND buy Equipment-listed / API-ingested
+// inventory WITHOUT being redirected to the sibling app or losing their Feed
+// session. The catalog comes from GET /api/cross/inventory; a purchase is a
+// single in-session POST /api/cross/purchase which creates the local order and
+// initiates payment through the Farmsky Central Payment Gateway. The buyer then
+// approves the STK prompt / OTP and we poll /mpesa/confirm — exactly like a
+// native Feed purchase, so the session is never interrupted.
+// =====================================================================
+let _crossItems = []
+async function viewMarketplace() {
+  $('content').innerHTML = `<div class="mb-4 flex items-center justify-between flex-wrap gap-3">
+      <div>
+        <div class="text-sm text-slate-600"><i class="fas fa-globe text-teal-600 mr-1"></i>Buy Equipment-listed &amp; partner inventory <b>without leaving Feed</b>.</div>
+        <div class="text-xs text-slate-400 mt-0.5">Payments are securely processed through the Farmsky Central Payment Gateway. You stay signed in the whole time.</div>
+      </div>
+      <input id="xmpSearch" oninput="refreshMarketplace()" placeholder="Search marketplace…" class="px-3 py-2 border border-slate-300 rounded-lg text-sm w-56">
+    </div>
+    <div id="xmpGrid" class="grid grid-cols-1 md:grid-cols-3 gap-5"><div class="text-sm text-slate-500 p-4">Loading marketplace…</div></div>`
+  await refreshMarketplace()
+}
+async function refreshMarketplace() {
+  const q = ($('xmpSearch') || {}).value || ''
+  let items = []
+  try { const { data } = await api.get('/cross/inventory' + (q ? ('?q=' + encodeURIComponent(q)) : '')); items = data.items || [] }
+  catch (err) { const g = $('xmpGrid'); if (g) g.innerHTML = `<div class="card p-6 text-red-600 text-sm">${esc(err.response?.data?.error || 'Failed to load marketplace')}</div>`; return }
+  _crossItems = items
+  const grid = $('xmpGrid'); if (!grid) return
+  if (!items.length) { grid.innerHTML = `<div class="card p-6 text-slate-500 text-sm md:col-span-3"><i class="fas fa-box-open mr-2"></i>No cross-marketplace inventory is available right now.</div>`; return }
+  grid.innerHTML = items.map(p => `
+    <div class="card overflow-hidden fade-in flex flex-col">
+      <div>${prodImg(p, 'w-full h-44')}</div>
+      <div class="p-4 flex flex-col flex-1">
+        <div class="flex justify-between items-start"><h3 class="font-bold text-slate-800">${esc(p.name)}</h3><span class="text-[10px] font-semibold px-2 py-0.5 rounded-full bg-indigo-100 text-indigo-700 whitespace-nowrap"><i class="fas fa-globe mr-1"></i>Equipment</span></div>
+        <p class="text-xs text-slate-500 mb-3">${esc(p.category || 'general')} · ${p.quantity} ${esc(p.unit || 'unit')} in stock</p>
+        <div class="space-y-1 text-sm mt-auto">
+          <div class="flex justify-between"><span class="text-slate-500">Price</span><span class="font-semibold text-emerald-600">${fmt(p.cash_price)}</span></div>
+        </div>
+        <button onclick="crossBuyModal(${p.id})" ${p.quantity <= 0 ? 'disabled' : ''} class="btn w-full mt-4 brand-bg text-white py-2 rounded-lg text-sm disabled:opacity-40"><i class="fas fa-cart-plus mr-1"></i>Buy in Feed</button>
+      </div>
+    </div>`).join('')
+}
+window.refreshMarketplace = refreshMarketplace
+window.crossBuyModal = (productId) => {
+  const p = _crossItems.find(x => x.id === productId)
+  if (!p) return toast('Item unavailable', false)
+  const maxQty = Math.max(1, Number(p.quantity) || 1)
+  showModal(`
+    <h3 class="text-lg font-bold mb-1">Buy: ${esc(p.name)}</h3>
+    <p class="text-xs text-slate-500 mb-4"><i class="fas fa-globe text-indigo-500 mr-1"></i>Equipment marketplace item · purchased in your Feed session (no sign-out).</p>
+    ${prodImg(p, 'w-full h-40 rounded-xl mb-3')}
+    <div class="responsive-grid cols-2 text-sm">
+      <div><label class="font-medium">Quantity</label><input id="xmpQty" type="number" value="1" min="1" max="${maxQty}" oninput="xmpRecalc(${p.id})" class="w-full mt-1 px-3 py-2 border border-slate-300 rounded-lg"></div>
+      <div><label class="font-medium">Unit Price</label><div class="mt-1 px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg">${fmt(p.cash_price)}</div></div>
+      <div style="grid-column:1 / -1"><label class="font-medium">Payment Method</label>
+        <div class="flex gap-3 mt-1 text-sm">
+          <label class="flex items-center gap-1"><input type="radio" name="xmpmethod" value="mpesa" checked>M-Pesa</label>
+          <label class="flex items-center gap-1"><input type="radio" name="xmpmethod" value="sasapay">SasaPay</label>
+        </div>
+      </div>
+      <div><label class="font-medium">Mobile Number</label><input id="xmpPhone" value="${esc(state.user?.phone || '')}" class="w-full mt-1 px-3 py-2 border border-slate-300 rounded-lg"></div>
+      <div style="grid-column:1 / -1"><label class="font-medium">Delivery Location</label><input id="xmpLoc" placeholder="Village / Ward" class="w-full mt-1 px-3 py-2 border border-slate-300 rounded-lg"></div>
+    </div>
+    <div class="mt-3 bg-emerald-50 border border-emerald-200 rounded-lg p-3 text-sm flex justify-between"><span class="text-slate-600">Total payable</span><b id="xmpTotal" class="text-emerald-700">${fmt(p.cash_price)}</b></div>
+    <div id="payStatus" class="mt-3"></div>
+    <div class="flex gap-2 mt-4">
+      <button id="xmpPayBtn" onclick="doCrossBuy(${p.id})" class="btn flex-1 brand-bg text-white py-2.5 rounded-lg text-sm"><i class="fas fa-cart-plus mr-1"></i>Pay &amp; Buy</button>
+      <button onclick="closeModal()" class="btn px-4 bg-slate-100 rounded-lg text-sm">Cancel</button>
+    </div>`)
+}
+window.xmpRecalc = (productId) => {
+  const p = _crossItems.find(x => x.id === productId); if (!p) return
+  const qty = Math.max(1, Number(($('xmpQty') || {}).value) || 1)
+  const total = Number(p.cash_price || 0) * qty
+  if ($('xmpTotal')) $('xmpTotal').textContent = fmt(total)
+}
+window.doCrossBuy = async (productId) => {
+  const p = _crossItems.find(x => x.id === productId); if (!p) return
+  const qty = Math.max(1, Number(($('xmpQty') || {}).value) || 1)
+  const method = document.querySelector('input[name="xmpmethod"]:checked')?.value || 'mpesa'
+  const phone = ($('xmpPhone') || {}).value || state.user?.phone || ''
+  const loc = ($('xmpLoc') || {}).value || ''
+  if (!phone) return toast('Enter a mobile number to receive the payment prompt.', false)
+  const btn = $('xmpPayBtn'); if (!btn || btn.disabled) return
+  btnLoading('xmpPayBtn', 'Processing…')
+  setHTML('payStatus', `<div class="text-xs text-slate-500 mb-1 flex items-center gap-2"><span class="inline-block w-3.5 h-3.5 border-2 border-slate-300 border-t-teal-600 rounded-full animate-spin"></span>Creating your order &amp; sending the payment request…</div>`)
+  let data
+  try {
+    // Single in-session call: creates the local order AND initiates gateway payment.
+    ;({ data } = await api.post('/cross/purchase', { product_id: productId, quantity: qty, payment_method: method, phone, delivery_location: loc }))
+  } catch (err) {
+    setHTML('payStatus', `<div class="bg-red-50 border border-red-200 rounded-lg p-2 text-xs text-red-700">${esc(err.response?.data?.error || (!err.response ? 'Network error — please try again.' : 'Purchase failed'))}</div>`)
+    btnReset('xmpPayBtn'); return
+  }
+  if (!data.requires_payment) {
+    payStateAlert('success', null, null)
+    toast('Purchase recorded.')
+    setTimeout(() => { closeModal(); state.route = 'contracts'; renderApp() }, 1500)
+    return
+  }
+  const checkoutId = data.checkout_request_id
+  // SasaPay wallet OTP path (gateway indicated needs_otp).
+  if (method === 'sasapay' && data.needs_otp) {
+    btnReset('xmpPayBtn')
+    setHTML('payStatus', `<div class="bg-green-50 border border-green-200 rounded-lg p-2 text-xs text-green-700 mb-2">${esc(data.customer_message || 'Enter the OTP sent to your SasaPay wallet to authorise the payment.')}</div>
+      <div class="flex gap-2 mb-2">
+        <input id="xmpOtp" type="text" inputmode="numeric" placeholder="OTP code" class="flex-1 px-3 py-2 border border-slate-300 rounded-lg text-sm">
+        <button id="xmpOtpBtn" onclick="doCrossOtp('${esc(checkoutId)}')" class="btn brand-bg text-white px-4 rounded-lg text-sm whitespace-nowrap">Verify</button>
+      </div>`)
+    return
+  }
+  setHTML('payStatus', `<div class="bg-teal-50 border border-teal-200 rounded-lg p-2 text-xs text-teal-700 mb-3"><i class="fas fa-mobile-alt mr-1"></i>${esc(data.customer_message || 'Payment request sent. Confirm on your phone.')}</div><div class="text-xs text-slate-500 mb-1 flex items-center gap-2"><span class="inline-block w-3.5 h-3.5 border-2 border-slate-300 border-t-teal-600 rounded-full animate-spin"></span>Waiting for confirmation…</div>`)
+  crossPoll(checkoutId, data.simulated)
+}
+// Submit SasaPay wallet OTP for a cross-marketplace purchase, then poll.
+window.doCrossOtp = async (checkoutId) => {
+  const code = $('xmpOtp')?.value?.trim()
+  if (!code) return toast('Enter the OTP code', false)
+  btnLoading('xmpOtpBtn', 'Verifying…')
+  setHTML('payStatus', `<div class="text-xs text-slate-500 mb-1 flex items-center gap-2"><span class="inline-block w-3.5 h-3.5 border-2 border-slate-300 border-t-teal-600 rounded-full animate-spin"></span>Verifying OTP…</div>`)
+  try {
+    await gatewayApi.post('/mpesa/process', { checkout_request_id: checkoutId, verification_code: code })
+    setHTML('payStatus', `<div class="text-xs text-slate-500 mb-1 flex items-center gap-2"><span class="inline-block w-3.5 h-3.5 border-2 border-slate-300 border-t-teal-600 rounded-full animate-spin"></span>OTP accepted. Confirming payment…</div>`)
+    crossPoll(checkoutId, false)
+  } catch (err) {
+    setHTML('payStatus', `<div class="bg-red-50 border border-red-200 rounded-lg p-2 text-xs text-red-700">${esc(err.response?.data?.error || 'OTP verification failed')}</div>`)
+    btnReset('xmpOtpBtn')
+  }
+}
+// Shared confirmation poller for cross-marketplace purchases.
+function crossPoll(checkoutId, simulated) {
+  let tries = 0
+  const poll = async () => {
+    if (!$('payStatus') || !state.user) return
+    tries++
+    try {
+      const { data: cd } = await gatewayApi.post('/mpesa/confirm', { checkout_request_id: checkoutId })
+      if (cd.status === 'success') {
+        payStateAlert('success', null, cd.mpesa_receipt)
+        toast('Purchase complete! Receipt: ' + cd.mpesa_receipt)
+        setTimeout(() => { closeModal(); state.route = 'contracts'; renderApp() }, 1800)
+        return
+      } else if (cd.status === 'failed') { payStateAlert('failed', cd.result_desc || 'Payment failed'); btnReset('xmpPayBtn'); btnReset('xmpOtpBtn'); return }
+    } catch (e) {
+      const st = e?.response?.status
+      if (st === 401 || st === 403 || !e?.response) { btnReset('xmpPayBtn'); btnReset('xmpOtpBtn'); return }
+    }
+    if (!$('payStatus') || !state.user) return
+    if (tries < 40) setTimeout(poll, 3000)
+    else { setHTML('payStatus', '<div class="bg-amber-50 border border-amber-200 rounded-lg p-2 text-xs text-amber-700">Still waiting for confirmation. If you completed the payment, it will settle automatically — check My Purchases shortly.</div>'); btnReset('xmpPayBtn'); btnReset('xmpOtpBtn') }
+  }
+  setTimeout(poll, simulated ? 1200 : 4000)
 }
 
 // Issue 3: render an explicit, persistent state alert inside the payment modal.

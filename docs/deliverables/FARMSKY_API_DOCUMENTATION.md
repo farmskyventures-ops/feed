@@ -266,6 +266,60 @@ Related: `GET /api/v1/payments-admin/summary` (admin/super_admin) proxies the ga
 
 ---
 
+## 8b. Native Cross-Marketplace Purchasing (Feed)
+
+Feed users can browse **and buy** Equipment-listed / API-ingested inventory
+natively inside their active Feed session — no redirect to the sibling app, no
+re-login. Payment stays **centralized in Equipment**: settlement is routed
+through the Farmsky Central Payment Gateway exactly like a native Feed purchase.
+These endpoints require an authenticated Feed session cookie (not the HMAC
+merchant scheme).
+
+### GET `/api/cross/inventory`
+Lists purchasable inventory that is **not native to Feed** — published, in-stock
+items whose `app_scope = 'equipment'` (Equipment catalog and merchant/API-ingested
+items). Feed's own `feed`/`both` catalog is excluded (it is served by the normal
+storefront).
+
+Query params: `q` (optional keyword — matches name / category / SKU).
+
+```json
+{ "items": [ { "id": 11, "sku": "EQ-XMP-001", "name": "Diesel Water Pump 3in",
+  "category": "irrigation", "cash_price": 25000, "quantity": 7, "unit": "unit",
+  "app_scope": "equipment", "source": "equipment", "stock_status": "in_stock" } ],
+  "count": 1 }
+```
+
+### POST `/api/cross/purchase`
+Buy a cross-catalog item in-session. Creates a local direct **cash** purchase
+record then initiates payment through the central gateway. The caller keeps the
+same session and polls `/api/mpesa/confirm` (identical to a native purchase).
+
+Request body:
+```json
+{ "product_id": 11, "quantity": 2, "payment_method": "mpesa",
+  "phone": "+2547XXXXXXX", "delivery_location": "Nakuru Ward 5" }
+```
+`payment_method` ∈ `mpesa | sasapay | buni`. For SasaPay wallet, the response
+may carry `needs_otp: true`; submit the wallet OTP via `/api/mpesa/process`.
+
+Response:
+```json
+{ "ok": true, "id": 3, "contract_ref": "XMP-881860186165", "requires_payment": true,
+  "simulated": true, "checkout_request_id": "ws_CO_...", "amount": 50000,
+  "total_payable": 50000, "customer_message": "Payment request sent. Approve on your phone." }
+```
+
+**Settlement:** poll `POST /api/mpesa/confirm { checkout_request_id }` until
+`status: "success"`. On success the item stock is decremented, a `sale` stock
+movement is recorded, and the purchase contract is marked `completed`. The buyer
+is never redirected or logged out at any point.
+
+Errors: `404` (item not in cross-catalog), `409` (insufficient stock), `412`
+(buyer has no customer profile), `502` (gateway rejected the request).
+
+---
+
 ## 9. Phone Normalization
 
 Identical `normalizePhone()` in both backends — apply it when supplying `customer.phone`:

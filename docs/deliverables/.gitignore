@@ -1,2 +1,2 @@
-docs/deliverables/*.pdf
-docs/deliverables/md2pdf.py
+*.pdf
+md2pdf.py

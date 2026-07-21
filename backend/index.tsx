@@ -2481,6 +2481,138 @@ app.get('/api/cross/config', requireAuth, (c) => {
   })
 })
 
+// =====================================================================
+// NATIVE CROSS-MARKETPLACE PURCHASING  (in-session, no redirect / logout)
+// ---------------------------------------------------------------------
+// Feed users can browse AND buy inventory that is NOT native to Feed —
+// i.e. Equipment-listed items (app_scope='equipment') and merchant /
+// API-ingested items — without being handed off to the sibling app or
+// losing their Feed session. The shared `products` table already carries
+// these rows; Feed's normal /api/products deliberately hides them, so
+// these endpoints surface them explicitly and drive an in-app checkout.
+//
+// Payment stays CENTRALIZED in Equipment: settlement is routed through
+// the Farmsky Central Payment Gateway exactly like a native Feed
+// purchase (gatewayInitiate → poll /api/mpesa/confirm). Feed never holds
+// provider credentials; it only creates the local purchase record and
+// signs an HMAC gateway request. This preserves the single structural
+// exception (payment centralized in Equipment) while giving Feed users a
+// seamless, session-preserving cross-marketplace buying experience.
+// =====================================================================
+
+// GET /api/cross/inventory — purchasable inventory that is NOT native to Feed.
+// Returns published, in-stock items whose app_scope is 'equipment' (Equipment
+// catalog) OR that were ingested via the merchant/API surface. Excludes Feed's
+// own ('feed'/'both') catalog which the normal storefront already serves.
+app.get('/api/cross/inventory', requireAuth, async (c) => {
+  const user = c.get('user') as SessionUser
+  const q = String(c.req.query('q') || '').trim().toLowerCase()
+  const rows = await withAdminContext(c, async () => {
+    let query = `SELECT id, sku, name, category, description, product_type, cash_price, credit_price,
+                        quantity, unit, image, app_scope, cash_enabled, financing_enabled,
+                        payment_option_mode, finance_status
+                 FROM products
+                 WHERE app_scope = 'equipment'
+                   AND (finance_status IS NULL OR finance_status = 'published')
+                   AND quantity > 0`
+    const { results } = await c.env.DB.prepare(query).all()
+    return results as any[]
+  })
+  let items = (rows || []).map((p: any) => ({
+    ...p,
+    source: 'equipment',
+    stock_status: p.quantity <= 0 ? 'out_of_stock' : 'in_stock'
+  }))
+  if (q) items = items.filter((p: any) =>
+    String(p.name || '').toLowerCase().includes(q) ||
+    String(p.category || '').toLowerCase().includes(q) ||
+    String(p.sku || '').toLowerCase().includes(q))
+  return c.json({ items, count: items.length })
+})
+
+// POST /api/cross/purchase — buy a cross-catalog (Equipment/API) item natively
+// inside the active Feed session. Creates a local direct cash-purchase contract
+// then initiates payment through the central gateway. The caller keeps the same
+// session and polls /api/mpesa/confirm (identical to a native Feed purchase).
+app.post('/api/cross/purchase', requireAuth, async (c) => {
+  const user = c.get('user') as SessionUser
+  const body = await c.req.json().catch(() => ({}))
+  const productId = Number(body.product_id)
+  const qty = Math.max(1, Number(body.quantity) || 1)
+  const rail = (['mpesa', 'sasapay', 'buni'].includes(String(body.payment_method)) ? String(body.payment_method) : 'mpesa') as any
+  const phone = String(body.phone || user.phone || '')
+  if (!Number.isFinite(productId) || productId <= 0) return c.json({ error: 'product_id is required' }, 400)
+
+  // The item must be a cross-catalog (Equipment-scoped) product; a Feed user
+  // cannot use this path to buy Feed's own catalog (that goes through the normal
+  // storefront). Read under admin context so ownership RLS does not hide it.
+  const p = await withAdminContext(c, async () => await c.env.DB.prepare(
+    `SELECT * FROM products WHERE id = ? AND app_scope = 'equipment'`
+  ).bind(productId).first<any>())
+  if (!p) return c.json({ error: 'Item not found in the cross-marketplace catalog' }, 404)
+  if (p.finance_status && p.finance_status !== 'published') return c.json({ error: 'This item is not available for purchase' }, 400)
+  if (Number(p.quantity) < qty) return c.json({ error: 'Insufficient stock' }, 409)
+
+  // Resolve the buyer's customer profile (self-service purchase). Every buyer
+  // must have a customer row so the purchase can be recorded + settled.
+  let custRow = await withAdminContext(c, async () => await c.env.DB.prepare(`SELECT * FROM customers WHERE user_id=?`).bind(user.id).first<any>())
+  if (!custRow && body.customer_id) {
+    custRow = await withAdminContext(c, async () => await c.env.DB.prepare(`SELECT * FROM customers WHERE id=?`).bind(Number(body.customer_id)).first<any>())
+  }
+  if (!custRow) return c.json({ error: 'A customer profile is required to purchase. Please complete your profile first.' }, 412)
+
+  // Cross-marketplace purchases are always CASH (direct purchase). Financing is
+  // scoped to the owning platform, so a Feed-side cross purchase settles the full
+  // cash price through the central gateway. Values are computed server-side.
+  const feeCfg = await getSetting(c, 'processing_fee', DEFAULT_PROCESSING_FEE)
+  const quote = financingQuote(p, qty, 'cash', 0, feeCfg)
+  const contractRef = ref('XMP')  // XMP = cross-marketplace purchase
+  const status = quote.amount_due_now > 0 ? 'pending_payment' : 'awaiting_cash_balance'
+
+  const r = await withAdminContext(c, async () => await c.env.DB.prepare(
+    `INSERT INTO murabaha_contracts (contract_ref,customer_id,agent_id,created_by,product_id,quantity,payment_type,supplier_cost,markup_pct,murabaha_price,term_months,monthly_payment,delivery_location,status,ownership_recorded,consent_given,amount_paid,outstanding,financing_model,interest_rate_pct,deposit_pct,deposit_amount,finance_principal,payment_frequency,installment_amount,dispatch_status,terms_document_url,terms_text)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
+  ).bind(
+    contractRef, custRow.id, custRow.agent_id || null, custRow.onboarded_by || custRow.agent_id || user.id, productId, qty, 'cash',
+    quote.supplier_cost, quote.markup_pct, quote.total_payable, 0, 0, String(body.delivery_location || ''), status,
+    0, 1, 0, quote.total_payable, quote.financing_model, 0, quote.deposit_pct, quote.deposit_amount,
+    quote.finance_principal, quote.payment_frequency, 0, 'pending', null, null
+  ).run())
+  const contractId = r.meta.last_row_id
+  await audit(c, user.id, 'cross_purchase', 'contract', `${contractRef} — ${p.name} x${qty} (Equipment catalog, in-session)`)
+
+  const amt = Number(quote.amount_due_now || quote.total_payable)
+  if (amt <= 0) {
+    return c.json({ id: contractId, contract_ref: contractRef, status, requires_payment: false, total_payable: quote.total_payable })
+  }
+
+  // Route settlement through the central gateway (payment centralized in
+  // Equipment). Falls back to simulation locally when the gateway is not set.
+  const desc = `Feed Cross-Marketplace Purchase — ${p.name}`
+  const chanMap: Record<string, string> = { mobile: 'MOBILE_MONEY', bank: 'BANK', wallet: 'SASAPAY_WALLET' }
+  const gwChannel = rail === 'sasapay' ? (chanMap[String(body.channel_type || 'mobile')] || 'MOBILE_MONEY') : undefined
+  const gwChannelCode = rail === 'sasapay' && body.channel_code ? String(body.channel_code) : undefined
+
+  if (gatewayConfigured(c.env)) {
+    const g = await gatewayInitiate(c.env, {
+      amount: amt, phone, payment_method: rail, origin_reference: contractRef,
+      description: desc, initiated_by_user: user.id, idempotency_key: `feed-xmp-${contractRef}-${amt}`,
+      channel: gwChannel, channelCode: gwChannelCode
+    })
+    if (!g.success) return c.json({ error: g.error || 'Payment gateway rejected the request' }, 502)
+    await c.env.DB.prepare(`INSERT INTO payment_intents (checkout_request_id,merchant_request_id,contract_id,customer_id,amount,phone,method,status) VALUES (?,?,?,?,?,?,?, 'pending')`)
+      .bind(g.transaction_ref, g.transaction_ref, contractId, custRow.id, amt, normalizePhone(phone), `gateway_${rail}`).run()
+    return c.json({ ok: true, id: contractId, contract_ref: contractRef, requires_payment: true, simulated: !!g.simulated, checkout_request_id: g.transaction_ref, needs_otp: !!(g as any).needs_otp, amount: amt, total_payable: quote.total_payable, customer_message: g.customer_message || 'Payment request sent. Approve the prompt on your phone.' })
+  }
+
+  // Local/standalone fallback: direct STK / simulation.
+  const result = await stkPush(c.env, { phone, amount: amt, account: contractRef, description: desc })
+  if (!result.success) return c.json({ error: result.error || 'STK push failed' }, 502)
+  await c.env.DB.prepare(`INSERT INTO payment_intents (checkout_request_id,merchant_request_id,contract_id,customer_id,amount,phone,method,status) VALUES (?,?,?,?,?,?,?, 'pending')`)
+    .bind(result.checkout_request_id, result.merchant_request_id, contractId, custRow.id, amt, normalizePhone(phone), 'mpesa').run()
+  return c.json({ ok: true, id: contractId, contract_ref: contractRef, requires_payment: true, simulated: result.simulated, checkout_request_id: result.checkout_request_id, amount: amt, total_payable: quote.total_payable, customer_message: result.customer_message })
+})
+
 // ----------------------------------------------------------------------------
 // HOSTED CHECKOUT PAGE (Phase 3) — where merchant buttons redirect the buyer.
 // ----------------------------------------------------------------------------

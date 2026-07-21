@@ -198,6 +198,56 @@ The app sets session context through the `PostgresStatement.setContext()` path i
 
 ---
 
+## 5b. Full Feature-Parity Port (Equipment as Core Platform)
+
+Equipment is designated the **core platform application** and must encompass the
+complete UI/feature set available across platforms. The 19 Feed-unique features
+were ported into Equipment so it is a strict superset (the single allowed
+structural difference remains **payment centralized in Equipment**).
+
+**Ported migrations** (renumbered on the Equipment side):
+- `0016_system_backups.sql` — automated + on-demand system backups (`system_backups`).
+- `0017_bulk_import.sql` — bulk user-data upload (`import_batches`, `import_rows`).
+- `0018_contract_controls_and_amendments.sql` — contract edit/cancel controls, conditional deletion, uniqueness, and profile amendments (`profile_amendments`).
+- `0019_password_lifecycle.sql` — temp-password lifecycle columns on `users` (`must_change_password`, `is_temp_password`, `temp_password_expires_at`, `created_by`).
+
+All four new tables were registered in `db-init.ts` `SERIAL_TABLES` and
+`db-postgres.ts` `TABLES_WITH_NUMERIC_ID` (so the PostgreSQL shim appends
+`RETURNING id`).
+
+**Ported backend routes** (Equipment): profile-amendments (submit / mine /
+list / decide), backups (list / run / download / run-auto), bulk imports
+(upload / list / detail / row-fix / dispatch), contract controls
+(`PUT /api/murabaha/:id`, `POST /api/murabaha/:id/cancel`), unified onboarding
+OTP + admin-reset (`/api/onboard/request-otp`, `/api/onboard/request-reset`),
+temp-password login lifecycle, and `me/password` clearing the temp flags.
+
+**Ported frontend** (Equipment `app.js`): new nav entries + views
+(`amendments`, `imports`, `backups`), the profile amendment-request form +
+`loadMyAmendments`, and the mandatory first-login **change-password** /
+**temp-password-expired** flows (`renderForceChangePassword`, `renderTempExpired`).
+
+## 5c. Native Cross-Marketplace Purchasing (Feed)
+
+Closes the observed flow gap: Feed users can now **buy Equipment-listed and
+API-ingested inventory natively inside their active Feed session** — with no
+redirect to the sibling app and no logout.
+
+- `GET /api/cross/inventory` — surfaces published, in-stock `app_scope='equipment'`
+  items (excluded from Feed's own storefront) with keyword search.
+- `POST /api/cross/purchase` — creates a local direct **cash** purchase record for
+  the cross-catalog item, then initiates settlement **through the Farmsky Central
+  Payment Gateway** (payment stays centralized in Equipment). Returns a
+  `checkout_request_id` the client polls via `/api/mpesa/confirm`, exactly like a
+  native purchase.
+- New Feed frontend **"Equipment Marketplace"** view (customers + agents):
+  browse → in-modal buy → STK/OTP → in-session confirmation. The session cookie
+  is never touched; the buyer stays signed in throughout.
+- On settlement: item stock is decremented, a `sale` stock movement is recorded,
+  and the purchase contract is marked `completed`.
+
+---
+
 ## 6. Security Model
 
 ### 6.1 HMAC-SHA256 signing scheme (shared, identical in both apps)
