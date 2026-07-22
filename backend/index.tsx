@@ -16,7 +16,7 @@ import { sendSms, smsConfigured, generateOtp } from './sms'
 import { sendEmail, emailConfigured } from './email'
 import { hashPassword, verifyPassword, isHashed } from './password'
 import { initiatePayment as gatewayInitiate, getPaymentStatus as gatewayStatus, processPayment as gatewayProcess, payoutPayment as gatewayPayout, gatewayConfigured } from './payment-gateway-client'
-import { validateImageDataUrl, validateText, validateTextFields } from './upload-validation'
+import { validateImageDataUrl, validateDocDataUrl, validateText, validateTextFields } from './upload-validation'
 import merchantApi from './merchant-api'
 import { mintHandoffToken, verifyHandoffToken } from './cross-app'
 
@@ -935,8 +935,28 @@ app.get('/api/products', requireAuth, async (c) => {
 app.post('/api/products', requireAuth, requirePermission('can_manage_inventory'), async (c) => {
   const user = c.get('user') as SessionUser
   const canFinance = hasPermission(user, 'can_manage_finance_settings')
-  const p = normalizeProductPayload(await c.req.json())
+  let raw: any
+  try { raw = await c.req.json() } catch (_) { return c.json({ error: 'Invalid request body' }, 400) }
+  const p = normalizeProductPayload(raw)
   if (!p.sku || !p.name) return c.json({ error: 'SKU and name are required' }, 400)
+  // Numeric sanity — never let NaN / negatives reach the NOT NULL money columns.
+  if (!(p.buying_price >= 0) || !(p.cash_price >= 0) || !(p.credit_price >= 0)) {
+    return c.json({ error: 'Prices must be valid non-negative numbers.' }, 400)
+  }
+  // Validate the (optional) product image.
+  if (p.image) {
+    const iv = validateImageDataUrl(p.image, { allowEmpty: true })
+    if (!iv.ok) return c.json({ error: iv.error || 'Invalid image.' }, 400)
+  }
+  // Validate any uploaded agreement / financing documents (PDF or image, <=8MB).
+  for (const [field, label] of [['cash_terms_doc_url', 'Cash agreement document'], ['financing_terms_doc_url', 'Financing agreement document']] as const) {
+    const dv = validateDocDataUrl((p as any)[field], { allowEmpty: true })
+    if (!dv.ok) return c.json({ error: `${label}: ${dv.error}` }, 400)
+  }
+  // Fail fast on a duplicate SKU with a clear 409 instead of an opaque 500 from
+  // the products_sku UNIQUE constraint.
+  const dup = await withAdminContext(c, async () => await c.env.DB.prepare(`SELECT id FROM products WHERE sku = ?`).bind(p.sku).first<any>())
+  if (dup) return c.json({ error: `A product with SKU "${p.sku}" already exists. Use a unique SKU.` }, 409)
   // Enforce the split at the app layer too (defence-in-depth alongside the RLS trigger).
   let financeStatus = 'published'
   if (!canFinance) {
@@ -950,18 +970,25 @@ app.post('/api/products', requireAuth, requirePermission('can_manage_inventory')
     financeStatus = 'pending_finance'
   }
   const financeSetBy = canFinance ? user.id : null
-  const r = await c.env.DB.prepare(
-    `INSERT INTO products (sku,name,category,description,product_type,supplier_id,buying_price,cash_markup_pct,credit_markup_pct,cash_price,credit_price,quantity,unit,reorder_threshold,image,cash_enabled,financing_enabled,payment_option_mode,financing_model,financing_interest_pct,financing_frequency,financing_term_min_months,financing_term_max_months,cash_deposit_pct,financing_deposit_pct,cash_terms_text,financing_terms_text,cash_terms_doc_url,financing_terms_doc_url,transunion_product_code,created_by,finance_status,finance_set_by)
-     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
-  ).bind(
-    p.sku, p.name, p.category, p.description, p.product_type, p.supplier_id, p.buying_price, p.cash_markup_pct, p.credit_markup_pct,
-    p.cash_price, p.credit_price, p.quantity, p.unit, p.reorder_threshold, p.image, p.cash_enabled, p.financing_enabled,
-    p.payment_option_mode, p.financing_model, p.financing_interest_pct, p.financing_frequency, p.financing_term_min_months,
-    p.financing_term_max_months, p.cash_deposit_pct, p.financing_deposit_pct, p.cash_terms_text, p.financing_terms_text,
-    p.cash_terms_doc_url, p.financing_terms_doc_url, p.transunion_product_code, user.id, financeStatus, financeSetBy
-  ).run()
-  await audit(c, user.id, 'create', 'product', `${p.name} (${financeStatus})`)
-  return c.json({ id: r.meta.last_row_id, finance_status: financeStatus })
+  try {
+    const r = await c.env.DB.prepare(
+      `INSERT INTO products (sku,name,category,description,product_type,supplier_id,buying_price,cash_markup_pct,credit_markup_pct,cash_price,credit_price,quantity,unit,reorder_threshold,image,cash_enabled,financing_enabled,payment_option_mode,financing_model,financing_interest_pct,financing_frequency,financing_term_min_months,financing_term_max_months,cash_deposit_pct,financing_deposit_pct,cash_terms_text,financing_terms_text,cash_terms_doc_url,financing_terms_doc_url,transunion_product_code,created_by,finance_status,finance_set_by)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
+    ).bind(
+      p.sku, p.name, p.category, p.description, p.product_type, p.supplier_id, p.buying_price, p.cash_markup_pct, p.credit_markup_pct,
+      p.cash_price, p.credit_price, p.quantity, p.unit, p.reorder_threshold, p.image, p.cash_enabled, p.financing_enabled,
+      p.payment_option_mode, p.financing_model, p.financing_interest_pct, p.financing_frequency, p.financing_term_min_months,
+      p.financing_term_max_months, p.cash_deposit_pct, p.financing_deposit_pct, p.cash_terms_text, p.financing_terms_text,
+      p.cash_terms_doc_url, p.financing_terms_doc_url, p.transunion_product_code, user.id, financeStatus, financeSetBy
+    ).run()
+    await audit(c, user.id, 'create', 'product', `${p.name} (${financeStatus})`)
+    return c.json({ id: r.meta.last_row_id, finance_status: financeStatus })
+  } catch (err: any) {
+    const msg = String(err?.message || err || '')
+    if (/unique|duplicate|sku/i.test(msg)) return c.json({ error: `A product with SKU "${p.sku}" already exists. Use a unique SKU.` }, 409)
+    console.error('product create error:', msg)
+    return c.json({ error: 'Could not save the product. Please check the fields and try again.' }, 500)
+  }
 })
 // Editing core/cash details needs can_manage_inventory. Editing finance columns
 // needs can_manage_finance_settings — if the editor lacks it, the existing
@@ -973,7 +1000,27 @@ app.put('/api/products/:id', requireAuth, requirePermission('can_manage_inventor
   const canFinance = hasPermission(user, 'can_manage_finance_settings')
   const existing = await withAdminContext(c, async () => await c.env.DB.prepare(`SELECT * FROM products WHERE id=?`).bind(id).first<any>())
   if (!existing) return c.json({ error: 'Not found' }, 404)
-  const p = normalizeProductPayload(await c.req.json())
+  let raw: any
+  try { raw = await c.req.json() } catch (_) { return c.json({ error: 'Invalid request body' }, 400) }
+  const p = normalizeProductPayload(raw)
+  // Validate uploads the editor is permitted to change.
+  if (canInv && p.image) {
+    const iv = validateImageDataUrl(p.image, { allowEmpty: true })
+    if (!iv.ok) return c.json({ error: iv.error || 'Invalid image.' }, 400)
+  }
+  if (canInv) {
+    const dv = validateDocDataUrl(p.cash_terms_doc_url, { allowEmpty: true })
+    if (!dv.ok) return c.json({ error: `Cash agreement document: ${dv.error}` }, 400)
+  }
+  if (canFinance) {
+    const dv = validateDocDataUrl(p.financing_terms_doc_url, { allowEmpty: true })
+    if (!dv.ok) return c.json({ error: `Financing agreement document: ${dv.error}` }, 400)
+  }
+  // If the editor is changing the SKU, ensure it doesn't collide with another row.
+  if (canInv && p.sku && p.sku !== existing.sku) {
+    const dup = await withAdminContext(c, async () => await c.env.DB.prepare(`SELECT id FROM products WHERE sku = ? AND id <> ?`).bind(p.sku, id).first<any>())
+    if (dup) return c.json({ error: `A product with SKU "${p.sku}" already exists. Use a unique SKU.` }, 409)
+  }
   // Choose which columns the editor is allowed to change.
   const coreCols = canInv ? {
     sku: p.sku, name: p.name, category: p.category, description: p.description, product_type: p.product_type,
@@ -1001,17 +1048,24 @@ app.put('/api/products/:id', requireAuth, requirePermission('can_manage_inventor
     transunion_product_code: existing.transunion_product_code,
     payment_option_mode: existing.payment_option_mode, finance_status: existing.finance_status, finance_set_by: existing.finance_set_by
   }
-  await c.env.DB.prepare(
-    `UPDATE products SET sku=?, name=?, category=?, description=?, product_type=?, buying_price=?, cash_markup_pct=?, credit_markup_pct=?, cash_price=?, credit_price=?, quantity=?, unit=?, reorder_threshold=?, image=COALESCE(?, image), cash_enabled=?, financing_enabled=?, payment_option_mode=?, financing_model=?, financing_interest_pct=?, financing_frequency=?, financing_term_min_months=?, financing_term_max_months=?, cash_deposit_pct=?, financing_deposit_pct=?, cash_terms_text=?, financing_terms_text=?, cash_terms_doc_url=?, financing_terms_doc_url=?, transunion_product_code=?, finance_status=?, finance_set_by=?, finance_set_at=CASE WHEN ?='published' THEN CURRENT_TIMESTAMP ELSE finance_set_at END WHERE id=?`
-  ).bind(
-    coreCols.sku, coreCols.name, coreCols.category, coreCols.description, coreCols.product_type, coreCols.buying_price, coreCols.cash_markup_pct, finCols.credit_markup_pct,
-    coreCols.cash_price, finCols.credit_price, coreCols.quantity, coreCols.unit, coreCols.reorder_threshold, coreCols.image || null, coreCols.cash_enabled, finCols.financing_enabled,
-    finCols.payment_option_mode, finCols.financing_model, finCols.financing_interest_pct, finCols.financing_frequency, finCols.financing_term_min_months,
-    finCols.financing_term_max_months, coreCols.cash_deposit_pct, finCols.financing_deposit_pct, coreCols.cash_terms_text, finCols.financing_terms_text,
-    coreCols.cash_terms_doc_url, finCols.financing_terms_doc_url, finCols.transunion_product_code, finCols.finance_status, finCols.finance_set_by, finCols.finance_status, id
-  ).run()
-  await audit(c, user.id, 'update', 'product', `${coreCols.name}${canFinance ? '' : ' (core only)'}`)
-  return c.json({ ok: true })
+  try {
+    await c.env.DB.prepare(
+      `UPDATE products SET sku=?, name=?, category=?, description=?, product_type=?, buying_price=?, cash_markup_pct=?, credit_markup_pct=?, cash_price=?, credit_price=?, quantity=?, unit=?, reorder_threshold=?, image=COALESCE(?, image), cash_enabled=?, financing_enabled=?, payment_option_mode=?, financing_model=?, financing_interest_pct=?, financing_frequency=?, financing_term_min_months=?, financing_term_max_months=?, cash_deposit_pct=?, financing_deposit_pct=?, cash_terms_text=?, financing_terms_text=?, cash_terms_doc_url=?, financing_terms_doc_url=?, transunion_product_code=?, finance_status=?, finance_set_by=?, finance_set_at=CASE WHEN ?='published' THEN CURRENT_TIMESTAMP ELSE finance_set_at END WHERE id=?`
+    ).bind(
+      coreCols.sku, coreCols.name, coreCols.category, coreCols.description, coreCols.product_type, coreCols.buying_price, coreCols.cash_markup_pct, finCols.credit_markup_pct,
+      coreCols.cash_price, finCols.credit_price, coreCols.quantity, coreCols.unit, coreCols.reorder_threshold, coreCols.image || null, coreCols.cash_enabled, finCols.financing_enabled,
+      finCols.payment_option_mode, finCols.financing_model, finCols.financing_interest_pct, finCols.financing_frequency, finCols.financing_term_min_months,
+      finCols.financing_term_max_months, coreCols.cash_deposit_pct, finCols.financing_deposit_pct, coreCols.cash_terms_text, finCols.financing_terms_text,
+      coreCols.cash_terms_doc_url, finCols.financing_terms_doc_url, finCols.transunion_product_code, finCols.finance_status, finCols.finance_set_by, finCols.finance_status, id
+    ).run()
+    await audit(c, user.id, 'update', 'product', `${coreCols.name}${canFinance ? '' : ' (core only)'}`)
+    return c.json({ ok: true })
+  } catch (err: any) {
+    const msg = String(err?.message || err || '')
+    if (/unique|duplicate|sku/i.test(msg)) return c.json({ error: `A product with SKU "${coreCols.sku}" already exists. Use a unique SKU.` }, 409)
+    console.error('product update error:', msg)
+    return c.json({ error: 'Could not update the product. Please check the fields and try again.' }, 500)
+  }
 })
 app.delete('/api/products/:id', requireAuth, requireRole('admin', 'super_admin'), async (c) => {
   const id = c.req.param('id')

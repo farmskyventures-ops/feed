@@ -99,6 +99,53 @@ export function validateImageDataUrl(value: unknown, opts: { allowEmpty?: boolea
   return { ok: true }
 }
 
+// Allowed document MIME types for financing / cash agreement uploads: the
+// allowed raster images PLUS PDF. Docs may also be an https:// link.
+const ALLOWED_DOC_MIME = [...ALLOWED_IMAGE_MIME, 'application/pdf']
+// Max decoded document size (8 MB).
+const MAX_DOC_BYTES = 8 * 1024 * 1024
+const MAX_DOC_URL_CHARS = Math.ceil((MAX_DOC_BYTES * 4) / 3) + 128
+
+/**
+ * Validate a user-supplied agreement/financing document. Accepts EITHER an
+ * https:// link OR a base64 data URL that is an allowed image or a PDF, whose
+ * payload matches the declared magic bytes (rejects HTML/script disguised as a
+ * PDF). Used for cash_terms_doc_url / financing_terms_doc_url.
+ */
+export function validateDocDataUrl(value: unknown, opts: { allowEmpty?: boolean } = {}): ImageValidationResult {
+  if (value === null || value === undefined || value === '') {
+    return opts.allowEmpty === false ? { ok: false, error: 'A document is required.' } : { ok: true }
+  }
+  if (typeof value !== 'string') return { ok: false, error: 'Invalid document value.' }
+  const v = value.trim()
+
+  // Allow a plain https link to an externally-hosted document.
+  if (/^https:\/\/[^\s]+$/i.test(v)) return { ok: true }
+
+  const m = v.match(/^data:([a-z0-9.+/-]+);base64,([A-Za-z0-9+/=\s]+)$/i)
+  if (!m) return { ok: false, error: 'Document must be a PDF or image under 8 MB, or an https link.' }
+
+  const mime = m[1].toLowerCase()
+  if (!ALLOWED_DOC_MIME.includes(mime)) {
+    return { ok: false, error: 'Agreement document must be a PDF or image (PNG, JPEG, WEBP, GIF) under 8 MB.' }
+  }
+  if (v.length > MAX_DOC_URL_CHARS) {
+    return { ok: false, error: 'Document is too large (max 8 MB).' }
+  }
+  const b64 = m[2].replace(/\s+/g, '')
+  if (!b64 || b64.length % 4 !== 0) return { ok: false, error: 'The document data is corrupt.' }
+
+  const bytes = decodePrefix(b64, 12)
+  if (bytes.length < 4) return { ok: false, error: 'That file is not a valid document.' }
+  const isPdf = bytes[0] === 0x25 && bytes[1] === 0x50 && bytes[2] === 0x44 && bytes[3] === 0x46 // %PDF
+  if (mime === 'application/pdf') {
+    if (!isPdf) return { ok: false, error: 'That file is not a valid PDF.' }
+  } else if (!magicMatches(mime, bytes)) {
+    return { ok: false, error: 'That file is not a valid image.' }
+  }
+  return { ok: true }
+}
+
 // Patterns that strongly indicate an injection / code payload rather than a
 // legitimate name / address / note. Used as a screen for free-text fields.
 const INJECTION_PATTERNS: RegExp[] = [
