@@ -3297,7 +3297,7 @@ async function viewProfile() {
       <!-- FEATURE 4: Amendment request for locked identity fields -->
       <div class="card p-6">
         <h3 class="font-bold text-slate-800 mb-1"><i class="fas fa-id-card-clip text-amber-600 mr-2"></i>Request National ID / Phone Change</h3>
-        <p class="text-xs text-slate-500 mb-4">Your <b>National ID</b> and <b>Phone number</b> are locked. To change them, submit a request below with a reason. An administrator will review and approve or reject it.</p>
+        <p class="text-xs text-slate-500 mb-4">To Change <b>National ID</b> and <b>Phone number</b>.Submit a request below with a reason. We will review and approve.</p>
         <div id="amendStatus" class="mb-3"></div>
         <div class="responsive-grid cols-2 text-sm">
           ${isFarmer ? `<div><label class="field-label">New National ID</label><input id="am_national_id" placeholder="Leave blank to keep current" class="px-3 py-2 border rounded-lg w-full"></div>` : ''}
