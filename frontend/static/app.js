@@ -3273,7 +3273,7 @@ async function viewProfile() {
       <!-- Farmer data (National ID & Phone locked) -->
       <div class="card p-6">
         <h3 class="font-bold text-slate-800 mb-1"><i class="fas fa-leaf text-teal-600 mr-2"></i>My Farmer Profile</h3>
-        <p class="text-xs text-slate-500 mb-4">You can update your details below. Your <b>National ID</b> and <b>Phone number</b> cannot be changed — contact an administrator if these need updating.</p>
+        <p class="text-xs text-slate-500 mb-4">You can update your details below. For <b>National ID</b> and <b>Phone number</b> Request updates.</p>
         <div class="responsive-grid cols-2 text-sm">
           <div><label class="field-label">Full name</label><input id="pf_name" value="${esc(c?.full_name || u.full_name || '')}" class="px-3 py-2 border rounded-lg"></div>
           <div><label class="field-label">National ID <span class="text-slate-400">(locked)</span></label><input value="${esc(c?.national_id || '')}" disabled class="px-3 py-2 border rounded-lg bg-slate-100 text-slate-500"></div>
