@@ -248,6 +248,58 @@ redirect to the sibling app and no logout.
 
 ---
 
+## 5d. App Synchronization & Shared-Central-DB Alignment (Feed ⇄ Equipment)
+
+Feed has been fully aligned with the latest Equipment (core platform / **central
+payment processing hub**) updates so that **both apps can run against ONE shared
+central PostgreSQL database** — the same database on which the Farmsky Score
+platform creates a **UUID-keyed `users` table**. Payment processing remains
+centralized in Equipment; this alignment is schema/runtime resilience only.
+
+**Migrations ported into Feed (idempotent, SQLite-dialect → transformed):**
+
+| Feed migration | Purpose |
+|----------------|---------|
+| `0000_normalize_boolean_flags` | Runs FIRST. Converts legacy BOOLEAN flag columns (`otp_codes.consumed`, `products.*_enabled`, `users.is_temp_password`, …) to INTEGER 1/0 so app binds + `WHERE consumed=0` never hit `operator does not exist: boolean = integer`. |
+| `0019_demo_accounts_kyc_uniqueness` | Feed demo phones, `customers.kyc_completed_at` + `liveliness_passed` KYC gating, `national_id` partial-unique index. Integer-id UPDATEs guarded behind a users.id type check (skipped on a UUID DB). |
+| `0020_product_taxonomy_and_source` | `products.source_platform` / `marketplace` / `subcategory` for cross-marketplace tagging on the shared products table. |
+| `0021_score_platform` | Dedicated Score tables (`score_subscriptions`, `score_verifications`, `score_iprs_checks`, `score_credit_evaluations`) + `score` app_clients row so the central gateway accepts Score subscription payments. |
+| `0022_ensure_users_columns` | Defensive `ADD COLUMN IF NOT EXISTS` for every column Feed writes to `users` — converges the schema even when a sibling app created `users` first. |
+| `0023_sessions_user_id_text` | Widens `sessions.user_id` + `audit_logs.user_id` to TEXT so a session can hold an INTEGER **or** UUID user id. |
+| `0024_userref_columns_text` | Widens auth-path user-reference columns (`customers.user_id`/`agent_id`, `agents.user_id`, `change_requests.requester_id`) to TEXT. |
+| `0025_all_userref_columns_text` | Dynamically widens EVERY remaining user-reference column (wallet, ledger, murabaha, imports, amendments, `*_by`) to TEXT, with an explicit non-user-FK exclude set. |
+| `0026_ensure_superadmin` | Guarantees Feed's own Super-Admin (`2547500000`) exists — id-type-agnostic, attaches an `org_id` tenant when the shared DB requires it. Coexists with Equipment's Super-Admin. |
+
+**Runtime alignment (`backend/`):**
+
+- **`db-init.ts`** — dollar-quote / quote / comment-aware statement splitter
+  (so PL/pgSQL `DO $$…$$` blocks in the new migrations are not shredded);
+  **strips cross-type `REFERENCES users(id)` FKs** from `CREATE TABLE` bodies
+  (a UUID users table would otherwise reject the whole statement, dropping core
+  tables); **two-level resilience** (a single incompatible statement is logged +
+  skipped so the rest of the file/chain still runs). Feed's **RLS-aware
+  sequence-sync is preserved** (Feed uses FORCE ROW LEVEL SECURITY).
+- **`db-postgres.ts`** — `last_row_id` returns the raw UUID string when the
+  inserted id is not numeric (so cross-table FKs still resolve on a UUID DB).
+- **`index.tsx`** — session join uses `CAST(u.id AS TEXT) = s.user_id`;
+  `getSessionUser` exposes `id` as a string + resolves `org_id`; all four user
+  INSERT paths (self-signup, agent create, user create, bulk import) attach an
+  `org_id` when the shared `users.org_id NOT NULL` column is present
+  (`usersHasOrgId` / `resolveCreatorOrgId` / `resolveDefaultOrgId`).
+- **`cross-app.ts`** — the SSO handoff token now carries the originating
+  `email` / `name` / `role` and an authoritative `super_admin` assertion.
+- **`server.ts` / `types.ts`** — new env wired into the hand-built Node ENV
+  (`SCORE_APP_URL`, `DB_SCHEMA`, `EQUIPMENT_ORG_ID`, `DEFAULT_ORG_ID`,
+  `BACKUP_EMAIL_TO`, `BACKUP_NOTIFY_EMAIL`, `ADMIN_TASK_TOKEN`,
+  `INTERNAL_SCHEDULER_NONCE`). Feed keeps its gateway-**client** env
+  (`FARMSKY_PAYMENTS_*`) — it never holds provider credentials.
+
+**Verified on both DB shapes** (see §9): a standalone integer-keyed Feed DB and a
+Score-style **UUID-keyed shared DB** (login, session, self-signup and admin user
+creation all succeed; both Super-Admins coexist; all user-ref columns TEXT).
+
+---
+
 ## 6. Security Model
 
 ### 6.1 HMAC-SHA256 signing scheme (shared, identical in both apps)
@@ -280,20 +332,37 @@ signature = HMAC_SHA256_hex(secret, canonical)
 
 | Variable | Both / App | Purpose |
 |----------|-----------|---------|
-| `DATABASE_URL` | both | PostgreSQL connection string |
+| `DATABASE_URL` | both | PostgreSQL connection string (may point at the **shared central DB**) |
 | `SESSION_SECRET` | both | session token secret |
 | `APP_TYPE` | both | `equipment` \| `feed` — data-scope + payment-host context |
 | `PUBLIC_BASE_URL` | both | this app's public origin (hosted checkout URLs) |
 | `CROSS_APP_URL` | both | sibling app origin (cross-nav target) |
 | `CROSS_APP_HMAC_SECRET` | both | shared secret for cross-app SSO handoff (**must match** on both apps) |
-| `AUTH_HASH_ITERATIONS` | both | PBKDF2 rounds (**must match** on both apps) |
-| `AUTH_HASH_KEYLEN` | both | derived key length in bytes (**must match**) |
+| `SCORE_APP_URL` | both | Farmsky Score app origin (cross-nav / score platform) |
+| `AUTH_HASH_ITERATIONS` | both | PBKDF2 rounds — default `210000` (**must match** on both apps) |
+| `AUTH_HASH_KEYLEN` | both | derived key length in bytes — default `32` (**must match**) |
 | `AUTH_PEPPER` | both | server-side pepper (**must match**) |
-| `MPESA_*`, `SASAPAY_*`, `BUNI_*` | Equipment | payment provider credentials |
+| **Shared-central-DB alignment** | | |
+| `DB_SCHEMA` | both | Postgres schema to use when sharing one central DB (default `public`) |
+| `EQUIPMENT_ORG_ID` | both | preferred `org_id` (UUID) assigned to new users on the shared multitenant DB |
+| `DEFAULT_ORG_ID` | both | fallback `org_id` (UUID) when `EQUIPMENT_ORG_ID` is unset; else most-populated / oldest org is used |
+| **Central payment gateway (Feed = client, Equipment = host)** | | |
+| `FARMSKY_PAYMENTS_URL` | Feed | Equipment payment-hub base URL (gateway host) |
+| `FARMSKY_PAYMENTS_KEY` | Feed | Feed's merchant API key issued by the Equipment hub |
+| `FARMSKY_PAYMENTS_SECRET` | Feed | HMAC secret for signing gateway requests to Equipment |
+| `MPESA_*`, `SASAPAY_*`, `BUNI_*` | Equipment | payment provider credentials (**Equipment only** — Feed never holds these) |
+| **Automated backups** | | |
+| `BACKUP_EMAIL_TO` | both | recipient for automated DB backup archives |
+| `BACKUP_NOTIFY_EMAIL` | both | recipient for backup success/failure notifications |
+| `ADMIN_TASK_TOKEN` | both | bearer token guarding `/api/backups/run-auto` and admin task routes |
 | `SMS_*`, `EMAIL_*` | both | notification providers |
 | `TRANSUNION_*` | both | KYC / credit check |
 
 > **Critical:** `CROSS_APP_HMAC_SECRET`, `AUTH_HASH_ITERATIONS`, `AUTH_HASH_KEYLEN` and `AUTH_PEPPER` must be configured with **identical values** on both platforms, otherwise cross-app SSO and password portability break.
+>
+> **Payment centralization:** The Equipment app is the sole payment-processing hub. Feed carries only the `FARMSKY_PAYMENTS_*` gateway-**client** variables and never holds provider credentials (`MPESA_*`, `SASAPAY_*`, `BUNI_*`). This preserves the architecture where *"this marketplace also processes payments from all other apps."*
+>
+> **Shared central DB:** When Feed, Equipment and Farmsky Score run against one Postgres DB, the `users` table is UUID-keyed with a mandatory `org_id`. Set `EQUIPMENT_ORG_ID` / `DEFAULT_ORG_ID` so new Feed users are attached to the correct tenant; leave them unset for standalone (integer-id) operation.
 
 ---
 

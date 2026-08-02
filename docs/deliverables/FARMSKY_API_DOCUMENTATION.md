@@ -198,10 +198,13 @@ Lets a signed-in user cross between Equipment and Feed with **no second login** 
 
 ### Token format (`backend/cross-app.ts`)
 ```
-body  = base64url( JSON { phone, ts, nonce } )
+body  = base64url( JSON { phone, ts, nonce, email?, name?, role?, super_admin? } )
 token = body + "." + hmacSha256Hex(CROSS_APP_HMAC_SECRET, body)
 ```
-Verified against the shared secret with a **2-minute** TTL.
+Verified against the shared secret with a **2-minute** TTL. The payload now also
+carries optional **identity assertions** — `email`, `name`, `role` and
+`super_admin` — so the receiving app can provision or elevate the matched account
+consistently across the shared central database (aligned with Equipment).
 
 ### 6.1 Mint handoff URL — `GET /api/cross/handoff?target=<app>`
 Auth: session cookie required. Returns a URL into the sibling app:

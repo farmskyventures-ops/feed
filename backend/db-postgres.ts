@@ -100,15 +100,24 @@ class PostgresStatement implements D1StatementLike {
     return { results: result.rows as T[], success: true }
   }
 
-  async run(): Promise<{ success: boolean; meta: { last_row_id: number; changes: number } }> {
+  async run(): Promise<{ success: boolean; meta: { last_row_id: any; changes: number } }> {
     let sql = this.rawSql.trim().replace(/;\s*$/, '')
-    let lastRowId = 0
+    let lastRowId: any = 0
     if (/^insert\s+/i.test(sql) && !/\breturning\b/i.test(sql)) {
       const table = tableNameFromInsert(sql)
       if (table && TABLES_WITH_NUMERIC_ID.has(table)) sql += ' RETURNING id'
     }
     const result = await this.query(sql)
-    if (result.rows?.[0]?.id != null) lastRowId = Number(result.rows[0].id)
+    const rawId = result.rows?.[0]?.id
+    if (rawId != null) {
+      // Normally an INTEGER id → return as a number (D1-compatible). On a shared
+      // central DB the `id` may be a UUID (a sibling app such as Score created the
+      // table); in that case Number(uuid) is NaN, so preserve the raw UUID string
+      // instead so callers that use last_row_id as a foreign key still get a
+      // usable value.
+      const n = Number(rawId)
+      lastRowId = Number.isFinite(n) && String(n) === String(rawId) ? n : rawId
+    }
     return {
       success: true,
       meta: {

@@ -90,7 +90,29 @@ const ENV = {
   // Phase 4 — standardized auth hashing (must match sibling app)
   AUTH_HASH_ITERATIONS: process.env.AUTH_HASH_ITERATIONS,
   AUTH_HASH_KEYLEN: process.env.AUTH_HASH_KEYLEN,
-  AUTH_PEPPER: process.env.AUTH_PEPPER
+  AUTH_PEPPER: process.env.AUTH_PEPPER,
+  // Farmsky Score origin for the cross-app SSO hand-off. Built explicitly here
+  // because the Node server constructs ENV by hand — otherwise undefined at
+  // runtime and score_configured would always be false.
+  SCORE_APP_URL: process.env.SCORE_APP_URL,
+  // Shared-central-DB isolation. When Feed shares ONE Postgres DB with the
+  // Equipment payment hub / Score, DB_SCHEMA lets an operator pin Feed to its
+  // own schema (defence-in-depth). Optional; unset = public schema.
+  DB_SCHEMA: process.env.DB_SCHEMA,
+  // Optional explicit default tenant for user rows created outside an admin
+  // session (public self-signup / bulk import) on the shared central DB where
+  // users.org_id is NOT NULL. Built explicitly because the Node server builds
+  // ENV by hand — otherwise undefined at runtime.
+  EQUIPMENT_ORG_ID: process.env.EQUIPMENT_ORG_ID,
+  DEFAULT_ORG_ID: process.env.DEFAULT_ORG_ID,
+  // Automated backup email delivery (every 6h) + external cron trigger token.
+  // Built explicitly because the Node server constructs ENV by hand.
+  BACKUP_EMAIL_TO: process.env.BACKUP_EMAIL_TO,
+  BACKUP_NOTIFY_EMAIL: process.env.BACKUP_NOTIFY_EMAIL,
+  ADMIN_TASK_TOKEN: process.env.ADMIN_TASK_TOKEN,
+  // Per-boot nonce so the in-process 6h backup scheduler can authorize itself to
+  // POST /api/backups/run-auto without exposing a token. Never leaves the process.
+  INTERNAL_SCHEDULER_NONCE: crypto.randomUUID()
 }
 
 const root = new Hono()

@@ -412,13 +412,80 @@ function financingQuote(p: any, quantity: any, paymentType: string, termMonths: 
     terms_document_url: p.financing_terms_doc_url || null
   }
 }
+// Whether the connected DB's `users` table carries the multitenant `org_id`
+// column. The central farmsky_central_db (shared with the Equipment payment hub
+// + Score) has it as UUID NOT NULL; the Feed-only dev SQLite/D1 shape does not.
+// Cached per-process after the first probe so we only introspect once. On any
+// error (including SQLite where information_schema is absent) we assume the
+// column is NOT present and fall back to org-agnostic inserts.
+let _usersHasOrgId: boolean | null = null
+async function usersHasOrgId(c: any): Promise<boolean> {
+  if (_usersHasOrgId !== null) return _usersHasOrgId
+  try {
+    const r = await c.env.DB.prepare(
+      `SELECT COUNT(*) AS n FROM information_schema.columns WHERE table_name = 'users' AND column_name = 'org_id'`
+    ).first<any>()
+    _usersHasOrgId = Number(r?.n || 0) > 0
+  } catch (_) {
+    _usersHasOrgId = false
+  }
+  return _usersHasOrgId
+}
+
+// Resolve the tenant (org_id) a newly-created user must belong to: the creating
+// admin's org. Prefer the value already on the session; if absent (older
+// session issued before org_id was loaded) re-read it from the DB.
+async function resolveCreatorOrgId(c: any, creator: SessionUser | null): Promise<string | null> {
+  if (!creator) return null
+  if ((creator as any).org_id != null && (creator as any).org_id !== '') return String((creator as any).org_id)
+  if (!(await usersHasOrgId(c))) return null
+  try {
+    const o = await c.env.DB.prepare(`SELECT org_id FROM users WHERE CAST(id AS TEXT) = ?`).bind(String(creator.id)).first<any>()
+    return o?.org_id != null ? String(o.org_id) : null
+  } catch (_) { return null }
+}
+
+// A process-cached fallback tenant for user rows created OUTSIDE an admin session
+// (public self-signup, and any admin-created row whose creator somehow lacks an
+// org). The central farmsky_central_db enforces users.org_id NOT NULL, so these
+// paths MUST supply one. Preference order:
+//   1. EQUIPMENT_ORG_ID / DEFAULT_ORG_ID env (explicit operator override), then
+//   2. the most-populated existing org (mode of users.org_id), then
+//   3. the oldest organizations row.
+// Returns null only on a DB shape without the org_id column (dev SQLite/D1),
+// where the INSERT omits the column entirely.
+let _defaultOrgId: string | null | undefined = undefined
+async function resolveDefaultOrgId(c: any): Promise<string | null> {
+  if (_defaultOrgId !== undefined) return _defaultOrgId
+  if (!(await usersHasOrgId(c))) { _defaultOrgId = null; return null }
+  const envOrg = (c.env?.EQUIPMENT_ORG_ID || c.env?.DEFAULT_ORG_ID || '').trim()
+  if (envOrg) { _defaultOrgId = envOrg; return envOrg }
+  // Most common org among existing users — the natural tenant for this deployment.
+  try {
+    const r = await c.env.DB.prepare(
+      `SELECT org_id, COUNT(*) AS n FROM users WHERE org_id IS NOT NULL GROUP BY org_id ORDER BY n DESC LIMIT 1`
+    ).first<any>()
+    if (r?.org_id != null) { _defaultOrgId = String(r.org_id); return _defaultOrgId }
+  } catch (_) {}
+  // Fall back to the oldest organization on record.
+  try {
+    const r = await c.env.DB.prepare(`SELECT id FROM organizations ORDER BY created_at ASC LIMIT 1`).first<any>()
+    if (r?.id != null) { _defaultOrgId = String(r.id); return _defaultOrgId }
+  } catch (_) {}
+  _defaultOrgId = null
+  return null
+}
+
 async function getSessionUser(c: any): Promise<SessionUser | null> {
   const token = getCookie(c, 'session') || c.req.header('Authorization')?.replace('Bearer ', '')
   if (!token) return null
+  // CAST(u.id AS TEXT) = s.user_id so the session join works whether users.id is
+  // an INTEGER (Feed's own schema) or a UUID (shared central DB created by a
+  // sibling app). sessions.user_id is TEXT (migration 0023_sessions_user_id_text).
   const row = await c.env.DB.prepare(
     `SELECT u.id, u.full_name, u.phone, u.email, u.avatar_url, u.role, u.region, u.label, u.permissions, u.status,
             u.schedule_enabled, u.access_days, u.access_start, u.access_end, s.expires_at
-     FROM sessions s JOIN users u ON u.id = s.user_id WHERE s.token = ?`
+     FROM sessions s JOIN users u ON CAST(u.id AS TEXT) = s.user_id WHERE s.token = ?`
   ).bind(token).first<any>()
   if (!row) return null
   if (Number(row.expires_at) < Date.now()) return null
@@ -428,8 +495,21 @@ async function getSessionUser(c: any): Promise<SessionUser | null> {
   const access = checkAccessWindow({ enabled: window.enabled, days: window.days, start: window.start, end: window.end })
   if (!access.allowed) return null
   const fallback = await loadRoleTemplate(c, row.role)
+  // Best-effort tenant scope. Kept as a SEPARATE query so a DB shape without the
+  // multitenant `users.org_id` column (Feed-only SQLite/D1 dev) never fails
+  // authentication — the query is swallowed and org_id stays null there.
+  let orgId: string | null = null
+  if (await usersHasOrgId(c)) {
+    try {
+      const o = await c.env.DB.prepare(`SELECT org_id FROM users WHERE CAST(id AS TEXT) = ?`).bind(String(row.id)).first<any>()
+      orgId = o?.org_id != null ? String(o.org_id) : null
+    } catch (_) { orgId = null }
+  }
   return {
-    id: row.id,
+    org_id: orgId,
+    // Always expose the user id as a STRING so all user-reference columns (now
+    // TEXT on the shared DB) compare correctly regardless of integer/uuid shape.
+    id: String(row.id),
     full_name: row.full_name,
     phone: row.phone,
     email: row.email || null,
@@ -438,7 +518,7 @@ async function getSessionUser(c: any): Promise<SessionUser | null> {
     region: row.region,
     label: row.label || null,
     permissions: parsePermissions(row.permissions, row.role, fallback)
-  }
+  } as any
 }
 // Declare the executing user's identity + capabilities inside the DB session so
 // PostgreSQL Row-Level Security (backend/sql/03_ownership_rls_setup.sql) can
@@ -551,7 +631,9 @@ async function issueTempPassword(
 async function createSession(c: any, user: any) {
   const token = genToken()
   const expires = Date.now() + 1000 * 60 * 60 * 12
-  await c.env.DB.prepare(`INSERT INTO sessions (token, user_id, expires_at) VALUES (?,?,?)`).bind(token, user.id, expires).run()
+  // sessions.user_id is TEXT (migration 0023) so it holds an integer-as-string
+  // or a UUID. Always bind as a string so the value round-trips identically.
+  await c.env.DB.prepare(`INSERT INTO sessions (token, user_id, expires_at) VALUES (?,?,?)`).bind(token, String(user.id), expires).run()
   // Issue 7: mark the session cookie Secure when served over HTTPS so it is
   // never transmitted over a plaintext channel in production.
   const isHttps = (c.req.header('x-forwarded-proto') || '').includes('https') || new URL(c.req.url).protocol === 'https:'
@@ -834,9 +916,18 @@ app.post('/api/signup/verify', async (c) => {
   let userId: any
   try {
   userId = await withAdminContext(c, async () => {
-    const r = await c.env.DB.prepare(
-      `INSERT INTO users (full_name, phone, password, role, status, region, password_set, label, permissions) VALUES (?,?,?, ?, 'active', ?, 1, ?, ?)`
-    ).bind(String(full_name).trim(), p, await hashPassword(String(password)), role, region || null, 'Farmer', JSON.stringify(farmerPerms)).run()
+    // On the shared central DB, users.org_id is NOT NULL. Public self-signup has
+    // no creating admin, so attach the deployment's default tenant. On the
+    // Feed-only DB shape (no org_id column) orgId is null and we omit it.
+    const orgId = await resolveDefaultOrgId(c)
+    const withOrg = (await usersHasOrgId(c)) && orgId != null
+    const r = withOrg
+      ? await c.env.DB.prepare(
+          `INSERT INTO users (full_name, phone, password, role, status, region, password_set, label, permissions, org_id) VALUES (?,?,?, ?, 'active', ?, 1, ?, ?, ?)`
+        ).bind(String(full_name).trim(), p, await hashPassword(String(password)), role, region || null, 'Farmer', JSON.stringify(farmerPerms), orgId).run()
+      : await c.env.DB.prepare(
+          `INSERT INTO users (full_name, phone, password, role, status, region, password_set, label, permissions) VALUES (?,?,?, ?, 'active', ?, 1, ?, ?)`
+        ).bind(String(full_name).trim(), p, await hashPassword(String(password)), role, region || null, 'Farmer', JSON.stringify(farmerPerms)).run()
     const uid = r.meta.last_row_id
     // Create the customer profile with the SAME standard fields an agent captures.
     // KYC stays 'not_started' until ID documents are uploaded (required before financing).
@@ -2763,7 +2854,14 @@ app.post('/api/agents', requireAuth, requireRole('admin', 'super_admin'), async 
   const pwd = provided ? String(b.password) : genPassword()
   const perms = await permissionsForRole(c, 'agent', b.permissions || {})
   const creatorId = c.get('user').id
-  const r = await c.env.DB.prepare(`INSERT INTO users (full_name,phone,email,password,role,region,password_set,label,permissions,created_by) VALUES (?,?,?,?, 'agent', ?, ?, ?, ?, ?)`).bind(b.full_name, p, b.email || null, await hashPassword(pwd), b.region || null, provided, b.label || 'Agent', JSON.stringify(perms), creatorId).run()
+  // On the shared central DB users.org_id is NOT NULL — attach the creating
+  // admin's tenant (falling back to the deployment default). Omitted on the
+  // Feed-only DB shape (no org_id column).
+  const agOrgId = (await resolveCreatorOrgId(c, c.get('user'))) || (await resolveDefaultOrgId(c))
+  const agWithOrg = (await usersHasOrgId(c)) && agOrgId != null
+  const r = agWithOrg
+    ? await c.env.DB.prepare(`INSERT INTO users (full_name,phone,email,password,role,region,password_set,label,permissions,created_by,org_id) VALUES (?,?,?,?, 'agent', ?, ?, ?, ?, ?, ?)`).bind(b.full_name, p, b.email || null, await hashPassword(pwd), b.region || null, provided, b.label || 'Agent', JSON.stringify(perms), creatorId, agOrgId).run()
+    : await c.env.DB.prepare(`INSERT INTO users (full_name,phone,email,password,role,region,password_set,label,permissions,created_by) VALUES (?,?,?,?, 'agent', ?, ?, ?, ?, ?)`).bind(b.full_name, p, b.email || null, await hashPassword(pwd), b.region || null, provided, b.label || 'Agent', JSON.stringify(perms), creatorId).run()
   await c.env.DB.prepare(`INSERT INTO agents (user_id,region,permissions) VALUES (?,?,?)`).bind(r.meta.last_row_id, b.region || null, JSON.stringify(perms)).run()
   await audit(c, creatorId, 'create', 'agent', b.full_name)
   if (provided) return c.json({ id: r.meta.last_row_id, password: pwd, password_was_set_by_admin: true })
@@ -2846,7 +2944,13 @@ app.post('/api/users', requireAuth, requireRole('admin', 'super_admin'), async (
   const schedEnabled = boolInt(b.schedule_enabled, false) ? 1 : 0
   const schedDays = Array.isArray(b.access_days) ? JSON.stringify(b.access_days) : null
   const creatorId = c.get('user').id
-  const r = await c.env.DB.prepare(`INSERT INTO users (full_name, phone, email, password, role, label, permissions, status, region, password_set, schedule_enabled, access_days, access_start, access_end, created_by) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).bind(b.full_name, p, b.email || null, await hashPassword(pwd), b.role, label, JSON.stringify(perms), b.status || 'active', b.region || null, provided, schedEnabled, schedDays, b.access_start || null, b.access_end || null, creatorId).run()
+  // Shared central DB: users.org_id NOT NULL — attach the creating admin's
+  // tenant (fallback to deployment default). Omitted on Feed-only DB shape.
+  const usrOrgId = (await resolveCreatorOrgId(c, c.get('user'))) || (await resolveDefaultOrgId(c))
+  const usrWithOrg = (await usersHasOrgId(c)) && usrOrgId != null
+  const r = usrWithOrg
+    ? await c.env.DB.prepare(`INSERT INTO users (full_name, phone, email, password, role, label, permissions, status, region, password_set, schedule_enabled, access_days, access_start, access_end, created_by, org_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).bind(b.full_name, p, b.email || null, await hashPassword(pwd), b.role, label, JSON.stringify(perms), b.status || 'active', b.region || null, provided, schedEnabled, schedDays, b.access_start || null, b.access_end || null, creatorId, usrOrgId).run()
+    : await c.env.DB.prepare(`INSERT INTO users (full_name, phone, email, password, role, label, permissions, status, region, password_set, schedule_enabled, access_days, access_start, access_end, created_by) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).bind(b.full_name, p, b.email || null, await hashPassword(pwd), b.role, label, JSON.stringify(perms), b.status || 'active', b.region || null, provided, schedEnabled, schedDays, b.access_start || null, b.access_end || null, creatorId).run()
   if (b.role === 'agent') await c.env.DB.prepare(`INSERT INTO agents (user_id,region,permissions) VALUES (?,?,?)`).bind(r.meta.last_row_id, b.region || null, JSON.stringify(perms)).run()
   await audit(c, creatorId, 'create', 'user', `${b.full_name} (${b.role})`)
   if (provided) return c.json({ id: r.meta.last_row_id, password: pwd, password_was_set_by_admin: true })
@@ -3474,7 +3578,7 @@ app.post('/api/backups/run-auto', async (c) => {
   }
   // Fall back to authenticated admin.
   const sessionToken = getCookie(c, 'session')
-  const sess = sessionToken ? await c.env.DB.prepare(`SELECT u.role FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.token=? AND s.expires_at > ?`).bind(sessionToken, Date.now()).first<any>() : null
+  const sess = sessionToken ? await c.env.DB.prepare(`SELECT u.role FROM sessions s JOIN users u ON CAST(u.id AS TEXT)=s.user_id WHERE s.token=? AND s.expires_at > ?`).bind(sessionToken, Date.now()).first<any>() : null
   if (!sess || !['admin', 'super_admin'].includes(sess.role)) return c.json({ error: 'Unauthorized' }, 401)
   const r = await maybeAutoBackup(c)
   return c.json({ ok: true, ...r })
@@ -3641,6 +3745,10 @@ app.post('/api/imports/:id/dispatch', requireAuth, requireRole('admin', 'super_a
   const { results } = await c.env.DB.prepare(`SELECT * FROM import_rows WHERE batch_id=? AND status='valid'`).bind(id).all()
   const rows = (results || []) as any[]
   const creator = c.get('user').id
+  // Shared central DB: users.org_id NOT NULL — resolve the importing admin's
+  // tenant once for the whole batch (fallback to deployment default).
+  const impOrgId = (await resolveCreatorOrgId(c, c.get('user'))) || (await resolveDefaultOrgId(c))
+  const impWithOrg = (await usersHasOrgId(c)) && impOrgId != null
   let created = 0, skipped = 0
   const errors: string[] = []
   for (const row of rows) {
@@ -3652,10 +3760,14 @@ app.post('/api/imports/:id/dispatch', requireAuth, requireRole('admin', 'super_a
     try {
       const perms = await permissionsForRole(c, roleForCategory === 'agent' ? 'agent' : roleForCategory === 'partner' ? 'partner' : 'customer', {})
       const placeholder = await hashPassword(genPassword())
-      const ur = await c.env.DB.prepare(
-        `INSERT INTO users (full_name, phone, email, password, role, region, password_set, permissions, created_by) VALUES (?,?,?,?,?,?,0,?,?)`
-      ).bind(row.full_name, phone, row.email || null, placeholder, roleForCategory, row.region || row.county || null, JSON.stringify(perms), creator).run()
-      const userId = ur.meta.last_row_id as number
+      const ur = impWithOrg
+        ? await c.env.DB.prepare(
+            `INSERT INTO users (full_name, phone, email, password, role, region, password_set, permissions, created_by, org_id) VALUES (?,?,?,?,?,?,0,?,?,?)`
+          ).bind(row.full_name, phone, row.email || null, placeholder, roleForCategory, row.region || row.county || null, JSON.stringify(perms), creator, impOrgId).run()
+        : await c.env.DB.prepare(
+            `INSERT INTO users (full_name, phone, email, password, role, region, password_set, permissions, created_by) VALUES (?,?,?,?,?,?,0,?,?)`
+          ).bind(row.full_name, phone, row.email || null, placeholder, roleForCategory, row.region || row.county || null, JSON.stringify(perms), creator).run()
+      const userId = ur.meta.last_row_id as any
       // Farmers also get a customer profile with the standardized fields.
       if (roleForCategory === 'customer') {
         await c.env.DB.prepare(
