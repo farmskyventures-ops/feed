@@ -312,6 +312,26 @@ async function shopCrossApp() {
   } catch (e) { toast('Cross-app navigation unavailable', true) }
 }
 
+// Header button: open Farmsky Score with the SAME session — a short-lived HMAC
+// handoff token means no second login. Score's /sso endpoint verifies it and
+// drops the user straight into their console. Only Super-Admin, Admin or Lender
+// may see the button, and only when SCORE_APP_URL + the shared secret are set.
+function scoreHeaderButton() {
+  const cfg = state.crossApp
+  if (!cfg || !cfg.score_configured) return ''
+  if (!state.user || !['super_admin', 'admin', 'lender'].includes(state.user.role)) return ''
+  return `<button onclick="openScore()" title="Open Farmsky Score — identity &amp; credit scoring"
+    class="btn inline-flex items-center gap-2 brand-bg text-white px-4 py-2 rounded-lg text-sm whitespace-nowrap">
+    <i class="fas fa-chart-line"></i><span class="hidden sm:inline">Open Score</span></button>`
+}
+window.openScore = async () => {
+  try {
+    const { data } = await api.get('/cross/handoff?target=score')
+    if (data && data.url) { window.open(data.url, '_blank'); }
+    else toast('Score navigation is not configured', true)
+  } catch (e) { toast('Score is currently unavailable', true) }
+}
+
 // =====================================================================
 // Phase 5 — reusable multi-parameter client-side filter toolbar.
 // Any list view can render filterToolbar({...}) then, on input, call the
@@ -865,7 +885,10 @@ function renderApp() {
             <div class="text-xs text-slate-500 md:hidden"><i class="fas fa-tractor text-teal-600 mr-1"></i>Cash & Murabaha Financing</div>
           </div>
         </div>
-        <div class="text-sm text-slate-500 hidden md:block"><i class="fas fa-tractor text-teal-600 mr-1"></i>Cash & Murabaha Financing</div>
+        <div class="flex items-center gap-3">
+          ${scoreHeaderButton()}
+          <div class="text-sm text-slate-500 hidden md:block"><i class="fas fa-tractor text-teal-600 mr-1"></i>Cash & Murabaha Financing</div>
+        </div>
       </header>
       <div id="content-wrap"><div id="content"></div></div>
     </main>

@@ -2591,11 +2591,33 @@ app.get('/api/ledger', requireAuth, requireRole('admin', 'super_admin'), async (
 app.get('/api/cross/handoff', requireAuth, async (c) => {
   const user = c.get('user') as SessionUser
   const secret = c.env.CROSS_APP_HMAC_SECRET || ''
-  const siblingUrl = String(c.env.CROSS_APP_URL || '').replace(/\/+$/, '')
+  const target = String(c.req.query('target') || '')
+  // Choose the destination origin by target: 'score' -> SCORE_APP_URL,
+  // anything else -> the configured sibling marketplace (Equipment).
+  const siblingUrl = (target === 'score'
+    ? String(c.env.SCORE_APP_URL || '')
+    : String(c.env.CROSS_APP_URL || '')
+  ).replace(/\/+$/, '')
   if (!secret || !siblingUrl) return c.json({ error: 'Cross-app navigation is not configured' }, 503)
-  const token = await mintHandoffToken(secret, normalizePhone(user.phone))
-  const target = String(c.req.query('target') || '')  // informational
-  return c.json({ url: `${siblingUrl}/sso?token=${encodeURIComponent(token)}`, target })
+  // The same short-lived HMAC-signed token is accepted by every Farmsky app's
+  // /sso endpoint, so no second login is needed at the destination. Email +
+  // name are carried so email-keyed apps (Score) can resolve/create the
+  // account. The Equipment Admin Portal is the single source of truth for
+  // Super-Admin status, so carry the originating role + a super_admin assertion
+  // so the destination app grants the SAME access with the SAME credentials.
+  const isSuper = user.role === 'super_admin'
+  const token = await mintHandoffToken(secret, normalizePhone(user.phone), {
+    email: (user as any).email,
+    name: user.full_name,
+    role: user.role,
+    super_admin: isSuper,
+  })
+  // Optional deep-link: `dest` tells the destination app which view to open
+  // after SSO. Allow-listed slug to avoid open-redirect abuse.
+  const destRaw = String(c.req.query('dest') || '').trim()
+  const dest = /^[a-z0-9-]{1,32}$/.test(destRaw) ? destRaw : ''
+  const qs = `token=${encodeURIComponent(token)}` + (dest ? `&dest=${encodeURIComponent(dest)}` : '')
+  return c.json({ url: `${siblingUrl}/sso?${qs}`, target, dest: dest || null })
 })
 
 // Sibling app lands here: verify HMAC token, issue a local session, redirect.
@@ -2622,7 +2644,11 @@ app.get('/api/cross/config', requireAuth, (c) => {
   return c.json({
     app_type: String(c.env.APP_TYPE || 'equipment'),
     cross_app_configured: !!(c.env.CROSS_APP_HMAC_SECRET && c.env.CROSS_APP_URL),
-    cross_app_url: c.env.CROSS_APP_URL || null
+    cross_app_url: c.env.CROSS_APP_URL || null,
+    // Score SSO button is shown when the shared handoff secret AND the Score
+    // origin are configured. Reuses the same session (no re-login).
+    score_configured: !!(c.env.CROSS_APP_HMAC_SECRET && c.env.SCORE_APP_URL),
+    score_url: c.env.SCORE_APP_URL || null
   })
 })
 
