@@ -118,6 +118,12 @@ const payLabel = (t, model) => {
 
 let _products = [], _agents = [], _users = [], _customers = [], _walletUsers = []
 let _permMeta = { permissions: [], roles: [] }
+// Wallet withdraw-limit / charge / support-contact stash (populated by viewMyWallet
+// from GET /api/wallet so the withdraw modal can show the withdrawable limit
+// without a second round-trip). Aligned with the Equipment central-payment hub.
+let _walletWithdrawInfo = null
+// Peer-to-peer "Send money" wizard state (step 1: recipient+amount, step 2: OTP).
+let _p2p = { step: 1, recipient: null, amount: 0, reason: '' }
 function getRoleTemplate(role) {
   return (_permMeta.roles || []).find((r) => r.role_key === role)
 }
@@ -330,6 +336,26 @@ window.openScore = async () => {
     if (data && data.url) { window.open(data.url, '_blank'); }
     else toast('Score navigation is not configured', true)
   } catch (e) { toast('Score is currently unavailable', true) }
+}
+
+// "Use APIs" — Lender-tier: records the opt-in on the Feed side, then hands the
+// lender off (SSO, no re-login) to the Score console's API Access area where
+// they manage keys and call the APIs.
+window.openUseApis = async () => {
+  try {
+    try { await api.post('/cross/use-apis', {}) } catch (e) { /* non-fatal */ }
+    const { data } = await api.get('/cross/handoff?target=score&dest=api-access')
+    if (data && data.url) { window.open(data.url, '_blank'); }
+    else toast('API access is not configured', true)
+  } catch (e) { toast('Unable to start API access right now', true) }
+}
+// Admin hand-off straight to the Score Super-Admin portal (dest=superadmin).
+window.openScoreSuperAdmin = async () => {
+  try {
+    const { data } = await api.get('/cross/handoff?target=score&dest=superadmin')
+    if (data && data.url) window.open(data.url, '_blank')
+    else toast('Score Super-Admin portal is not configured', true)
+  } catch (e) { toast('Unable to open the Super-Admin portal right now', true) }
 }
 
 // =====================================================================
@@ -831,7 +857,8 @@ function navItems() {
     { k: 'settings', i: 'fa-sliders', t: 'Financing Settings' },
     { k: 'exports', i: 'fa-database', t: 'Data Export' },
     { k: 'imports', i: 'fa-file-arrow-up', t: 'Bulk Import' },
-    { k: 'backups', i: 'fa-shield-halved', t: 'Backups' }])
+    { k: 'backups', i: 'fa-shield-halved', t: 'Backups' },
+    { k: 'api_management', i: 'fa-plug', t: 'API Management' }])
   if (r === 'operations_finance') return withAccount([...common,
     { k: 'approvals', i: 'fa-clipboard-check', t: 'Approvals' },
     financeQueue,
@@ -855,7 +882,10 @@ function navItems() {
   // Lender / Investor / M&E / Partner: read-only dashboard + relevant views.
   if (['lender', 'investor', 'mne', 'partner'].includes(r)) return withAccount([...common,
     ...(canDo('view_credit_purchases') ? [{ k: 'contracts', i: 'fa-file-signature', t: 'Financed Portfolio' }] : []),
-    ...(canDo('view_farmers') ? [{ k: 'customers', i: 'fa-users', t: 'Farmers' }] : [])])
+    ...(canDo('view_farmers') ? [{ k: 'customers', i: 'fa-users', t: 'Farmers' }] : []),
+    // Lender-tier accounts get a dedicated API Access view: enable and begin
+    // consuming the Farmsky Score verification & credit APIs.
+    ...(r === 'lender' ? [{ k: 'api_access', i: 'fa-plug', t: 'API Access' }] : [])])
   return withAccount(common)
 }
 function renderApp() {
@@ -898,10 +928,112 @@ function renderApp() {
 }
 window.go = (r) => { state.route = r; toggleSidebar(false); renderApp() }
 function route() {
-  const titles = { dashboard: 'Dashboard', approvals: 'Financing Approvals', inventory: 'Inventory', finance_queue: 'Finance Approval Queue', customers: 'Customers', contracts: 'Purchases & Contracts', agents: 'Agent Management', users: 'User Accounts & Access', amendments: 'Pending Profile Amendments', ledger: 'Unified Payment Ledger', repayments: 'Repayment Performance', onboard: 'Farmer Onboarding', shop: 'Feed Shop', marketplace: 'Equipment Marketplace', exports: 'Data Export & Reports', imports: 'Bulk User Data Upload', backups: 'Automated System Backups', settings: 'Financing & Markup Settings', profile: 'My Account', wallet: 'My Wallet', wallets: 'Wallets & Payouts' }
+  const titles = { dashboard: 'Dashboard', approvals: 'Financing Approvals', inventory: 'Inventory', finance_queue: 'Finance Approval Queue', customers: 'Customers', contracts: 'Purchases & Contracts', agents: 'Agent Management', users: 'User Accounts & Access', amendments: 'Pending Profile Amendments', ledger: 'Unified Payment Ledger', repayments: 'Repayment Performance', onboard: 'Farmer Onboarding', shop: 'Feed Shop', marketplace: 'Equipment Marketplace', exports: 'Data Export & Reports', imports: 'Bulk User Data Upload', backups: 'Automated System Backups', settings: 'Financing & Markup Settings', profile: 'My Account', wallet: 'My Wallet', wallets: 'Wallets & Payouts', api_access: 'API Access', api_management: 'API Management' }
   $('pageTitle').textContent = titles[state.route] || 'Dashboard'
-  const map = { dashboard: viewDashboard, approvals: viewApprovals, inventory: viewInventory, finance_queue: viewFinanceQueue, customers: viewCustomers, contracts: viewContracts, agents: viewAgents, users: viewUsers, amendments: viewAmendments, ledger: viewLedger, repayments: viewRepayments, onboard: viewOnboard, shop: viewShop, marketplace: viewMarketplace, exports: viewExports, imports: viewImports, backups: viewBackups, settings: viewSettings, profile: viewProfile, wallet: viewMyWallet, wallets: viewWallets }
+  const map = { dashboard: viewDashboard, approvals: viewApprovals, inventory: viewInventory, finance_queue: viewFinanceQueue, customers: viewCustomers, contracts: viewContracts, agents: viewAgents, users: viewUsers, amendments: viewAmendments, ledger: viewLedger, repayments: viewRepayments, onboard: viewOnboard, shop: viewShop, marketplace: viewMarketplace, exports: viewExports, imports: viewImports, backups: viewBackups, settings: viewSettings, profile: viewProfile, wallet: viewMyWallet, wallets: viewWallets, api_access: viewApiAccess, api_management: viewApiManagement }
   ;(map[state.route] || viewDashboard)()
+}
+
+// ---------------------------------------------------------------------------
+// API ACCESS (Lender-facing) — enable & consume the Farmsky Score APIs via SSO.
+// ---------------------------------------------------------------------------
+async function viewApiAccess() {
+  const cfg = state.crossApp
+  const configured = !!(cfg && cfg.score_configured)
+  $('content').innerHTML = `
+    <div class="max-w-3xl">
+      <div class="card p-6 mb-4">
+        <div class="flex items-start gap-4">
+          <div class="w-12 h-12 rounded-xl bg-emerald-100 flex items-center justify-center text-emerald-600 text-xl"><i class="fas fa-plug"></i></div>
+          <div class="flex-1">
+            <h2 class="text-lg font-bold text-slate-800">Farmsky Score APIs</h2>
+            <p class="text-sm text-slate-600 mt-1">As a <strong>Lender</strong>, you can consume Farmsky's identity verification, credit scoring and workflow APIs directly. Enabling this hands you off (no second login) to the Score console's <strong>API Access</strong> area, where you generate keys, run in Sandbox, and request Production access.</p>
+          </div>
+        </div>
+        <div class="mt-5 flex flex-wrap gap-3">
+          ${configured
+            ? `<button onclick="openUseApis()" class="btn inline-flex items-center gap-2 bg-emerald-600 hover:bg-emerald-700 text-white px-5 py-2.5 rounded-lg text-sm font-medium"><i class="fas fa-plug"></i>Use APIs — Enable &amp; Open Console</button>`
+            : `<div class="text-sm text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-4 py-3"><i class="fas fa-triangle-exclamation mr-1"></i>API access is not yet configured for this platform. Please contact your Farmsky administrator.</div>`}
+        </div>
+      </div>
+      <div class="grid grid-cols-1 sm:grid-cols-3 gap-4 mb-4">
+        <div class="card p-4"><div class="text-emerald-600 text-lg mb-1"><i class="fas fa-id-card-clip"></i></div><div class="font-semibold text-slate-800 text-sm">Identity &amp; KYB</div><div class="text-xs text-slate-500 mt-1">Verify farmers &amp; businesses via GovChecks.</div></div>
+        <div class="card p-4"><div class="text-emerald-600 text-lg mb-1"><i class="fas fa-chart-line"></i></div><div class="font-semibold text-slate-800 text-sm">Credit Scoring</div><div class="text-xs text-slate-500 mt-1">Bureau + alternative-data credit signals.</div></div>
+        <div class="card p-4"><div class="text-emerald-600 text-lg mb-1"><i class="fas fa-diagram-project"></i></div><div class="font-semibold text-slate-800 text-sm">Workflows</div><div class="text-xs text-slate-500 mt-1">Chain checks into automated decisions.</div></div>
+      </div>
+      <div class="card p-5">
+        <h3 class="font-semibold text-slate-800 mb-2 text-sm">How it works</h3>
+        <ol class="list-decimal pl-5 space-y-1 text-sm text-slate-600">
+          <li>Click <strong>Use APIs</strong>. We record your opt-in and open the Score console via secure single sign-on.</li>
+          <li>In the console's <strong>API Access</strong> tab, toggle the APIs on to generate your Sandbox keys.</li>
+          <li>Test freely in Sandbox, then <strong>request Production</strong> access — a Farmsky Super-Admin reviews and approves it.</li>
+          <li>Your pricing tier &amp; rate limits are shown in the console and managed by Farmsky.</li>
+        </ol>
+        <p class="text-xs text-slate-400 mt-3">Lenders added by an Admin here and lenders who self-register on Score receive identical API features and permissions.</p>
+      </div>
+    </div>`
+}
+
+// ---------------------------------------------------------------------------
+// API MANAGEMENT (Admin-facing) — surfaces the API-consumption feature inside
+// the Feed admin portal: which lenders can consume APIs, and a secure hand-off
+// (SSO) into the Score Super-Admin portal to configure pricing tiers, approve
+// Production-access requests, and manage global API settings.
+// ---------------------------------------------------------------------------
+async function viewApiManagement() {
+  const cfg = state.crossApp
+  const configured = !!(cfg && cfg.score_configured)
+  let lenders = []
+  try {
+    const { data } = await api.get('/users')
+    lenders = (data.users || []).filter(u => u.role === 'lender')
+  } catch (_) { lenders = [] }
+  const rows = lenders.length
+    ? lenders.map(u => `<tr class="border-t border-slate-100">
+        <td class="px-4 py-3 font-medium">${esc(u.full_name)}</td>
+        <td class="px-4 py-3">${esc(u.phone || '—')}</td>
+        <td class="px-4 py-3">${esc(u.email || '—')}</td>
+        <td class="px-4 py-3">${badge(u.status)}</td>
+        <td class="px-4 py-3 text-right">
+          <button onclick="go('users')" class="text-teal-600 hover:underline text-xs">Manage user</button>
+        </td></tr>`).join('')
+    : `<tr><td colspan="5" class="px-4 py-8 text-center text-slate-400 text-sm">No lender accounts yet. Add one from <button onclick="go('users')" class="text-teal-600 hover:underline">User Accounts</button>.</td></tr>`
+  $('content').innerHTML = `
+    <div class="card p-6 mb-4">
+      <div class="flex flex-col md:flex-row md:items-center md:justify-between gap-4">
+        <div>
+          <h2 class="text-lg font-bold text-slate-800"><i class="fas fa-plug text-emerald-600 mr-2"></i>Farmsky Score — API Management</h2>
+          <p class="text-sm text-slate-600 mt-1">Govern platform API consumption: pricing tiers &amp; rates, Production-access approvals, and global settings. These controls live in the Score Super-Admin portal; open it below via secure single sign-on.</p>
+        </div>
+        <div class="flex flex-wrap gap-3">
+          ${configured
+            ? `<button onclick="openScoreSuperAdmin()" class="btn inline-flex items-center gap-2 bg-slate-800 hover:bg-slate-900 text-white px-5 py-2.5 rounded-lg text-sm font-medium"><i class="fas fa-crown"></i>Open Super-Admin Portal</button>
+               <button onclick="openScore()" class="btn inline-flex items-center gap-2 bg-teal-600 hover:bg-teal-700 text-white px-5 py-2.5 rounded-lg text-sm font-medium"><i class="fas fa-up-right-from-square"></i>Open Score Console</button>`
+            : `<div class="text-sm text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-4 py-3"><i class="fas fa-triangle-exclamation mr-1"></i>Score is not configured. Set SCORE_APP_URL &amp; CROSS_APP_HMAC_SECRET.</div>`}
+        </div>
+      </div>
+    </div>
+    <div class="grid grid-cols-1 sm:grid-cols-3 gap-4 mb-4">
+      <div class="card p-4"><div class="text-slate-500 text-xs uppercase tracking-wide">Lenders on platform</div><div class="text-2xl font-bold text-slate-800 mt-1">${lenders.length}</div></div>
+      <div class="card p-4"><div class="text-slate-500 text-xs uppercase tracking-wide">Pricing tiers</div><div class="text-2xl font-bold text-slate-800 mt-1">Managed in Score</div></div>
+      <div class="card p-4"><div class="text-slate-500 text-xs uppercase tracking-wide">Production approvals</div><div class="text-2xl font-bold text-slate-800 mt-1">In Super-Admin</div></div>
+    </div>
+    <div class="card p-5 mb-4">
+      <h3 class="font-semibold text-slate-800 mb-2 text-sm">What you can manage in the Super-Admin portal</h3>
+      <ul class="list-disc pl-5 space-y-1 text-sm text-slate-600">
+        <li><strong>Pricing tiers &amp; rates</strong> — monthly fee, per-check price, included checks, production eligibility.</li>
+        <li><strong>Production access</strong> — approve or deny requests to move a lender from Sandbox to Production.</li>
+        <li><strong>Global settings</strong> — OTP channel, public lender sign-up, default tier and platform controls.</li>
+        <li><strong>Per-lender API access</strong> — enable/disable APIs and assign a tier for any organization.</li>
+      </ul>
+    </div>
+    <div class="card table-card">
+      <div class="px-4 py-3 border-b border-slate-100 font-semibold text-slate-700 text-sm">Lender accounts (API-eligible)</div>
+      <table class="w-full text-sm">
+        <thead class="bg-slate-50 text-slate-500 text-xs uppercase"><tr><th class="text-left px-4 py-3">Name</th><th class="text-left px-4 py-3">Phone</th><th class="text-left px-4 py-3">Email</th><th class="text-left px-4 py-3">Status</th><th></th></tr></thead>
+        <tbody>${rows}</tbody>
+      </table>
+    </div>`
 }
 
 // ---------------------------------------------------------------------------
@@ -2174,11 +2306,15 @@ function ledgerRow(l) {
 }
 async function viewMyWallet() {
   let wallet = null, ledger = [], rules = [], analytics = null
+  let withdrawable = null, wdCharge = null, supportContact = null
   try {
     const [w, a] = await Promise.all([api.get('/wallet'), api.get('/wallet/analytics')])
     wallet = w.data.wallet; ledger = w.data.ledger || []; rules = w.data.earning_rules || []
+    withdrawable = w.data.withdrawable; wdCharge = w.data.withdrawal_charge; supportContact = w.data.support_contact
     analytics = a.data
   } catch (err) { toast(err.response?.data?.error || 'Wallet unavailable', false) }
+  // Stash for the withdraw / send modals (avoids a second round-trip).
+  _walletWithdrawInfo = { withdrawable, charge: wdCharge, support_contact: supportContact }
   const rulesHtml = rules.length ? rules.map(r => `<div class="flex items-center justify-between border-b border-slate-100 py-2 text-sm">
       <span><b>${esc(r.rule_type)}</b> · ${esc(r.calc_method)}</span>
       <span class="text-slate-600">${r.calc_method === 'percentage' ? Number(r.rate || 0) + '%' : fmt(r.fixed_amount)}</span>
@@ -2189,7 +2325,9 @@ async function viewMyWallet() {
       <div class="text-xs text-slate-500 mb-1">Wallet balance</div>
       <div class="text-2xl font-bold text-teal-700">${fmt(wallet?.balance)}</div>
       <div class="text-xs text-slate-400 mt-1">${esc(wallet?.currency || 'KES')} · ${esc(wallet?.status || 'active')}</div>
-      <button onclick="withdrawModal(${Number(wallet?.balance || 0)})" class="btn brand-bg text-white px-3 py-1.5 rounded-lg text-xs mt-3"><i class="fas fa-money-bill-transfer mr-1"></i>Withdraw</button>
+      ${withdrawable != null ? `<div class="text-xs text-slate-500 mt-1">Withdrawable now: <b class="text-teal-700">${fmt(withdrawable)}</b>${(wdCharge && wdCharge.enabled) ? ' <span class="text-slate-400">(after withdrawal charge)</span>' : ''}</div>` : ''}
+      <button onclick="sendMoneyModal(${Number(wallet?.balance || 0)})" class="btn brand-bg text-white px-3 py-1.5 rounded-lg text-xs mt-3"><i class="fas fa-paper-plane mr-1"></i>Send</button>
+      <button onclick="withdrawModal(${Number(wallet?.balance || 0)})" class="btn bg-white border px-3 py-1.5 rounded-lg text-xs mt-3 ml-1"><i class="fas fa-money-bill-transfer mr-1"></i>Withdraw</button>
       <button onclick="payoutAccountsModal()" class="btn bg-white border px-3 py-1.5 rounded-lg text-xs mt-3 ml-1"><i class="fas fa-building-columns mr-1"></i>Payout accounts</button>
     </div>
     <div class="card p-5"><div class="text-xs text-slate-500 mb-1">Total earned</div><div class="text-2xl font-bold text-emerald-600">${fmt(analytics?.totals?.total_earned)}</div></div>
@@ -2319,6 +2457,107 @@ window.doAddEarningRule = async (userId) => {
   catch (err) { toast(err.response?.data?.error || 'Failed', false) }
 }
 // ---------------------------------------------------------------------------
+// PEER-TO-PEER "SEND MONEY" — transfer funds to another Farmsky user's wallet.
+// Step 1: recipient (looked up by phone) + amount. Step 2: OTP authorisation.
+// Aligned with the Equipment central-payment hub P2P feature.
+// ---------------------------------------------------------------------------
+window.sendMoneyModal = (balance) => {
+  _p2p = { step: 1, recipient: null, amount: 0, reason: '' }
+  showModal(`<h3 class="font-bold mb-1"><i class="fas fa-paper-plane text-teal-600 mr-2"></i>Send money</h3>
+    <p class="text-xs text-slate-500 mb-3">Send funds directly to another Farmsky user's wallet. Available balance: <b>${fmt(balance)}</b>.</p>
+    <div id="p2p_body"></div>`)
+  renderP2PStep(balance)
+}
+function renderP2PStep(balance) {
+  const body = $('p2p_body'); if (!body) return
+  if (_p2p.step === 1) {
+    body.innerHTML = `
+      <label class="field-label">Recipient phone number</label>
+      <div class="flex gap-2">
+        <input id="p2p_phone" type="text" placeholder="e.g. 0712345678" class="flex-1 px-3 py-2 border rounded-lg" oninput="_p2p.recipient=null;$('p2p_recip').innerHTML=''">
+        <button type="button" onclick="doLookupRecipient()" class="btn px-3 bg-slate-100 rounded-lg text-xs whitespace-nowrap">Find</button>
+      </div>
+      <div id="p2p_recip" class="text-xs mt-1"></div>
+      <label class="field-label mt-3">Amount (KES)</label>
+      <input id="p2p_amt" type="number" class="w-full px-3 py-2 border rounded-lg mb-3">
+      <label class="field-label">Note (optional)</label>
+      <input id="p2p_reason" placeholder="e.g. Payment for goods" class="w-full px-3 py-2 border rounded-lg mb-3">
+      <div id="p2p_status"></div>
+      <div class="flex gap-2 mt-2">
+        <button id="p2p_next" onclick="doSendMoney()" class="btn flex-1 brand-bg text-white py-2 rounded-lg text-sm">Continue</button>
+        <button onclick="closeModal()" class="btn px-4 bg-slate-100 rounded-lg text-sm">Cancel</button>
+      </div>`
+  } else if (_p2p.step === 2) {
+    const r = _p2p.recipient || {}
+    body.innerHTML = `
+      <div class="bg-slate-50 border rounded-lg p-3 text-sm mb-3">
+        <div class="flex justify-between"><span class="text-slate-500">To</span><b>${esc(r.name || 'Farmsky user')}</b></div>
+        <div class="flex justify-between mt-1"><span class="text-slate-500">Amount</span><b class="text-teal-700">${fmt(_p2p.amount)}</b></div>
+      </div>
+      <label class="field-label">Verification code (OTP)</label>
+      <input id="p2p_otp" type="text" inputmode="numeric" placeholder="Enter the code sent to your phone" class="w-full px-3 py-2 border rounded-lg">
+      <div id="p2p_otphint" class="text-xs text-slate-500 mt-1"></div>
+      <div id="p2p_status" class="mt-2"></div>
+      <div class="flex gap-2 mt-3">
+        <button id="p2p_confirm" onclick="doSendMoney()" class="btn flex-1 brand-bg text-white py-2 rounded-lg text-sm">Confirm & send</button>
+        <button onclick="closeModal()" class="btn px-4 bg-slate-100 rounded-lg text-sm">Cancel</button>
+      </div>`
+    const otpEl = $('p2p_otp'); if (otpEl) otpEl.focus()
+  }
+}
+window.doLookupRecipient = async () => {
+  const phone = String($('p2p_phone')?.value || '').trim()
+  const box = $('p2p_recip')
+  if (!phone) { if (box) { box.className = 'text-xs text-red-600 mt-1'; box.textContent = 'Enter a phone number.' } return }
+  if (box) { box.className = 'text-xs text-slate-500 mt-1'; box.textContent = 'Searching…' }
+  try {
+    const { data } = await api.get('/wallet/lookup-recipient', { params: { phone } })
+    _p2p.recipient = data.recipient
+    if (box) { box.className = 'text-xs text-emerald-700 mt-1'; box.innerHTML = `<i class="fas fa-check-circle mr-1"></i>${esc(data.recipient.name)} · ${esc(data.recipient.phone)}` }
+  } catch (err) {
+    _p2p.recipient = null
+    if (box) { box.className = 'text-xs text-red-600 mt-1'; box.textContent = err.response?.data?.error || 'Recipient not found.' }
+  }
+}
+window.doSendMoney = async () => {
+  if (_p2p.step === 1) {
+    const amount = Number($('p2p_amt')?.value || 0)
+    const phone = String($('p2p_phone')?.value || '').trim()
+    if (!phone) return toast('Enter the recipient phone number', false)
+    if (amount <= 0) return toast('Enter a valid amount', false)
+    _p2p.amount = amount
+    _p2p.reason = $('p2p_reason')?.value || ''
+    _p2p.phone = phone
+  }
+  const payload = { recipient_phone: _p2p.phone, amount: _p2p.amount, reason: _p2p.reason || null }
+  if (_p2p.step === 2) {
+    const code = String($('p2p_otp')?.value || '').trim()
+    if (!code) return toast('Enter the verification code', false)
+    payload.otp_code = code
+  }
+  const btn = _p2p.step === 1 ? $('p2p_next') : $('p2p_confirm')
+  if (btn) { btn.disabled = true; btn.classList.add('opacity-50') }
+  const status = $('p2p_status')
+  if (status) status.innerHTML = `<div class="text-xs text-slate-500"><i class="fas fa-spinner fa-spin mr-1"></i>Processing…</div>`
+  try {
+    const { data } = await api.post('/wallet/transfer', payload)
+    if (data.needs_otp) {
+      _p2p.step = 2
+      if (data.recipient) _p2p.recipient = { ...(_p2p.recipient || {}), name: data.recipient.name }
+      renderP2PStep()
+      const hint = $('p2p_otphint')
+      if (hint) hint.innerHTML = `${esc(data.message || 'Enter the code sent to your registered number.')} ${data.phone ? `<span class="text-slate-400">(${esc(data.phone)})</span>` : ''}${data.demo_otp ? ` <b class="text-teal-700">Demo code: ${esc(data.demo_otp)}</b>` : ''}`
+      return
+    }
+    closeModal(); toast(data.customer_message || `Sent (${data.reference})`); viewMyWallet()
+  } catch (err) {
+    const d = err.response?.data || {}
+    if (status) status.innerHTML = `<div class="bg-red-50 border border-red-200 rounded-lg p-2 text-xs text-red-700">${esc(d.error || 'Transfer failed')}</div>`
+    if (btn) { btn.disabled = false; btn.classList.remove('opacity-50') }
+  }
+}
+
+// ---------------------------------------------------------------------------
 // WALLET WITHDRAWAL — cash out to a registered mobile / bank / SasaPay account.
 // ---------------------------------------------------------------------------
 window.withdrawModal = async (balance) => {
@@ -2326,8 +2565,16 @@ window.withdrawModal = async (balance) => {
   let accounts = []
   try { const { data } = await api.get('/payout-accounts'); accounts = data.accounts || [] } catch (_) {}
   const savedOpts = accounts.map(a => `<option value="${a.id}">${esc(a.label || a.channel_name)} · ${esc(a.account_number)}${a.is_verified ? ' ✓' : ''}</option>`).join('')
+  const info = _walletWithdrawInfo || {}
+  const wdCharge = info.charge || null
+  const withdrawable = info.withdrawable
+  const chargeLine = (wdCharge && wdCharge.enabled)
+    ? `<p class="text-xs text-slate-500 mb-1">A withdrawal charge applies${wdCharge.flat_fee ? ` (flat KES ${Number(wdCharge.flat_fee).toLocaleString()}` : ''}${wdCharge.percentage_rate ? `${wdCharge.flat_fee ? ' + ' : ' ('}${Number(wdCharge.percentage_rate)}%` : ''}${(wdCharge.flat_fee || wdCharge.percentage_rate) ? ')' : ''}.${withdrawable != null ? ` You can withdraw up to <b>${fmt(withdrawable)}</b>.` : ''}</p>`
+    : ''
   showModal(`<h3 class="font-bold mb-1"><i class="fas fa-money-bill-transfer text-teal-600 mr-2"></i>Withdraw funds</h3>
-    <p class="text-xs text-slate-500 mb-3">Available balance: <b>${fmt(balance)}</b>. Funds are sent via SasaPay to your mobile, bank, or SasaPay wallet.</p>
+    <p class="text-xs text-slate-500 mb-1">Available balance: <b>${fmt(balance)}</b>. Funds are sent via SasaPay to your mobile, bank, or SasaPay wallet.</p>
+    ${chargeLine}
+    <div class="mb-3"></div>
     ${savedOpts ? `<label class="field-label">Use a saved account</label>
     <select id="wd_saved" onchange="onWithdrawSavedChange()" class="w-full px-3 py-2 border rounded-lg mb-3">
       <option value="">— New / one-off destination —</option>${savedOpts}
@@ -2387,7 +2634,20 @@ window.doWithdraw = async () => {
     const { data } = await api.post('/wallet/withdraw', payload)
     closeModal(); toast(data.customer_message || `Withdrawal ${data.status} (${data.reference})`); viewMyWallet()
   } catch (err) {
-    $('wd_status').innerHTML = `<div class="bg-red-50 border border-red-200 rounded-lg p-2 text-xs text-red-700 mb-2">${esc(err.response?.data?.error || 'Withdrawal failed')}</div>`
+    const d = err.response?.data || {}
+    let extra = ''
+    // Insufficient balance → show the most that can be withdrawn now (net of charge).
+    if (d.insufficient && d.withdrawable != null) {
+      extra = `<div class="mt-1">The most you can withdraw now is <b>${fmt(d.withdrawable)}</b>${d.charge_at_max != null ? ` (after a ${fmt(d.charge_at_max)} withdrawal charge)` : ''}.</div>`
+    }
+    // Main-wallet under-funded → surface the configured Farmsky support contact.
+    if (d.contact_farmsky) {
+      const bits = []
+      if (d.support_phone) bits.push(`call <b>${esc(d.support_phone)}</b>`)
+      if (d.support_email) bits.push(`email <b>${esc(d.support_email)}</b>`)
+      if (bits.length) extra = `<div class="mt-1">Please ${bits.join(' or ')}.</div>`
+    }
+    $('wd_status').innerHTML = `<div class="bg-red-50 border border-red-200 rounded-lg p-2 text-xs text-red-700 mb-2">${esc(d.error || 'Withdrawal failed')}${extra}</div>`
     done()
   }
 }
@@ -3482,10 +3742,22 @@ let _feeCfg = { enabled: false, mode: 'percentage', percentage_rate: 0, tiers: [
 let _mkCfg = { financing_applicable: true, mode: 'percentage', percentage_rate: 20, tiers: [], cash_markup_pct: 10, cash_terms_text: '', product_ids: [] }
 let _inventory = []
 let _canManageFees = false, _canManageMarkup = false
+// Wallet withdrawal-charge + Farmsky support-contact settings (admin-managed).
+// Aligned with the Equipment central-payment hub wallet configuration.
+let _wdCfg = { enabled: true, percentage_rate: 0, flat_fee: 0, min_charge: 0, max_charge: 0, min_withdrawal: 0 }
+let _supportCfg = { phone: '', email: '' }
+let _canManageWithdrawal = false
 async function viewSettings() {
   let data
   try { data = (await api.get('/settings/financing')).data }
   catch (err) { $('content').innerHTML = `<div class="card p-6 text-red-600 text-sm">${esc(err.response?.data?.error || 'Failed to load settings')}</div>`; return }
+  // Withdrawal charge + support contact (best-effort; endpoint is auth-open for reads).
+  try {
+    const wd = (await api.get('/settings/withdrawal')).data
+    _wdCfg = Object.assign({ enabled: true, percentage_rate: 0, flat_fee: 0, min_charge: 0, max_charge: 0, min_withdrawal: 0 }, wd.withdrawal_charge || {})
+    _supportCfg = Object.assign({ phone: '', email: '' }, wd.support_contact || {})
+    _canManageWithdrawal = !!wd.can_manage
+  } catch (_) {}
   _feeCfg = Object.assign({ enabled: false, mode: 'percentage', percentage_rate: 0, tiers: [], product_ids: [] }, data.processing_fee || {})
   if (!Array.isArray(_feeCfg.tiers)) _feeCfg.tiers = []
   if (!Array.isArray(_feeCfg.product_ids)) _feeCfg.product_ids = []
@@ -3516,9 +3788,64 @@ async function viewSettings() {
           ? `<div class="flex gap-2 mt-5"><button onclick="saveProcessingFee()" class="btn brand-bg text-white px-5 py-2 rounded-lg text-sm"><i class="fas fa-save mr-1"></i>Save Processing Fee</button></div>`
           : `<p class="text-xs text-amber-600 mt-4"><i class="fas fa-lock mr-1"></i>You lack the "Manage Processing Fees" permission — read-only.</p>`}
       </div>
+
+      <!-- ============ WITHDRAWAL CHARGE (standard withdrawal schema) ============ -->
+      <div class="card p-6">
+        <h3 class="font-bold text-slate-800 mb-1"><i class="fas fa-money-bill-transfer text-teal-600 mr-2"></i>Withdrawal Charge</h3>
+        <p class="text-xs text-slate-500 mb-4">The standard withdrawal charge deducted when a wallet holder cashes out. A holder can only withdraw an amount whose <b>gross + charge</b> is within their balance.</p>
+        <label class="flex items-center gap-2 text-sm mb-4 ${_canManageWithdrawal ? 'cursor-pointer' : 'opacity-60'}">
+          <input type="checkbox" id="wc_enabled" ${_wdCfg.enabled ? 'checked' : ''} ${_canManageWithdrawal ? '' : 'disabled'}> Apply a withdrawal charge
+        </label>
+        <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+          <div><label class="field-label">Percentage of amount (%)</label><input id="wc_pct" type="number" step="0.01" value="${Number(_wdCfg.percentage_rate || 0)}" ${_canManageWithdrawal ? '' : 'disabled'} class="w-full px-3 py-2 border rounded-lg"></div>
+          <div><label class="field-label">Flat fee (KES)</label><input id="wc_flat" type="number" step="0.01" value="${Number(_wdCfg.flat_fee || 0)}" ${_canManageWithdrawal ? '' : 'disabled'} class="w-full px-3 py-2 border rounded-lg"></div>
+          <div><label class="field-label">Minimum charge (KES)</label><input id="wc_min" type="number" step="0.01" value="${Number(_wdCfg.min_charge || 0)}" ${_canManageWithdrawal ? '' : 'disabled'} class="w-full px-3 py-2 border rounded-lg"></div>
+          <div><label class="field-label">Maximum charge (KES, 0 = none)</label><input id="wc_max" type="number" step="0.01" value="${Number(_wdCfg.max_charge || 0)}" ${_canManageWithdrawal ? '' : 'disabled'} class="w-full px-3 py-2 border rounded-lg"></div>
+          <div><label class="field-label">Minimum withdrawal (KES, 0 = none)</label><input id="wc_minwd" type="number" step="0.01" value="${Number(_wdCfg.min_withdrawal || 0)}" ${_canManageWithdrawal ? '' : 'disabled'} class="w-full px-3 py-2 border rounded-lg"></div>
+        </div>
+        ${_canManageWithdrawal
+          ? `<div class="flex gap-2 mt-5"><button onclick="saveWithdrawalCharge()" class="btn brand-bg text-white px-5 py-2 rounded-lg text-sm"><i class="fas fa-save mr-1"></i>Save Withdrawal Charge</button></div>`
+          : `<p class="text-xs text-amber-600 mt-4"><i class="fas fa-lock mr-1"></i>Only Admin / Super-Admin can change this — read-only.</p>`}
+      </div>
+
+      <!-- ============ SUPPORT CONTACT (shown when SasaPay main wallet is short) ============ -->
+      <div class="card p-6">
+        <h3 class="font-bold text-slate-800 mb-1"><i class="fas fa-headset text-teal-600 mr-2"></i>Farmsky Support Contact</h3>
+        <p class="text-xs text-slate-500 mb-4">Shown to users as "Contact Farmsky" when a withdrawal cannot be settled because the SasaPay main wallet is short of funds.</p>
+        <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+          <div><label class="field-label">Support phone</label><input id="sc_phone" type="text" placeholder="e.g. 0700000000" value="${esc(_supportCfg.phone || '')}" ${_canManageWithdrawal ? '' : 'disabled'} class="w-full px-3 py-2 border rounded-lg"></div>
+          <div><label class="field-label">Support email</label><input id="sc_email" type="email" placeholder="e.g. support@farmsky.co.ke" value="${esc(_supportCfg.email || '')}" ${_canManageWithdrawal ? '' : 'disabled'} class="w-full px-3 py-2 border rounded-lg"></div>
+        </div>
+        ${_canManageWithdrawal
+          ? `<div class="flex gap-2 mt-5"><button onclick="saveSupportContact()" class="btn brand-bg text-white px-5 py-2 rounded-lg text-sm"><i class="fas fa-save mr-1"></i>Save Support Contact</button></div>`
+          : `<p class="text-xs text-amber-600 mt-4"><i class="fas fa-lock mr-1"></i>Only Admin / Super-Admin can change this — read-only.</p>`}
+      </div>
     </div>`
   renderMarkupBuilder()
   renderFeeBuilder()
+}
+window.saveWithdrawalCharge = async () => {
+  const payload = {
+    enabled: !!($('wc_enabled') || {}).checked,
+    percentage_rate: Number(($('wc_pct') || {}).value || 0),
+    flat_fee: Number(($('wc_flat') || {}).value || 0),
+    min_charge: Number(($('wc_min') || {}).value || 0),
+    max_charge: Number(($('wc_max') || {}).value || 0),
+    min_withdrawal: Number(($('wc_minwd') || {}).value || 0)
+  }
+  try {
+    const { data } = await api.put('/settings/withdrawal-charge', payload)
+    _wdCfg = data.withdrawal_charge || payload
+    toast('Withdrawal charge saved')
+  } catch (err) { toast(err.response?.data?.error || 'Failed to save', false) }
+}
+window.saveSupportContact = async () => {
+  const payload = { phone: ($('sc_phone') || {}).value || '', email: ($('sc_email') || {}).value || '' }
+  try {
+    const { data } = await api.put('/settings/support-contact', payload)
+    _supportCfg = data.support_contact || payload
+    toast('Support contact saved')
+  } catch (err) { toast(err.response?.data?.error || 'Failed to save', false) }
 }
 
 // ---- shared helpers -------------------------------------------------------

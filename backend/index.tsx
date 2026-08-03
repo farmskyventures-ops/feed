@@ -177,6 +177,75 @@ function boolInt(value: any, fallback = true) {
 function roundMoney(value: number) {
   return Math.round((Number(value) || 0) * 100) / 100
 }
+
+// ----------------------------------------------------------------------------
+// WITHDRAWAL CHARGE SCHEMA (standard withdrawal schema) — aligned with Equipment.
+// A withdrawal costs the wallet holder an "effective charge" that is deducted on
+// top of the gross withdrawal. The withdrawable limit for a given balance is
+//   withdrawable = balance - effectiveCharge(withdrawable)
+// The charge is a flat fee + a percentage of the requested amount, with optional
+// min/max clamps — mirroring typical mobile-money withdrawal tariffs.
+// ----------------------------------------------------------------------------
+const DEFAULT_WITHDRAWAL_CHARGE = {
+  enabled: true,
+  percentage_rate: 0,     // % of the requested amount
+  flat_fee: 0,            // flat KES added per withdrawal
+  min_charge: 0,          // charge is never below this (when enabled)
+  max_charge: 0,          // 0 = no upper cap
+  min_withdrawal: 0       // smallest gross amount a holder may request (0 = none)
+}
+function normalizeWithdrawalCharge(raw: any) {
+  const cfg: any = { ...DEFAULT_WITHDRAWAL_CHARGE, ...(raw && typeof raw === 'object' ? raw : {}) }
+  cfg.enabled = raw && Object.prototype.hasOwnProperty.call(raw, 'enabled') ? Boolean(cfg.enabled) : true
+  cfg.percentage_rate = Math.max(0, numberVal(cfg.percentage_rate, 0))
+  cfg.flat_fee = Math.max(0, numberVal(cfg.flat_fee, 0))
+  cfg.min_charge = Math.max(0, numberVal(cfg.min_charge, 0))
+  cfg.max_charge = Math.max(0, numberVal(cfg.max_charge, 0))
+  cfg.min_withdrawal = Math.max(0, numberVal(cfg.min_withdrawal, 0))
+  return cfg
+}
+// Effective charge for a requested (gross) withdrawal amount.
+function computeWithdrawalCharge(cfg: any, amount: number): number {
+  const c = normalizeWithdrawalCharge(cfg)
+  if (!c.enabled) return 0
+  const amt = Math.max(0, Number(amount) || 0)
+  let charge = c.flat_fee + amt * (c.percentage_rate / 100)
+  if (c.min_charge > 0 && charge < c.min_charge) charge = c.min_charge
+  if (c.max_charge > 0 && charge > c.max_charge) charge = c.max_charge
+  return roundMoney(charge)
+}
+// Given a wallet balance, the maximum gross amount a holder may withdraw such
+// that (amount + effective charge) never exceeds the balance.
+function computeWithdrawableLimit(cfg: any, balance: number): { withdrawable: number; charge_at_max: number } {
+  const c = normalizeWithdrawalCharge(cfg)
+  const bal = roundMoney(Math.max(0, Number(balance) || 0))
+  if (!c.enabled) return { withdrawable: bal, charge_at_max: 0 }
+  const p = c.percentage_rate / 100
+  let withdrawable = (bal - c.flat_fee) / (1 + p)
+  withdrawable = roundMoney(Math.max(0, withdrawable))
+  while (withdrawable > 0 && roundMoney(withdrawable + computeWithdrawalCharge(c, withdrawable)) > bal) {
+    withdrawable = roundMoney(withdrawable - 0.01)
+  }
+  return { withdrawable, charge_at_max: withdrawable > 0 ? computeWithdrawalCharge(c, withdrawable) : 0 }
+}
+// SUPPORT CONTACT — shown to users when a withdrawal cannot be settled because
+// the SasaPay main wallet is short. Configured in the Super-Admin dashboard.
+const DEFAULT_SUPPORT_CONTACT = { phone: '', email: '' }
+function normalizeSupportContact(raw: any) {
+  const cfg: any = { ...DEFAULT_SUPPORT_CONTACT, ...(raw && typeof raw === 'object' ? raw : {}) }
+  cfg.phone = String(cfg.phone || '').trim().slice(0, 40)
+  cfg.email = String(cfg.email || '').trim().slice(0, 120)
+  return cfg
+}
+// Mask a phone number for display (e.g. in OTP prompts).
+function maskPhone(phone: string): string {
+  const p = String(phone || '').trim()
+  if (p.length <= 6) return p ? p.replace(/.(?=.{2})/g, '*') : p
+  const head = p.slice(0, 4)
+  const tail = p.slice(-4)
+  return `${head}${'*'.repeat(Math.max(2, p.length - 8))}${tail}`
+}
+
 // ---- App settings (key/value JSON store) ----
 async function getSetting<T = any>(c: any, key: string, fallback: T): Promise<T> {
   try {
@@ -1182,7 +1251,7 @@ app.get('/api/products/finance-queue', requireAuth, requirePermission('can_manag
   const rows = await withAdminContext(c, async () => {
     const { results } = await c.env.DB.prepare(
       `SELECT p.*, u.full_name AS created_by_name
-         FROM products p LEFT JOIN users u ON u.id = p.created_by
+         FROM products p LEFT JOIN users u ON CAST(u.id AS TEXT) = p.created_by
         WHERE p.finance_status = 'pending_finance'
         ORDER BY p.created_at DESC`
     ).all()
@@ -1234,7 +1303,7 @@ app.get('/api/products/finance-audit', requireAuth, requirePermission('can_manag
               u.full_name AS created_by_name,
               (CASE WHEN p.credit_markup_pct IS NULL OR p.credit_markup_pct = 0 THEN 1 ELSE 0 END) AS missing_markup,
               (CASE WHEN p.financing_terms_text IS NULL OR p.financing_terms_text = '' THEN 1 ELSE 0 END) AS missing_agreement
-         FROM products p LEFT JOIN users u ON u.id = p.created_by
+         FROM products p LEFT JOIN users u ON CAST(u.id AS TEXT) = p.created_by
         WHERE p.finance_status <> 'published'
         ORDER BY p.created_at ASC`
     ).all()
@@ -2620,6 +2689,18 @@ app.get('/api/cross/handoff', requireAuth, async (c) => {
   return c.json({ url: `${siblingUrl}/sso?${qs}`, target, dest: dest || null })
 })
 
+// Lender opts in to consuming the Farmsky Score APIs from the Feed platform.
+// Records the opt-in (best-effort audit) before the SSO handoff to Score,
+// where the lender enables and manages API access. Lender-tier only.
+app.post('/api/cross/use-apis', requireAuth, async (c) => {
+  const user = c.get('user') as SessionUser
+  if (user.role !== 'lender') return c.json({ error: 'Only Lender-tier accounts can consume the APIs' }, 403)
+  try {
+    await audit(c, user.id, 'update', 'user', 'lender opted in to Use APIs (Farmsky Score API consumption)')
+  } catch (_) { /* audit is best-effort; never block the handoff */ }
+  return c.json({ ok: true })
+})
+
 // Sibling app lands here: verify HMAC token, issue a local session, redirect.
 app.get('/sso', async (c) => {
   const token = c.req.query('token') || ''
@@ -2840,8 +2921,8 @@ app.get('/api/dashboard', requireAuth, async (c) => {
 app.get('/api/agents', requireAuth, requireRole('admin', 'super_admin'), async (c) => {
   const { results } = await c.env.DB.prepare(
     `SELECT u.id, u.full_name, u.phone, u.email, u.region, u.label, u.permissions, u.status,
-     (SELECT COUNT(*) FROM customers WHERE agent_id=u.id) customers,
-     (SELECT COUNT(*) FROM murabaha_contracts WHERE agent_id=u.id AND status='active') active
+     (SELECT COUNT(*) FROM customers WHERE agent_id=CAST(u.id AS TEXT)) customers,
+     (SELECT COUNT(*) FROM murabaha_contracts WHERE agent_id=CAST(u.id AS TEXT) AND status='active') active
      FROM users u WHERE u.role='agent'`
   ).all()
   const agentFallback = await loadRoleTemplate(c, 'agent')
@@ -3166,6 +3247,42 @@ app.put('/api/settings/financing-markup', requireAuth, requirePermission('manage
 // Backward-compatible alias (the earlier frontend saved to /settings/markup, which 404'd).
 app.put('/api/settings/markup', requireAuth, requirePermission('manage_markup_pct'), saveFinancingMarkup)
 
+// ----------------------------------------------------------------------------
+// WITHDRAWAL CHARGE + SUPPORT CONTACT SETTINGS (aligned with Equipment)
+//   • withdrawal_charge : the standard withdrawal charge schema (flat + %).
+//   • support_contact   : phone/email shown when SasaPay main wallet is short.
+// Both are configured from the Super-Admin dashboard (admin/super_admin only).
+// ----------------------------------------------------------------------------
+function isAdminRole(user: SessionUser) {
+  return user.role === 'admin' || user.role === 'super_admin' || hasPermission(user, 'manage_wallets')
+}
+// GET — readable by any authenticated user so the wallet/withdraw UI can show
+// the withdrawable limit and the support contact if a payout can't be settled.
+app.get('/api/settings/withdrawal', requireAuth, async (c) => {
+  const user = c.get('user') as SessionUser
+  const withdrawal_charge = normalizeWithdrawalCharge(await getSetting(c, 'withdrawal_charge', DEFAULT_WITHDRAWAL_CHARGE))
+  const support_contact = normalizeSupportContact(await getSetting(c, 'support_contact', DEFAULT_SUPPORT_CONTACT))
+  return c.json({ withdrawal_charge, support_contact, can_manage: isAdminRole(user) })
+})
+app.put('/api/settings/withdrawal-charge', requireAuth, async (c) => {
+  const user = c.get('user') as SessionUser
+  if (!isAdminRole(user)) return c.json({ error: 'Forbidden' }, 403)
+  const b = await c.req.json()
+  const cfg = normalizeWithdrawalCharge(b)
+  await setSetting(c, 'withdrawal_charge', cfg)
+  await audit(c, user.id, 'update', 'settings', `withdrawal_charge:${cfg.enabled ? 'on' : 'off'} flat:${cfg.flat_fee} pct:${cfg.percentage_rate}`)
+  return c.json({ ok: true, withdrawal_charge: cfg })
+})
+app.put('/api/settings/support-contact', requireAuth, async (c) => {
+  const user = c.get('user') as SessionUser
+  if (!isAdminRole(user)) return c.json({ error: 'Forbidden' }, 403)
+  const b = await c.req.json()
+  const cfg = normalizeSupportContact(b)
+  await setSetting(c, 'support_contact', cfg)
+  await audit(c, user.id, 'update', 'settings', `support_contact phone:${cfg.phone ? 'set' : 'empty'} email:${cfg.email ? 'set' : 'empty'}`)
+  return c.json({ ok: true, support_contact: cfg })
+})
+
 // Inline "add product to inventory" used by the Processing Fee / Markup builders.
 // Authorized either by the classic admin roles OR the fee/markup management perms.
 app.post('/api/settings/quick-product', requireAuth, async (c) => {
@@ -3257,8 +3374,8 @@ app.get('/api/profile-amendments', requireAuth, async (c) => {
   const status = c.req.query('status') || 'pending'
   let q = `SELECT pa.*, u.full_name AS requester_name, u.role AS requester_role, r.full_name AS reviewer_name
            FROM profile_amendments pa
-           JOIN users u ON u.id = pa.user_id
-           LEFT JOIN users r ON r.id = pa.reviewed_by`
+           JOIN users u ON CAST(u.id AS TEXT) = pa.user_id
+           LEFT JOIN users r ON CAST(r.id AS TEXT) = pa.reviewed_by`
   const binds: any[] = []
   if (status !== 'all') { q += ` WHERE pa.status=?`; binds.push(status) }
   q += ` ORDER BY pa.created_at DESC`
@@ -3338,7 +3455,7 @@ const EXPORT_DATASETS: Record<string, { label: string; sql: string; cols: string
   },
   customers: {
     label: 'Customers / Farmers',
-    sql: `SELECT cu.id, cu.full_name, cu.mobile, cu.county, cu.value_chain, cu.kyc_status, cu.risk_band, cu.credit_score, u.full_name agent FROM customers cu LEFT JOIN users u ON u.id=cu.agent_id`,
+    sql: `SELECT cu.id, cu.full_name, cu.mobile, cu.county, cu.value_chain, cu.kyc_status, cu.risk_band, cu.credit_score, u.full_name agent FROM customers cu LEFT JOIN users u ON CAST(u.id AS TEXT)=cu.agent_id`,
     cols: ['id', 'full_name', 'mobile', 'county', 'value_chain', 'kyc_status', 'risk_band', 'credit_score', 'agent'],
     filterable: { kyc_status: 'cu.kyc_status', risk_band: 'cu.risk_band', county: 'cu.county' }
   },
@@ -3374,7 +3491,7 @@ const EXPORT_DATASETS: Record<string, { label: string; sql: string; cols: string
   },
   audit_logs: {
     label: 'Audit Log',
-    sql: `SELECT a.id, u.full_name actor, a.action, a.entity, a.detail, a.created_at FROM audit_logs a LEFT JOIN users u ON u.id=a.user_id`,
+    sql: `SELECT a.id, u.full_name actor, a.action, a.entity, a.detail, a.created_at FROM audit_logs a LEFT JOIN users u ON CAST(u.id AS TEXT)=a.user_id`,
     cols: ['id', 'actor', 'action', 'entity', 'detail', 'created_at'],
     filterable: { action: 'a.action', entity: 'a.entity' }
   }
@@ -3564,7 +3681,7 @@ app.get('/api/backups', requireAuth, requireRole('admin', 'super_admin'), async 
   await maybeAutoBackup(c)
   const { results } = await c.env.DB.prepare(
     `SELECT b.id, b.trigger_type, b.summary, b.record_count, b.size_bytes, b.status, b.error, b.created_at, u.full_name created_by_name
-       FROM system_backups b LEFT JOIN users u ON u.id=b.created_by
+       FROM system_backups b LEFT JOIN users u ON CAST(u.id AS TEXT)=b.created_by
       ORDER BY b.id DESC LIMIT 100`
   ).all()
   return c.json({ backups: results || [], interval_hours: AUTO_BACKUP_INTERVAL_MS / 3600000 })
@@ -3704,7 +3821,7 @@ app.post('/api/imports', requireAuth, requireRole('admin', 'super_admin'), async
 // List batches.
 app.get('/api/imports', requireAuth, requireRole('admin', 'super_admin'), async (c) => {
   const { results } = await c.env.DB.prepare(
-    `SELECT b.*, u.full_name created_by_name FROM import_batches b LEFT JOIN users u ON u.id=b.created_by ORDER BY b.id DESC LIMIT 100`
+    `SELECT b.*, u.full_name created_by_name FROM import_batches b LEFT JOIN users u ON CAST(u.id AS TEXT)=b.created_by ORDER BY b.id DESC LIMIT 100`
   ).all()
   return c.json({ batches: results || [] })
 })
@@ -3849,7 +3966,18 @@ app.get('/api/wallet', requireAuth, requirePermission('view_wallet', 'manage_wal
   const wallet = await c.env.DB.prepare(`SELECT * FROM wallets WHERE id=?`).bind(walletId).first<any>()
   const { results: ledger } = await c.env.DB.prepare(`SELECT * FROM wallet_ledger WHERE wallet_id=? ORDER BY id DESC LIMIT 200`).bind(walletId).all()
   const { results: rules } = await c.env.DB.prepare(`SELECT * FROM earning_rules WHERE user_id=? AND is_active=1 ORDER BY id`).bind(user.id).all()
-  return c.json({ wallet, ledger, earning_rules: rules })
+  // Withdrawal charge schema + the holder's withdrawable limit (balance − effective charge).
+  const chargeCfg = normalizeWithdrawalCharge(await getSetting(c, 'withdrawal_charge', DEFAULT_WITHDRAWAL_CHARGE))
+  const supportContact = normalizeSupportContact(await getSetting(c, 'support_contact', DEFAULT_SUPPORT_CONTACT))
+  const balance = numberVal(wallet?.balance, 0)
+  const limit = computeWithdrawableLimit(chargeCfg, balance)
+  return c.json({
+    wallet, ledger, earning_rules: rules,
+    withdrawal_charge: chargeCfg,
+    withdrawable: limit.withdrawable,
+    charge_at_max: limit.charge_at_max,
+    support_contact: supportContact
+  })
 })
 
 // ---- Admin wallet management ----
@@ -3859,7 +3987,7 @@ app.get('/api/wallets', requireAuth, requirePermission('manage_wallets'), async 
     const { results } = await c.env.DB.prepare(
       `SELECT w.*, u.full_name, u.phone, u.role,
               (SELECT COUNT(*) FROM earning_rules er WHERE er.user_id=w.user_id AND er.is_active=1) AS rule_count
-         FROM wallets w JOIN users u ON u.id = w.user_id ORDER BY u.full_name`
+         FROM wallets w JOIN users u ON CAST(u.id AS TEXT) = w.user_id ORDER BY u.full_name`
     ).all()
     return results
   })
@@ -3869,7 +3997,8 @@ app.get('/api/wallets', requireAuth, requirePermission('manage_wallets'), async 
 app.post('/api/wallets', requireAuth, requirePermission('manage_wallets'), async (c) => {
   const admin = c.get('user') as SessionUser
   const b = await c.req.json()
-  const userId = Number(b.user_id)
+  // Shared central DB: users.id is a UUID — treat the id as an opaque string.
+  const userId = String(b.user_id ?? '').trim()
   if (!userId) return c.json({ error: 'user_id is required' }, 400)
   const walletId = await ensureWallet(c, userId, admin.id)
   await audit(c, admin.id, 'assign', 'wallet', `wallet for user ${userId}`)
@@ -3888,7 +4017,7 @@ app.get('/api/earning-rules/:userId', requireAuth, requirePermission('manage_wal
 app.post('/api/earning-rules', requireAuth, requirePermission('manage_wallets'), async (c) => {
   const admin = c.get('user') as SessionUser
   const b = await c.req.json()
-  const userId = Number(b.user_id)
+  const userId = String(b.user_id ?? '').trim()
   const ruleType = String(b.rule_type || '').trim()
   if (!userId || !ruleType) return c.json({ error: 'user_id and rule_type are required' }, 400)
   const calcMethod = b.calc_method === 'percentage' ? 'percentage' : 'fixed'
@@ -3950,14 +4079,14 @@ app.post('/api/wallet/payouts', requireAuth, requirePermission('manage_wallets')
   if (amount <= 0) return c.json({ error: 'amount must be > 0' }, 400)
   const batchRef = ref('PAY')
   const result = await withAdminContext(c, async () => {
-    let recipients: number[] = []
+    let recipients: string[] = []
     if (Array.isArray(b.user_ids) && b.user_ids.length) {
-      recipients = b.user_ids.map((x: any) => Number(x)).filter(Boolean)
+      recipients = b.user_ids.map((x: any) => String(x ?? '').trim()).filter(Boolean)
     } else if (b.user_id) {
-      recipients = [Number(b.user_id)]
+      recipients = [String(b.user_id).trim()]
     } else if (b.target === 'all_agents') {
       const { results } = await c.env.DB.prepare(`SELECT id FROM users WHERE role='agent' AND status='active'`).all()
-      recipients = (results as any[]).map((r) => Number(r.id))
+      recipients = (results as any[]).map((r) => String(r.id)).filter(Boolean)
     }
     if (!recipients.length) return { error: 'No recipients resolved' }
     let total = 0, count = 0
@@ -4106,12 +4235,62 @@ app.post('/api/wallet/withdraw', requireAuth, requirePermission('view_wallet', '
   const reference = ref('WD')
   const walletId = await ensureWallet(c, user.id)
 
-  // 1) Debit the wallet ledger up-front (the trigger rejects if balance is short).
+  // Load configuration + the holder's CURRENT balance so we can validate against
+  // the withdrawable limit (balance − effective withdrawal charge) before we
+  // touch the ledger. Aligned with the Equipment central-payment hub schema.
+  const chargeCfg = normalizeWithdrawalCharge(await getSetting(c, 'withdrawal_charge', DEFAULT_WITHDRAWAL_CHARGE))
+  const supportContact = normalizeSupportContact(await getSetting(c, 'support_contact', DEFAULT_SUPPORT_CONTACT))
+  const walletRow = await c.env.DB.prepare(`SELECT balance FROM wallets WHERE id=?`).bind(walletId).first<any>()
+  const balance = roundMoney(numberVal(walletRow?.balance, 0))
+  const charge = computeWithdrawalCharge(chargeCfg, amount)
+  const totalDebit = roundMoney(amount + charge)
+  const limit = computeWithdrawableLimit(chargeCfg, balance)
+
+  // Enforce an optional minimum withdrawal.
+  if (chargeCfg.min_withdrawal > 0 && amount < chargeCfg.min_withdrawal) {
+    return c.json({ error: `The minimum withdrawal is KES ${chargeCfg.min_withdrawal.toLocaleString()}.` }, 400)
+  }
+
+  // 1a) Withdrawable-limit pre-check. The holder may only withdraw an amount
+  // whose gross + effective charge is within their balance.
+  if (totalDebit > balance) {
+    const insufficientMsg = 'Unsuccessful. You have insufficient Balance'
+    const smsBody = `${insufficientMsg}. Your wallet balance is KES ${balance.toLocaleString()}. `
+      + `The most you can withdraw now is KES ${limit.withdrawable.toLocaleString()} `
+      + `(after a KES ${limit.charge_at_max.toLocaleString()} withdrawal charge).`
+    try { if (user.phone) await sendSms(c.env, user.phone, smsBody) } catch (_) {}
+    return c.json({
+      error: insufficientMsg, insufficient: true,
+      balance, requested: amount, charge,
+      withdrawable: limit.withdrawable, charge_at_max: limit.charge_at_max
+    }, 400)
+  }
+
+  // 1b) SasaPay main-wallet funding check. If the settlement account cannot cover
+  // the gross payout, we DO NOT debit the holder — instead we tell them to
+  // contact Farmsky (support phone/email configured by the super-admin).
+  const mainBal = await sasapayBalance(c.env)
+  if (mainBal.success && !mainBal.simulated && numberVal(mainBal.org_balance, 0) < amount) {
+    return c.json({
+      error: 'Contact Farmsky', contact_farmsky: true,
+      support_phone: supportContact.phone, support_email: supportContact.email,
+      message: 'We are unable to process your withdrawal right now. Please contact Farmsky.'
+    }, 503)
+  }
+
+  // 1c) Debit the wallet ledger up-front (gross + charge). The trigger rejects
+  //     if the balance is short (defence-in-depth against a race).
   try {
     await postLedger(c, { userId: user.id, walletId, type: 'debit', amount, category: 'withdrawal', reference, description: b.reason || `Withdrawal to ${chan.name}`, createdBy: user.id })
+    if (charge > 0) {
+      await postLedger(c, { userId: user.id, walletId, type: 'debit', amount: charge, category: 'withdrawal_charge', reference, description: `Withdrawal charge for ${reference}`, createdBy: user.id })
+    }
   } catch (e: any) {
     const msg = String(e?.message || '')
-    if (/insufficient/i.test(msg)) return c.json({ error: 'Insufficient wallet balance' }, 400)
+    if (/insufficient/i.test(msg)) {
+      try { await postLedger(c, { userId: user.id, walletId, type: 'credit', amount, category: 'adjustment', reference, description: `Reversal — charge could not be posted ${reference}`, createdBy: user.id }) } catch (_) {}
+      return c.json({ error: 'Unsuccessful. You have insufficient Balance', insufficient: true, withdrawable: limit.withdrawable }, 400)
+    }
     return c.json({ error: 'Withdrawal could not be posted' }, 400)
   }
 
@@ -4124,8 +4303,11 @@ app.post('/api/wallet/withdraw', requireAuth, requirePermission('view_wallet', '
   const payout = await disburseB2C(c, { amount, receiverNumber: receiver, channel: channelCode, reason: b.reason || 'Wallet withdrawal', reference })
 
   if (!payout.success) {
-    // Reverse the debit (credit back) and mark failed.
+    // Reverse BOTH the gross debit and the withdrawal charge (credit back) and mark failed.
     await postLedger(c, { userId: user.id, walletId, type: 'credit', amount, category: 'adjustment', reference, description: `Reversal — failed withdrawal ${reference}`, createdBy: user.id })
+    if (charge > 0) {
+      await postLedger(c, { userId: user.id, walletId, type: 'credit', amount: charge, category: 'adjustment', reference, description: `Reversal — withdrawal charge ${reference}`, createdBy: user.id })
+    }
     await c.env.DB.prepare(`UPDATE wallet_withdrawals SET status='failed', ledger_debited=0, result_desc=?, updated_at=CURRENT_TIMESTAMP WHERE reference=?`).bind(payout.error || 'B2C failed', reference).run()
     return c.json({ error: payout.error || 'Disbursal failed; wallet has been refunded.' }, 502)
   }
@@ -4133,13 +4315,139 @@ app.post('/api/wallet/withdraw', requireAuth, requirePermission('view_wallet', '
   await c.env.DB.prepare(`UPDATE wallet_withdrawals SET simulated=?, b2c_request_id=?, conversation_id=?, transaction_charges=?, status=?, updated_at=CURRENT_TIMESTAMP WHERE reference=?`)
     .bind(payout.simulated ? 1 : 0, payout.b2c_request_id || null, payout.conversation_id || null, numberVal(payout.transaction_charges, 0), payout.simulated ? 'success' : 'processing', reference).run()
 
-  await audit(c, user.id, 'withdraw', 'wallet', `KES ${amount} to ${chan.name} ${receiver} (${payout.simulated ? 'sim' : 'live'})`)
-  return c.json({ ok: true, simulated: payout.simulated, reference, status: payout.simulated ? 'success' : 'processing', customer_message: payout.customer_message || (payout.simulated ? 'Withdrawal completed (simulation).' : 'Withdrawal is being processed.') })
+  await audit(c, user.id, 'withdraw', 'wallet', `KES ${amount} to ${chan.name} ${receiver} (charge KES ${charge}) (${payout.simulated ? 'sim' : 'live'})`)
+  return c.json({ ok: true, simulated: payout.simulated, reference, status: payout.simulated ? 'success' : 'processing', amount, charge, total_debited: totalDebit, customer_message: payout.customer_message || (payout.simulated ? 'Withdrawal completed (simulation).' : 'Withdrawal is being processed.') })
 })
 
 app.get('/api/wallet/withdrawals', requireAuth, requirePermission('view_wallet', 'manage_wallets'), async (c) => {
   const { results } = await c.env.DB.prepare(`SELECT * FROM wallet_withdrawals ORDER BY id DESC LIMIT 100`).all()
   return c.json({ withdrawals: results })
+})
+
+// ============================================================================
+// PEER-TO-PEER WALLET TRANSFER — a wallet holder sends funds to another Farmsky
+// user's wallet. Resolved by phone (preferred) or explicit user_id, OTP-gated,
+// and committed as a double-entry under admin context. Aligned with the
+// Equipment central-payment hub P2P feature.
+// ============================================================================
+
+// Resolve a P2P recipient from a phone number (preferred) or explicit user_id.
+// Returns the recipient user row (admin-context read so we can look up any user)
+// or an { error } object. Matches phone across raw / normalized / +254 / 07xx forms.
+async function resolveTransferRecipient(c: any, b: any): Promise<{ user?: any; error?: string }> {
+  return await withAdminContext(c, async () => {
+    const rawUserId = String(b.recipient_user_id ?? '').trim()
+    if (rawUserId) {
+      const u = await c.env.DB.prepare(`SELECT id, full_name, phone, status FROM users WHERE id=?`).bind(rawUserId).first<any>()
+      if (!u) return { error: 'Recipient not found.' }
+      return { user: u }
+    }
+    const rawPhone = String(b.recipient_phone ?? '').trim()
+    if (!rawPhone) return { error: 'A recipient phone number is required.' }
+    const norm = sasapayNormalizePhone(rawPhone)
+    const local = norm.startsWith('254') ? '0' + norm.slice(3) : rawPhone
+    const plus = norm ? '+' + norm : rawPhone
+    const u = await c.env.DB.prepare(
+      `SELECT id, full_name, phone, status FROM users WHERE phone=? OR phone=? OR phone=? OR phone=?`
+    ).bind(rawPhone, norm, plus, local).first<any>()
+    if (!u) return { error: 'No Farmsky user is registered with that phone number.' }
+    return { user: u }
+  })
+}
+
+// Look up a recipient (used by the frontend to preview the name before sending).
+app.get('/api/wallet/lookup-recipient', requireAuth, requirePermission('view_wallet', 'manage_wallets'), async (c) => {
+  const user = c.get('user') as SessionUser
+  const found = await resolveTransferRecipient(c, { recipient_phone: c.req.query('phone'), recipient_user_id: c.req.query('user_id') })
+  if (found.error) return c.json({ error: found.error }, 404)
+  const recipient = found.user
+  if (String(recipient.id) === String(user.id)) return c.json({ error: 'You cannot send money to yourself.' }, 400)
+  if (recipient.status && recipient.status !== 'active') return c.json({ error: 'That account cannot receive funds.' }, 400)
+  return c.json({ ok: true, recipient: { id: recipient.id, name: recipient.full_name || 'Farmsky user', phone: maskPhone(sasapayNormalizePhone(String(recipient.phone || ''))) } })
+})
+
+app.post('/api/wallet/transfer', requireAuth, requirePermission('view_wallet', 'manage_wallets'), async (c) => {
+  const user = c.get('user') as SessionUser
+  const b = await c.req.json()
+  const amount = roundMoney(numberVal(b.amount, 0))
+  if (amount <= 0) return c.json({ error: 'amount must be > 0' }, 400)
+
+  // Resolve the recipient (by phone or explicit user_id).
+  const found = await resolveTransferRecipient(c, b)
+  if (found.error) return c.json({ error: found.error }, 404)
+  const recipient = found.user
+  if (String(recipient.id) === String(user.id)) return c.json({ error: 'You cannot send money to yourself.' }, 400)
+  if (recipient.status && recipient.status !== 'active') return c.json({ error: 'That account cannot receive funds.' }, 400)
+
+  // Sender's wallet + balance (strictly the caller's own wallet).
+  const senderWalletId = await ensureWallet(c, user.id)
+  const senderRow = await c.env.DB.prepare(`SELECT balance FROM wallets WHERE id=?`).bind(senderWalletId).first<any>()
+  const balance = roundMoney(numberVal(senderRow?.balance, 0))
+  if (amount > balance) {
+    return c.json({ error: 'Unsuccessful. You have insufficient Balance', insufficient: true, balance }, 400)
+  }
+
+  // ---- OTP AUTHORISATION (mandatory before any outgoing funds) ----------------
+  const registeredPhone = sasapayNormalizePhone(String(user.phone || '').trim())
+  if (!registeredPhone) return c.json({ error: 'Your account has no registered phone number for OTP.' }, 400)
+  const otpCode = String(b.otp_code || '').trim()
+  if (!otpCode) {
+    const { demo_otp } = await issueOtp(c, registeredPhone, 'wallet_transfer')
+    return c.json({
+      needs_otp: true,
+      phone: maskPhone(registeredPhone),
+      recipient: { id: recipient.id, name: recipient.full_name || 'Farmsky user' },
+      amount,
+      message: 'Enter the code sent to your registered number to authorise this transfer.',
+      demo_otp
+    })
+  }
+  const otpOk = await verifyOtp(c, registeredPhone, otpCode, 'wallet_transfer')
+  if (!otpOk.ok) return c.json({ error: otpOk.error || 'Invalid verification code.', otp_failed: true }, 400)
+
+  const reference = ref('P2P')
+  const note = String(b.reason || '').trim()
+
+  // Commit the double-entry under admin context (so we can credit the recipient's
+  // wallet regardless of RLS). The DB trigger rejects the sender debit if the
+  // balance is short — defence-in-depth against a race with the pre-check.
+  try {
+    await withAdminContext(c, async () => {
+      const recipientWalletId = await ensureWallet(c, recipient.id)
+      // 1) Debit the sender first (trigger enforces sufficient balance).
+      await postLedger(c, {
+        userId: user.id, walletId: senderWalletId, type: 'debit', amount,
+        category: 'p2p_transfer', reference,
+        description: note || `Sent to ${recipient.full_name || 'user'}`, createdBy: user.id
+      })
+      // 2) Credit the recipient.
+      await postLedger(c, {
+        userId: recipient.id, walletId: recipientWalletId, type: 'credit', amount,
+        category: 'p2p_transfer', reference,
+        description: note || `Received from ${user.full_name || 'a Farmsky user'}`, createdBy: user.id
+      })
+      // 3) Record the transfer.
+      await c.env.DB.prepare(
+        `INSERT INTO wallet_withdrawals (reference, flow, wallet_id, user_id, recipient_user_id, amount, currency, channel_code, channel_name, receiver_number, recipient_name, reason, status, ledger_debited, created_by)
+         VALUES (?, 'p2p_transfer', ?,?,?,?, 'KES', '0', 'Farmsky Wallet (P2P)', ?, ?, ?, 'success', 1, ?)`
+      ).bind(reference, senderWalletId, user.id, String(recipient.id), amount, sasapayNormalizePhone(String(recipient.phone || '')), recipient.full_name || null, note || 'P2P transfer', user.id).run()
+    })
+  } catch (e: any) {
+    const msg = String(e?.message || '')
+    if (/insufficient/i.test(msg)) {
+      return c.json({ error: 'Unsuccessful. You have insufficient Balance', insufficient: true }, 400)
+    }
+    return c.json({ error: 'Transfer could not be completed' }, 400)
+  }
+
+  // Notify both parties by SMS (simulated when unconfigured).
+  try {
+    if (user.phone) await sendSms(c.env, user.phone, `You sent KES ${amount.toLocaleString()} to ${recipient.full_name || 'a Farmsky user'}. Ref ${reference}.`)
+    if (recipient.phone) await sendSms(c.env, String(recipient.phone), `You received KES ${amount.toLocaleString()} from ${user.full_name || 'a Farmsky user'}. Ref ${reference}.`)
+  } catch (_) {}
+
+  await audit(c, user.id, 'transfer', 'wallet', `KES ${amount} to user ${recipient.id} (${recipient.full_name || ''})`)
+  return c.json({ ok: true, reference, amount, recipient: { id: recipient.id, name: recipient.full_name || 'Farmsky user' }, status: 'success', customer_message: `KES ${amount.toLocaleString()} sent to ${recipient.full_name || 'the recipient'}.` })
 })
 
 // ============================================================================
@@ -4156,8 +4464,9 @@ app.post('/api/wallet/direct-pay', requireAuth, requirePermission('manage_wallet
   const reference = ref('DP')
 
   if (destination === 'wallet') {
-    // Credit an internal user's wallet directly.
-    const recipientId = Number(b.user_id)
+    // Credit an internal user's wallet directly. NB: on the shared central DB
+    // users.id is a UUID, so the id is treated as an opaque string (not Number).
+    const recipientId = String(b.user_id ?? '').trim()
     if (!recipientId) return c.json({ error: 'user_id is required for a wallet payment' }, 400)
     const result = await withAdminContext(c, async () => {
       const walletId = await ensureWallet(c, recipientId, admin.id)
@@ -4183,7 +4492,7 @@ app.post('/api/wallet/direct-pay', requireAuth, requirePermission('manage_wallet
   await c.env.DB.prepare(
     `INSERT INTO wallet_withdrawals (reference, flow, user_id, recipient_user_id, amount, currency, channel_code, channel_name, receiver_number, recipient_name, reason, status, ledger_debited, created_by)
      VALUES (?, 'direct_pay', ?,?,?, 'KES', ?,?,?,?,?, 'processing', 0, ?)`
-  ).bind(reference, admin.id, b.user_id ? Number(b.user_id) : null, amount, channelCode, chan.name, receiver, b.account_name || null, b.reason || 'Direct payment', admin.id).run()
+  ).bind(reference, admin.id, b.user_id ? String(b.user_id).trim() : null, amount, channelCode, chan.name, receiver, b.account_name || null, b.reason || 'Direct payment', admin.id).run()
 
   const payout = await disburseB2C(c, { amount, receiverNumber: receiver, channel: channelCode, reason: b.reason || 'Direct payment', reference })
   if (!payout.success) {

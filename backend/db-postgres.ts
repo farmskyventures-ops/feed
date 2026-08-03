@@ -6,6 +6,13 @@ pgTypes.setTypeParser(23, (value) => Number(value))
 pgTypes.setTypeParser(700, (value) => Number(value))
 pgTypes.setTypeParser(701, (value) => Number(value))
 pgTypes.setTypeParser(1700, (value) => Number(value))
+// Return json / jsonb columns as their raw TEXT (not a pre-parsed JS object) so
+// the app's own JSON.parse (via safeJson/getSetting) behaves identically to the
+// Cloudflare D1 driver in production. Without this, node-postgres auto-parses
+// jsonb into an object and safeJson(String(obj)) throws -> silently falls back
+// to defaults (e.g. withdrawal_charge / support_contact read back as blank).
+pgTypes.setTypeParser(114, (value) => value)   // json
+pgTypes.setTypeParser(3802, (value) => value)  // jsonb
 
 export interface D1Like {
   prepare(sql: string): D1StatementLike
