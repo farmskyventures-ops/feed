@@ -118,6 +118,10 @@ const payLabel = (t, model) => {
 
 let _products = [], _agents = [], _users = [], _customers = [], _walletUsers = []
 let _permMeta = { permissions: [], roles: [] }
+// AGENT "BUY FOR A FARMER" context (parity with Equipment): when set, the shop
+// checkout targets this farmer (customer_id) and any deposit prompt is directed
+// to the farmer's phone. Shape: { id, name, phone } | null.
+let _buyFor = null
 // Wallet withdraw-limit / charge / support-contact stash (populated by viewMyWallet
 // from GET /api/wallet so the withdraw modal can show the withdrawable limit
 // without a second round-trip). Aligned with the Equipment central-payment hub.
@@ -1061,7 +1065,9 @@ async function viewDashboard() {
     <div class="card p-6"><h3 class="font-bold mb-2"><i class="fas fa-store text-teal-600 mr-2"></i>Quick Actions</h3>
       <button onclick="go('shop')" class="btn brand-bg text-white px-5 py-2.5 rounded-lg text-sm mr-2"><i class="fas fa-cart-plus mr-1"></i>Buy Feed</button>
       <button onclick="go('contracts')" class="btn bg-slate-100 px-5 py-2.5 rounded-lg text-sm"><i class="fas fa-list mr-1"></i>My Purchases</button>
-    </div>`
+    </div>
+    <div id="quickCheckout" class="mt-6"></div>`
+    renderQuickCheckout()
   } else if (data.role === 'agent') {
     $('content').innerHTML = `${banner}<div class="grid grid-cols-1 md:grid-cols-4 gap-4 mb-6">
       ${statCard('fa-users', 'Farmers Added', data.customers_onboarded, 'bg-teal-50 text-teal-600')}
@@ -1073,7 +1079,10 @@ async function viewDashboard() {
       ${statCard('fa-triangle-exclamation', 'Portfolio at Risk', data.portfolio_at_risk + '%', 'bg-red-50 text-red-600')}
       ${statCard('fa-calendar-xmark', 'Late Installments', data.late_installments, 'bg-orange-50 text-orange-600')}
     </div>
-    <div class="card p-6"><button onclick="go('onboard')" class="btn brand-bg text-white px-5 py-2.5 rounded-lg text-sm"><i class="fas fa-user-plus mr-1"></i>Add New Farmer</button></div>`
+    <div class="card p-6 flex flex-wrap gap-2">
+      <button onclick="go('onboard')" class="btn brand-bg text-white px-5 py-2.5 rounded-lg text-sm"><i class="fas fa-user-plus mr-1"></i>Add New Farmer</button>
+      <button onclick="buyForModal()" class="btn bg-emerald-600 text-white px-5 py-2.5 rounded-lg text-sm"><i class="fas fa-cart-plus mr-1"></i>Buy For a Farmer</button>
+    </div>`
   } else {
     $('content').innerHTML = `${banner}<div class="grid grid-cols-1 md:grid-cols-4 gap-4 mb-6">
       ${statCard('fa-chart-line', 'Total Sales', fmt(data.total_sales), 'bg-teal-50 text-teal-600')}
@@ -1151,10 +1160,103 @@ function prodImg(p, cls) {
     ? `<img src="${esc(p.image)}" alt="${esc(p.name)}" class="${cls} object-cover">`
     : `<div class="${cls} flex items-center justify-center bg-gradient-to-br from-teal-50 to-emerald-100 text-teal-400"><i class="fas fa-box-open text-3xl"></i></div>`
 }
+
+// ---------------------------------------------------------------------------
+// CUSTOMER QUICK CHECKOUT (parity with Equipment) — a compact grid of in-stock
+// products on the customer dashboard so a farmer can jump straight into a
+// purchase without navigating to the full shop.
+// ---------------------------------------------------------------------------
+async function renderQuickCheckout() {
+  const el = $('quickCheckout'); if (!el) return
+  try {
+    const { data } = await api.get('/products?shop=1')
+    _products = data.products || []
+    const items = _products.filter(p => Number(p.quantity) > 0).slice(0, 6)
+    if (!items.length) { el.innerHTML = ''; return }
+    const cards = items.map(p => `
+      <div class="card overflow-hidden fade-in flex flex-col cursor-pointer hover:shadow-lg transition-shadow" onclick="buyModal(${p.id})">
+        ${prodImg(p, 'w-full h-32')}
+        <div class="p-3 flex flex-col flex-1">
+          <h4 class="font-semibold text-sm text-slate-800 truncate">${esc(p.name)}</h4>
+          <p class="text-[11px] text-slate-400 mb-2 truncate">${esc(p.category || '')}${p.subcategory ? ' › ' + esc(p.subcategory) : ''}</p>
+          <div class="mt-auto flex items-center justify-between">
+            <div><span class="text-[10px] text-slate-400 block">Cash</span><span class="font-bold text-emerald-600 text-sm">${fmt(p.cash_price)}</span></div>
+            <span class="btn brand-bg text-white px-3 py-1.5 rounded-lg text-xs"><i class="fas fa-bolt mr-1"></i>Checkout</span>
+          </div>
+        </div>
+      </div>`).join('')
+    el.innerHTML = `<div class="flex items-center justify-between mb-3">
+        <h3 class="font-bold text-slate-800"><i class="fas fa-bolt text-amber-500 mr-2"></i>Quick Checkout</h3>
+        <button onclick="go('shop')" class="text-teal-600 text-sm hover:underline">Browse all <i class="fas fa-arrow-right text-xs ml-1"></i></button>
+      </div>
+      <div class="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-4">${cards}</div>`
+  } catch (err) { el.innerHTML = '' }
+}
+
+// ---------------------------------------------------------------------------
+// AGENT "BUY FOR A FARMER" (parity with Equipment) — an agent selects a farmer
+// from their own roster and places an order on the farmer's behalf. The shop
+// then enters buy-for context (see _buyFor) so checkout targets that farmer.
+// ---------------------------------------------------------------------------
+window.buyForModal = async () => {
+  let farmers = []
+  try { const { data } = await api.get('/customers'); farmers = data.customers || [] } catch (err) { return toast(err.response?.data?.error || 'Could not load your farmers', false) }
+  if (!farmers.length) {
+    return showModal(`<h3 class="font-bold mb-2"><i class="fas fa-cart-plus text-emerald-600 mr-2"></i>Buy For a Farmer</h3>
+      <p class="text-sm text-slate-500 mb-4">You have no farmers on your roster yet. Add a farmer first, then place an order on their behalf.</p>
+      <div class="flex gap-2"><button onclick="closeModal();go('onboard')" class="btn flex-1 brand-bg text-white py-2 rounded-lg text-sm">Add a Farmer</button><button onclick="closeModal()" class="btn px-4 bg-slate-100 rounded-lg text-sm">Close</button></div>`)
+  }
+  const rows = farmers.map(f => `<button onclick="buyForFarmer(${f.id})" class="w-full text-left flex items-center justify-between border-b border-slate-100 py-2.5 px-1 hover:bg-slate-50 rounded-lg">
+      <span><span class="font-medium text-sm">${esc(f.full_name)}</span><span class="block text-xs text-slate-400">${esc(f.mobile || 'no phone')} · ${esc(f.county || '')} ${f.kyc_status === 'verified' ? '<span class="text-emerald-600">· KYC ✓</span>' : ''}</span></span>
+      <i class="fas fa-chevron-right text-slate-300 text-xs"></i>
+    </button>`).join('')
+  showModal(`<h3 class="font-bold mb-1"><i class="fas fa-cart-plus text-emerald-600 mr-2"></i>Buy For a Farmer</h3>
+    <p class="text-xs text-slate-500 mb-3">Select a farmer from your roster to place an order on their behalf.</p>
+    <input id="bf_search" oninput="bfFilterFarmers()" placeholder="Search farmers…" class="w-full px-3 py-2 border rounded-lg mb-3 text-sm">
+    <div id="bf_list" class="max-h-72 overflow-y-auto">${rows}</div>
+    <div class="mt-3"><button onclick="closeModal()" class="btn px-4 bg-slate-100 rounded-lg text-sm">Cancel</button></div>`)
+}
+window.bfFilterFarmers = () => {
+  const q = String($('bf_search')?.value || '').toLowerCase()
+  const list = $('bf_list'); if (!list) return
+  Array.from(list.children).forEach(el => {
+    el.style.display = el.textContent.toLowerCase().includes(q) ? '' : 'none'
+  })
+}
+// Step 2: farmer selected → enter buy-for context and open the standard shop so
+// the agent can add products and check out for the farmer.
+window.buyForFarmer = (farmerId) => {
+  const f = (_customers || []).find(x => x.id === farmerId)
+  // _customers may not be loaded if invoked from the dashboard modal; fall back to a fetch.
+  if (!f) {
+    api.get('/customers').then(({ data }) => {
+      const found = (data.customers || []).find(x => x.id === farmerId)
+      if (!found) return toast('Farmer not found on your roster', false)
+      _customers = data.customers
+      _enterBuyFor(found)
+    }).catch(() => toast('Could not load farmer', false))
+    return
+  }
+  _enterBuyFor(f)
+}
+function _enterBuyFor(f) {
+  _buyFor = { id: f.id, name: f.full_name, phone: f.mobile || '' }
+  closeModal()
+  toast(`Buying for ${f.full_name}. Add products and check out on their behalf.`)
+  state.route = 'shop'; renderApp()
+}
+window.clearBuyFor = () => { _buyFor = null; toast('Buy-For cancelled'); route() }
+
 async function viewShop() {
   const { data } = await api.get('/products?shop=1')
   _products = data.products
-  $('content').innerHTML = `<div class="grid grid-cols-1 md:grid-cols-3 gap-5">
+  // AGENT "Buy For a Farmer" banner: when an agent has entered buy-for context,
+  // surface who the order will be placed for + a way to cancel the session.
+  const buyForBanner = _buyFor ? `<div class="mb-4 p-3 rounded-lg bg-emerald-50 border border-emerald-200 flex items-center justify-between flex-wrap gap-2">
+      <div class="text-sm text-emerald-800"><i class="fas fa-cart-plus mr-1"></i>Buying on behalf of <b>${esc(_buyFor.name)}</b>${_buyFor.phone ? ` · ${esc(_buyFor.phone)}` : ''}. Add products and check out for this farmer.</div>
+      <button onclick="clearBuyFor()" class="btn bg-white border border-emerald-300 text-emerald-700 px-3 py-1.5 rounded-lg text-xs"><i class="fas fa-xmark mr-1"></i>Cancel Buy-For</button>
+    </div>` : ''
+  $('content').innerHTML = `${buyForBanner}<div class="grid grid-cols-1 md:grid-cols-3 gap-5">
     ${data.products.map(p => `
       <div class="card overflow-hidden fade-in flex flex-col">
         <div class="cursor-pointer" onclick="productDetail(${p.id})">${prodImg(p, 'w-full h-44')}</div>
@@ -1264,15 +1366,28 @@ window.submitBuy = async (productId, ev) => {
   if (!$('consent').checked) return toast('Consent is required (Sharia requirement)', false)
   const done = btnLoading(ev?.currentTarget, 'Submitting…')
   const body = { product_id: productId, quantity: $('qty').value, payment_type: $('ptype').value, term_months: $('term') ? $('term').value : 0, delivery_location: $('dloc').value, consent: true }
+  // AGENT "Buy For": target the selected farmer's customer profile.
+  if (_buyFor) body.customer_id = _buyFor.id
   try {
     const { data } = await api.post('/murabaha/apply', body)
     if (data.requires_payment) {
-      // Cash purchase -> pay now via M-Pesa STK push (full amount).
-      payModal(data.id, data.amount_due_now, data.outstanding, 'cash')
+      // Cash purchase -> deposit due now. If an agent placed this order for a
+      // farmer, direct the STK prompt to the farmer's phone; otherwise the
+      // buyer's own phone (standard flow).
+      const farmer = data.buy_for ? (data.farmer || _buyFor) : null
+      const opts = farmer ? { phone: farmer.phone, name: farmer.name, deposit: (data.deposit_amount || 0) > 0 } : undefined
+      if (data.buy_for) _buyFor = null  // order is placed; end the buy-for shopping session
+      payModal(data.id, data.amount_due_now, data.outstanding, 'cash', opts)
       return
     }
     closeModal()
-    toast('Application submitted: ' + data.contract_ref)
+    if (data.buy_for) {
+      const who = (data.farmer && data.farmer.name) || (_buyFor && _buyFor.name) || 'the farmer'
+      _buyFor = null
+      toast(`Order placed for ${who}: ${data.contract_ref}. Advanced to approval / delivery.`)
+    } else {
+      toast('Application submitted: ' + data.contract_ref)
+    }
     state.route = 'contracts'; renderApp()
   } catch (err) {
     done()
@@ -1387,8 +1502,14 @@ window.contractDetail = async (id) => {
   const { data } = await api.get('/murabaha/' + id)
   const c = data.contract
   const canPay = state.user.role === 'customer' && c.status === 'active'
-  const canDispatch = ['admin', 'super_admin', 'operations_finance'].includes(state.user.role) && ['active', 'completed', 'awaiting_cash_balance'].includes(c.status) && c.dispatch_status !== 'dispatched'
+  const canDispatch = ['admin', 'super_admin', 'operations_finance'].includes(state.user.role) && ['active', 'completed', 'awaiting_cash_balance'].includes(c.status) && !['dispatched', 'delivered'].includes(c.dispatch_status)
   const canRequest = !['admin', 'super_admin'].includes(state.user.role) && canDo('request_admin_action')
+  // Delivery may be confirmed by ops/admin, collect_payment holders, or the
+  // owning agent (who fulfils their farmers' orders). On delivery, any
+  // outstanding balance triggers a farmer payment prompt (parity w/ Equipment).
+  const isOwningAgent = state.user.role === 'agent' && String(c.agent_id) === String(state.user.id)
+  const canDeliver = (['admin', 'super_admin', 'operations_finance'].includes(state.user.role) || canDo('collect_payment') || isOwningAgent)
+    && ['active', 'completed', 'awaiting_cash_balance'].includes(c.status) && c.dispatch_status !== 'delivered'
 
   // ---- Issue 2: Milestone Payment & Balance Calculator ----------------------
   const isCash = c.payment_type === 'cash'
@@ -1462,7 +1583,8 @@ window.contractDetail = async (id) => {
       ${canPay ? `<button onclick="payModal(${c.id}, ${c.monthly_payment || c.installment_amount || c.outstanding}, ${c.outstanding})" class="btn flex-1 brand-bg text-white py-2.5 rounded-lg text-sm"><i class="fas fa-mobile-alt mr-1"></i>Pay via M-Pesa</button>` : ''}
       ${cashBalanceDue && canCollect ? `<button onclick="payModal(${c.id}, ${outstanding}, ${outstanding}, 'cash')" class="btn flex-1 bg-amber-500 text-white py-2.5 rounded-lg text-sm"><i class="fas fa-wallet mr-1"></i>Pay Balance (${fmt(outstanding)})</button>` : ''}
       ${!isCash && hasBalance && canCollect ? `<button onclick="payModal(${c.id}, ${nextDue ? (Number(nextDue.amount_due) - Number(nextDue.amount_paid||0)) : outstanding}, ${outstanding}, 'repay')" class="btn flex-1 bg-teal-600 text-white py-2.5 rounded-lg text-sm"><i class="fas fa-coins mr-1"></i>Collect Installment</button>` : ''}
-      ${canDispatch ? `<button onclick="dispatchContract(${c.id})" class="btn flex-1 bg-emerald-600 text-white py-2.5 rounded-lg text-sm"><i class="fas fa-truck mr-1"></i>Dispatch Feedt</button>` : ''}
+      ${canDispatch ? `<button onclick="dispatchContract(${c.id})" class="btn flex-1 bg-emerald-600 text-white py-2.5 rounded-lg text-sm"><i class="fas fa-truck mr-1"></i>Dispatch Feed</button>` : ''}
+      ${canDeliver ? `<button onclick="deliverContract(${c.id})" class="btn flex-1 bg-indigo-600 text-white py-2.5 rounded-lg text-sm"><i class="fas fa-box-open mr-1"></i>Mark Delivered</button>` : ''}
       ${canRequest ? `<button onclick="requestChangeModal('contract', ${c.id}, 'amend contract')" class="btn flex-1 bg-amber-500 text-white py-2.5 rounded-lg text-sm"><i class="fas fa-paper-plane mr-1"></i>Request Admin Change</button>` : ''}
       <button onclick="viewDoc(${c.id})" class="btn flex-1 bg-slate-800 text-white py-2.5 rounded-lg text-sm"><i class="fas fa-file-pdf mr-1"></i>Documents</button>
       ${canManageContracts() ? `<button onclick="closeModal();editContractModal(${c.id})" class="btn flex-1 bg-indigo-600 text-white py-2.5 rounded-lg text-sm"><i class="fas fa-pen-to-square mr-1"></i>Edit</button>${(c.status !== 'cancelled' && c.status !== 'completed') ? `<button onclick="cancelContract(${c.id},'${esc(c.contract_ref)}')" class="btn flex-1 bg-red-600 text-white py-2.5 rounded-lg text-sm"><i class="fas fa-ban mr-1"></i>Cancel Contract</button>` : ''}` : ''}
@@ -1476,15 +1598,37 @@ window.dispatchContract = async (id) => {
     closeModal(); viewContracts()
   } catch (err) { toast(err.response?.data?.error || 'Dispatch failed', false) }
 }
-window.payModal = async (id, amount, outstanding, kind) => {
+// Mark an order delivered. On successful delivery, if a balance remains, a
+// final-balance payment prompt is automatically raised to the farmer.
+window.deliverContract = async (id) => {
+  try {
+    const { data } = await api.post(`/murabaha/${id}/deliver`, {})
+    if (data.balance_due && data.outstanding > 0) {
+      const farmer = data.farmer || {}
+      toast(`Delivered. Requesting the outstanding balance of ${fmt(data.outstanding)} from ${farmer.name || 'the farmer'}.`)
+      // Auto-trigger the final balance payment prompt directed to the farmer.
+      payModal(id, data.outstanding, data.outstanding, 'cash', { phone: farmer.phone, name: farmer.name, balance: true })
+    } else {
+      toast('Order marked delivered. No outstanding balance.')
+      closeModal(); viewContracts()
+    }
+  } catch (err) { toast(err.response?.data?.error || 'Could not mark delivered', false) }
+}
+window.payModal = async (id, amount, outstanding, kind, opts) => {
   kind = kind || 'repay'
+  opts = opts || {}
   const isCash = kind === 'cash'
+  // When set (agent deliver / Buy-For), the prompt is directed to the farmer's phone.
+  const targetPhone = opts.phone || state.user.phone
+  const forFarmer = !!opts.phone
+  const payTitle = opts.deposit ? 'Deposit Payment' : opts.balance ? 'Final Balance Payment' : (isCash ? 'Cash Checkout' : 'Repayment')
   let mpMode = { mode: 'simulation', live: false }
   try { mpMode = (await api.get('/mpesa/status')).data } catch {}
   const modeBadge = (m) => m.live
 
-  showModal(`<h3 class="text-lg font-bold mb-1"><i class="fas fa-mobile-alt text-teal-600 mr-2"></i>${isCash ? 'Cash Checkout' : 'Repayment'}</h3>
+  showModal(`<h3 class="text-lg font-bold mb-1"><i class="fas fa-mobile-alt text-teal-600 mr-2"></i>${esc(payTitle)}</h3>
     <p class="text-xs text-slate-500 mb-3">${isCash ? 'Amount due' : 'Outstanding'}: ${fmt(outstanding)}</p>
+    ${forFarmer ? `<div class="mb-3 p-2 rounded-lg bg-emerald-50 border border-emerald-200 text-xs text-emerald-800"><i class="fas fa-user mr-1"></i>A payment prompt will be sent to <b>${esc(opts.name || 'the farmer')}</b>${opts.phone ? ` (${esc(opts.phone)})` : ''} to authorise this ${opts.balance ? 'balance' : 'deposit'} payment.</div>` : ''}
 
     <!-- Customer-facing payment rails: M-Pesa and SasaPay. BOTH are routed
          through the Farmsky Central Payment Gateway (Feed.farmsky.africa),
@@ -1525,7 +1669,7 @@ window.payModal = async (id, amount, outstanding, kind) => {
       </div>
     </div>
 
-    <label class="text-sm font-medium">Phone</label><input id="mpphone" value="${esc(state.user.phone)}" class="w-full mt-1 mb-3 px-3 py-2 border border-slate-300 rounded-lg">
+    <label class="text-sm font-medium">Phone${forFarmer ? ' (farmer)' : ''}</label><input id="mpphone" value="${esc(targetPhone)}" class="w-full mt-1 mb-3 px-3 py-2 border border-slate-300 rounded-lg">
     <label class="text-sm font-medium">Amount (KES)</label><input id="mpamt" type="number" value="${amount}" ${isCash ? 'readonly' : ''} class="w-full mt-1 mb-2 px-3 py-2 border border-slate-300 rounded-lg ${isCash ? 'bg-slate-50' : ''}">
 
     <!-- Issue 6: Dynamic legal agreement block — toggles between asset financing
@@ -2918,8 +3062,9 @@ async function viewCustomers() {
   _customers = data.customers || []
   const isAdmin = ['admin', 'super_admin'].includes(state.user.role)
   const canEditFarmers = isAdmin || state.user.role === 'agent'
+  const isAgent = state.user.role === 'agent'
   const actionBar = canDo('add_farmer') || isAdmin
-    ? `<div class="action-bar"><button onclick="viewOnboard()" class="btn brand-bg text-white px-4 py-2 rounded-lg text-sm"><i class="fas fa-user-plus mr-1"></i>Add Farmer</button></div>`
+    ? `<div class="action-bar"><button onclick="viewOnboard()" class="btn brand-bg text-white px-4 py-2 rounded-lg text-sm"><i class="fas fa-user-plus mr-1"></i>Add Farmer</button>${isAgent ? `<button onclick="buyForModal()" class="btn bg-emerald-600 text-white px-4 py-2 rounded-lg text-sm ml-2"><i class="fas fa-cart-plus mr-1"></i>Buy For a Farmer</button>` : ''}</div>`
     : ''
   const counties = [...new Set(_customers.map(c => c.county).filter(Boolean))].map(v => ({ v, t: v }))
   const chains = [...new Set(_customers.map(c => c.value_chain).filter(Boolean))].map(v => ({ v, t: v }))

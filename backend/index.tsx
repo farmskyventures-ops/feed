@@ -1523,6 +1523,12 @@ app.post('/api/murabaha/apply', requireAuth, async (c) => {
     custId = myCust.id
   }
   const custRow = await withAdminContext(c, async () => await c.env.DB.prepare(`SELECT * FROM customers WHERE id=?`).bind(custId).first<any>())
+  if (!custRow) return c.json({ error: 'Farmer not found' }, 404)
+  // AGENT "BUY FOR" GUARD: an agent placing an order on behalf of a farmer may
+  // only select a farmer assigned to their own roster.
+  if (user.role === 'agent' && String(custRow.agent_id ?? '') !== String(user.id ?? '')) {
+    return c.json({ error: 'You can only place orders for farmers assigned to you.' }, 403)
+  }
   const normalizedPaymentType = payment_type === 'cash' ? 'cash' : 'financing'
   if (normalizedPaymentType === 'financing' && custRow?.kyc_status !== 'verified') {
     return c.json({
@@ -1565,8 +1571,14 @@ app.post('/api/murabaha/apply', requireAuth, async (c) => {
     outstanding: q.total_payable,
     installment_amount: q.installment_amount,
     monthly_payment: q.monthly_payment || q.installment_amount,
+    deposit_amount: q.deposit_amount,
+    deposit_pct: q.deposit_pct,
     requires_payment: normalizedPaymentType === 'cash' && q.amount_due_now > 0,
-    payment_frequency: q.payment_frequency
+    payment_frequency: q.payment_frequency,
+    // "Buy For" context: when an agent placed this order on a farmer's behalf,
+    // surface the farmer so the client can direct the deposit prompt to them.
+    buy_for: user.role === 'agent',
+    farmer: { id: custRow.id, name: custRow.full_name || 'Farmer', phone: custRow.mobile || '' }
   })
 })
 app.get('/api/murabaha', requireAuth, async (c) => {
@@ -1643,6 +1655,51 @@ app.post('/api/murabaha/:id/dispatch', requireAuth, requireRole('admin', 'super_
   await c.env.DB.prepare(`UPDATE murabaha_contracts SET dispatch_status='dispatched', dispatched_at=CURRENT_TIMESTAMP, dispatched_by=? WHERE id=?`).bind(c.get('user').id, id).run()
   await audit(c, c.get('user').id, 'dispatch', 'contract', contract.contract_ref)
   return c.json({ ok: true })
+})
+
+// ----------------------------------------------------------------------------
+// DELIVERY CONFIRMATION (parity with Equipment) — mark an order delivered.
+//   Available to ops/admin, holders of the collect_payment permission, OR the
+//   owning agent who fulfils their own farmers' orders. On delivery, if a
+//   balance remains, the farmer is notified via SMS and a final-balance
+//   payment prompt can be raised to the farmer's phone (see frontend).
+// ----------------------------------------------------------------------------
+app.post('/api/murabaha/:id/deliver', requireAuth, async (c) => {
+  const user = c.get('user') as SessionUser
+  const id = c.req.param('id')
+  const contract = await withAdminContext(c, async () => await c.env.DB.prepare(
+    `SELECT mc.*, cu.full_name AS customer_name, cu.mobile AS customer_mobile
+       FROM murabaha_contracts mc JOIN customers cu ON cu.id=mc.customer_id WHERE mc.id=?`
+  ).bind(id).first<any>())
+  if (!contract) return c.json({ error: 'Not found' }, 404)
+  const isStaff = ['admin', 'super_admin', 'operations_finance'].includes(user.role) || hasPermission(user, 'collect_payment')
+  const isOwningAgent = user.role === 'agent' && String(contract.agent_id ?? '') === String(user.id ?? '')
+  if (!isStaff && !isOwningAgent) return c.json({ error: 'You do not have permission to mark this order delivered.' }, 403)
+  if (!['active', 'completed', 'awaiting_cash_balance'].includes(contract.status)) {
+    return c.json({ error: 'Only an approved / paid order can be marked delivered.' }, 400)
+  }
+  if (contract.dispatch_status === 'delivered') return c.json({ error: 'This order is already marked delivered.' }, 400)
+  await c.env.DB.prepare(`UPDATE murabaha_contracts SET dispatch_status='delivered', dispatched_at=COALESCE(dispatched_at, CURRENT_TIMESTAMP), dispatched_by=COALESCE(dispatched_by, ?) WHERE id=?`).bind(user.id, id).run()
+  await audit(c, user.id, 'deliver', 'contract', contract.contract_ref)
+  const outstanding = roundMoney(numberVal(contract.outstanding, 0))
+  const balanceDue = outstanding > 0.5
+  // Notify the farmer that delivery is done and (if applicable) a balance is due.
+  try {
+    if (contract.customer_mobile) {
+      const msg = balanceDue
+        ? `Your order ${contract.contract_ref} has been delivered. A final balance of KES ${outstanding.toLocaleString()} is now due.`
+        : `Your order ${contract.contract_ref} has been delivered. Thank you for choosing Farmsky.`
+      await sendSms(c.env, String(contract.customer_mobile), msg)
+    }
+  } catch (_) {}
+  return c.json({
+    ok: true,
+    delivered: true,
+    balance_due: balanceDue,
+    outstanding,
+    contract_ref: contract.contract_ref,
+    farmer: { id: contract.customer_id, name: contract.customer_name || 'Farmer', phone: contract.customer_mobile || '' }
+  })
 })
 
 // ----------------------------------------------------------------------------
