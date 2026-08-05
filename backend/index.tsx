@@ -660,6 +660,57 @@ function genPassword(): string {
   return String(Math.floor(1000 + Math.random() * 9000))
 }
 
+// Roles for which an email address is MANDATORY. Everyone else (agent, customer,
+// partner, investor, operations_finance, …) may be onboarded without one.
+const EMAIL_REQUIRED_ROLES = ['super_admin', 'admin', 'lender']
+function emailIsRequired(role: string): boolean {
+  return EMAIL_REQUIRED_ROLES.includes(String(role || '').toLowerCase())
+}
+
+// Local domain used for synthetic placeholder emails. These are NOT deliverable
+// addresses — they exist purely to satisfy the central schema. Anything using
+// `email` for real delivery must treat an @PLACEHOLDER_EMAIL_DOMAIN address as
+// "no email on file".
+const PLACEHOLDER_EMAIL_DOMAIN = 'no-email.farmsky.local'
+function isPlaceholderEmail(email: any): boolean {
+  return String(email || '').toLowerCase().endsWith('@' + PLACEHOLDER_EMAIL_DOMAIN)
+}
+
+// Resolve the value bound to the central `users.email` column. On the shared
+// farmsky_central_db this column is BOTH `NOT NULL` and `UNIQUE`, so we cannot
+// bind NULL and we cannot reuse a shared sentinel like '' across users (the 2nd
+// such insert hits users_email_key → 23505). Behaviour:
+//   • email supplied             → trimmed, lower-cased value.
+//   • email blank, role needs it → { error } so the caller can 400.
+//   • email blank, role optional → a UNIQUE, non-deliverable placeholder derived
+//     from the phone (or a random UUID) so NOT NULL + UNIQUE are both satisfied.
+//     `isPlaceholderEmail()` lets the rest of the app treat it as "no email".
+function resolveEmail(role: string, rawEmail: any, phone?: any): { value: string } | { error: string } {
+  const email = String(rawEmail ?? '').trim()
+  if (email) return { value: email.toLowerCase() }
+  if (emailIsRequired(role)) {
+    return { error: `An email address is required for ${String(role).replace(/_/g, ' ')} accounts.` }
+  }
+  const key = String(phone ?? '').replace(/[^a-z0-9]/gi, '').toLowerCase() || (crypto.randomUUID().replace(/-/g, ''))
+  return { value: `no-email+${key}@${PLACEHOLDER_EMAIL_DOMAIN}` }
+}
+
+// Re-authenticate the current session by re-checking the caller's password.
+// Used to gate SENSITIVE data downloads (full system backups, platform data
+// exports) so a stolen/borrowed session cannot silently exfiltrate the DB.
+// Mirrors the Equipment implementation exactly.
+async function verifyReauth(c: any, password: any): Promise<{ ok: true } | { ok: false; error: string; status: number }> {
+  const pw = String(password ?? '')
+  if (!pw) return { ok: false, error: 'Enter your password to confirm this download.', status: 400 }
+  const user = c.get('user') as SessionUser
+  if (!user) return { ok: false, error: 'Not authenticated.', status: 401 }
+  const row = await c.env.DB.prepare(`SELECT password FROM users WHERE CAST(id AS TEXT) = ?`).bind(String(user.id)).first<any>()
+  if (!row) return { ok: false, error: 'Account not found.', status: 401 }
+  const check = await verifyPassword(pw, row.password)
+  if (!check.ok) return { ok: false, error: 'Incorrect password. Please try again.', status: 401 }
+  return { ok: true }
+}
+
 // A secure, random TEMPORARY password for the multi-user onboarding flow.
 // Mixed-case + digits, avoids ambiguous characters (0/O, 1/l/I).
 function genTempPassword(len = 10): string {
@@ -3009,23 +3060,30 @@ app.post('/api/agents', requireAuth, requireRole('admin', 'super_admin'), async 
   const dup = await c.env.DB.prepare(`SELECT id FROM users WHERE phone=?`).bind(p).first()
   if (dup) return c.json({ error: 'A user with this phone already exists' }, 409)
   const provided = b.password && String(b.password).length >= 4
-  // Multi-user onboarding: unless an explicit password is set, verify the new
-  // user's phone via OTP, then issue a temporary (must-change, 3h-expiry) one.
-  if (!provided) {
+  // Admin-driven onboarding — the creating admin is already authenticated, so we
+  // never block on a phone OTP. Password supplied → use it; blank → auto-generate
+  // a temporary (must-change) one and SMS it. An OTP is only consumed if supplied.
+  if (!provided && b.otp_code) {
     const v = await verifyOtp(c, p, String(b.otp_code || ''), 'onboard')
-    if (!v.ok) return c.json({ error: v.error || 'Phone verification required', otp_required: true }, 400)
+    if (!v.ok) return c.json({ error: v.error || 'Phone verification failed', otp_required: true }, 400)
   }
   const pwd = provided ? String(b.password) : genPassword()
   const perms = await permissionsForRole(c, 'agent', b.permissions || {})
   const creatorId = c.get('user').id
+  // Email is optional for agents. resolveEmail supplies a unique, non-deliverable
+  // placeholder (derived from phone) when blank, satisfying the central
+  // users.email NOT NULL + UNIQUE constraints (was 23502 on null, 23505 on '').
+  const agEmailRes = resolveEmail('agent', b.email, b.phone)
+  if ('error' in agEmailRes) return c.json({ error: agEmailRes.error }, 400)
+  const agEmail = agEmailRes.value
   // On the shared central DB users.org_id is NOT NULL — attach the creating
   // admin's tenant (falling back to the deployment default). Omitted on the
   // Feed-only DB shape (no org_id column).
   const agOrgId = (await resolveCreatorOrgId(c, c.get('user'))) || (await resolveDefaultOrgId(c))
   const agWithOrg = (await usersHasOrgId(c)) && agOrgId != null
   const r = agWithOrg
-    ? await c.env.DB.prepare(`INSERT INTO users (full_name,phone,email,password,role,region,password_set,label,permissions,created_by,org_id) VALUES (?,?,?,?, 'agent', ?, ?, ?, ?, ?, ?)`).bind(b.full_name, p, b.email || null, await hashPassword(pwd), b.region || null, provided, b.label || 'Agent', JSON.stringify(perms), creatorId, agOrgId).run()
-    : await c.env.DB.prepare(`INSERT INTO users (full_name,phone,email,password,role,region,password_set,label,permissions,created_by) VALUES (?,?,?,?, 'agent', ?, ?, ?, ?, ?)`).bind(b.full_name, p, b.email || null, await hashPassword(pwd), b.region || null, provided, b.label || 'Agent', JSON.stringify(perms), creatorId).run()
+    ? await c.env.DB.prepare(`INSERT INTO users (full_name,phone,email,password,role,region,password_set,label,permissions,created_by,org_id) VALUES (?,?,?,?, 'agent', ?, ?, ?, ?, ?, ?)`).bind(b.full_name, p, agEmail, await hashPassword(pwd), b.region || null, provided, b.label || 'Agent', JSON.stringify(perms), creatorId, agOrgId).run()
+    : await c.env.DB.prepare(`INSERT INTO users (full_name,phone,email,password,role,region,password_set,label,permissions,created_by) VALUES (?,?,?,?, 'agent', ?, ?, ?, ?, ?)`).bind(b.full_name, p, agEmail, await hashPassword(pwd), b.region || null, provided, b.label || 'Agent', JSON.stringify(perms), creatorId).run()
   await c.env.DB.prepare(`INSERT INTO agents (user_id,region,permissions) VALUES (?,?,?)`).bind(r.meta.last_row_id, b.region || null, JSON.stringify(perms)).run()
   await audit(c, creatorId, 'create', 'agent', b.full_name)
   if (provided) return c.json({ id: r.meta.last_row_id, password: pwd, password_was_set_by_admin: true })
@@ -3095,11 +3153,19 @@ app.post('/api/users', requireAuth, requireRole('admin', 'super_admin'), async (
   const dup = await c.env.DB.prepare(`SELECT id FROM users WHERE phone=?`).bind(p).first<any>()
   if (dup) return c.json({ error: 'A user with this phone already exists' }, 409)
   const provided = b.password && String(b.password).length >= 4
-  // Multi-user onboarding: verify the new staff member's phone via OTP unless an
-  // explicit password was supplied, then issue a temporary password.
-  if (!provided) {
+  // Admin-driven onboarding. The creating admin is already authenticated and
+  // authorized (requireRole admin/super_admin), so we do NOT gate account
+  // creation behind a phone OTP — that regressed the "Create User" flow into a
+  // "No active code. Request a new one." dead-end whenever the admin left the
+  // (optional) password blank. Behaviour:
+  //   • password supplied  → use it (account is immediately usable).
+  //   • password blank      → auto-generate a TEMPORARY password and SMS it to
+  //     the new user (they must change it on first login).
+  // An OTP is only consumed when the caller explicitly supplies one (kept for
+  // backward compatibility); a missing OTP never blocks an admin create.
+  if (!provided && b.otp_code) {
     const v = await verifyOtp(c, p, String(b.otp_code || ''), 'onboard')
-    if (!v.ok) return c.json({ error: v.error || 'Phone verification required', otp_required: true }, 400)
+    if (!v.ok) return c.json({ error: v.error || 'Phone verification failed', otp_required: true }, 400)
   }
   const pwd = provided ? String(b.password) : genPassword()
   const perms = await permissionsForRole(c, String(b.role), b.permissions || {})
@@ -3107,14 +3173,20 @@ app.post('/api/users', requireAuth, requireRole('admin', 'super_admin'), async (
   const label = b.label || templateRow?.label || (String(b.role) === 'operations_finance' ? 'Operations & Finance' : String(b.role).replace(/_/g, ' '))
   const schedEnabled = boolInt(b.schedule_enabled, false) ? 1 : 0
   const schedDays = Array.isArray(b.access_days) ? JSON.stringify(b.access_days) : null
+  // Email is mandatory ONLY for super_admin/admin/lender; any other role may be
+  // created without one. resolveEmail supplies a unique placeholder when blank so
+  // the central users.email NOT NULL + UNIQUE constraints hold (23502/23505).
+  const emailRes = resolveEmail(String(b.role), b.email, b.phone)
+  if ('error' in emailRes) return c.json({ error: emailRes.error }, 400)
+  const email = emailRes.value
   const creatorId = c.get('user').id
   // Shared central DB: users.org_id NOT NULL — attach the creating admin's
   // tenant (fallback to deployment default). Omitted on Feed-only DB shape.
   const usrOrgId = (await resolveCreatorOrgId(c, c.get('user'))) || (await resolveDefaultOrgId(c))
   const usrWithOrg = (await usersHasOrgId(c)) && usrOrgId != null
   const r = usrWithOrg
-    ? await c.env.DB.prepare(`INSERT INTO users (full_name, phone, email, password, role, label, permissions, status, region, password_set, schedule_enabled, access_days, access_start, access_end, created_by, org_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).bind(b.full_name, p, b.email || null, await hashPassword(pwd), b.role, label, JSON.stringify(perms), b.status || 'active', b.region || null, provided, schedEnabled, schedDays, b.access_start || null, b.access_end || null, creatorId, usrOrgId).run()
-    : await c.env.DB.prepare(`INSERT INTO users (full_name, phone, email, password, role, label, permissions, status, region, password_set, schedule_enabled, access_days, access_start, access_end, created_by) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).bind(b.full_name, p, b.email || null, await hashPassword(pwd), b.role, label, JSON.stringify(perms), b.status || 'active', b.region || null, provided, schedEnabled, schedDays, b.access_start || null, b.access_end || null, creatorId).run()
+    ? await c.env.DB.prepare(`INSERT INTO users (full_name, phone, email, password, role, label, permissions, status, region, password_set, schedule_enabled, access_days, access_start, access_end, created_by, org_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).bind(b.full_name, p, email, await hashPassword(pwd), b.role, label, JSON.stringify(perms), b.status || 'active', b.region || null, provided, schedEnabled, schedDays, b.access_start || null, b.access_end || null, creatorId, usrOrgId).run()
+    : await c.env.DB.prepare(`INSERT INTO users (full_name, phone, email, password, role, label, permissions, status, region, password_set, schedule_enabled, access_days, access_start, access_end, created_by) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).bind(b.full_name, p, email, await hashPassword(pwd), b.role, label, JSON.stringify(perms), b.status || 'active', b.region || null, provided, schedEnabled, schedDays, b.access_start || null, b.access_end || null, creatorId).run()
   if (b.role === 'agent') await c.env.DB.prepare(`INSERT INTO agents (user_id,region,permissions) VALUES (?,?,?)`).bind(r.meta.last_row_id, b.region || null, JSON.stringify(perms)).run()
   await audit(c, creatorId, 'create', 'user', `${b.full_name} (${b.role})`)
   if (provided) return c.json({ id: r.meta.last_row_id, password: pwd, password_was_set_by_admin: true })
@@ -3575,7 +3647,10 @@ async function buildExport(c: any, dataset: string, filters: Record<string, stri
   sql += ` ORDER BY 1 DESC`
   const stmt = binds.length ? c.env.DB.prepare(sql).bind(...binds) : c.env.DB.prepare(sql)
   const { results } = await stmt.all()
-  return { label: def.label, cols: def.cols, rows: results || [] }
+  // Mask non-deliverable placeholder emails so exports never leak internal
+  // synthetic addresses (they mean "no email on file").
+  const rows = (results || []).map((r: any) => (r && 'email' in r && isPlaceholderEmail(r.email)) ? { ...r, email: '' } : r)
+  return { label: def.label, cols: def.cols, rows }
 }
 
 // base64 of a UTF-8 string, works in both Node and Workers runtimes.
@@ -3609,6 +3684,29 @@ app.post('/api/export/data', requireAuth, requireRole('admin', 'super_admin'), a
     const out = await buildExport(c, dataset, filters || {}, date_from, date_to)
     await audit(c, c.get('user').id, 'export', dataset, `${out.rows.length} rows`)
     return c.json({ ok: true, ...out })
+  } catch (e: any) {
+    return c.json({ error: e.message || 'Export failed' }, 400)
+  }
+})
+// SENSITIVE server-authoritative download: returns the authoritative CSV only
+// after password re-authentication. The frontend uses this for both CSV and
+// XLSX downloads (it builds the .xlsx locally from this CSV). Mirrors Equipment.
+app.post('/api/export/download', requireAuth, requireRole('admin', 'super_admin'), async (c) => {
+  const body = await c.req.json().catch(() => ({}))
+  const reauth = await verifyReauth(c, body?.password)
+  if (!reauth.ok) return c.json({ error: reauth.error, reauth_required: true }, reauth.status as any)
+  const { dataset, filters, date_from, date_to } = body || {}
+  try {
+    const out = await buildExport(c, dataset, filters || {}, date_from, date_to)
+    const csv = toCsv(out.cols, out.rows)
+    const fname = `farmsky-${dataset}-${new Date().toISOString().slice(0, 10)}.csv`
+    await audit(c, c.get('user').id, 'export_download', dataset, `${out.rows.length} rows (password re-auth)`)
+    return new Response(csv, {
+      headers: {
+        'Content-Type': 'text/csv',
+        'Content-Disposition': `attachment; filename="${fname}"`
+      }
+    })
   } catch (e: any) {
     return c.json({ error: e.message || 'Export failed' }, 400)
   }
@@ -3754,17 +3852,28 @@ app.post('/api/backups', requireAuth, requireRole('admin', 'super_admin'), async
   }
 })
 
-// Download a stored backup snapshot as a JSON file.
-app.get('/api/backups/:id/download', requireAuth, requireRole('admin', 'super_admin'), async (c) => {
+// Download a stored backup snapshot as a JSON file. SENSITIVE: a full system
+// backup exports the entire database, so the download requires password
+// re-authentication (POST with { password }). The legacy GET is retired for
+// security and always instructs the client to POST with a password.
+app.post('/api/backups/:id/download', requireAuth, requireRole('admin', 'super_admin'), async (c) => {
+  const body = await c.req.json().catch(() => ({}))
+  const reauth = await verifyReauth(c, body?.password)
+  if (!reauth.ok) return c.json({ error: reauth.error, reauth_required: true }, reauth.status as any)
   const row = await c.env.DB.prepare(`SELECT id, payload, created_at FROM system_backups WHERE id=?`).bind(c.req.param('id')).first<any>()
   if (!row || !row.payload) return c.json({ error: 'Backup not found' }, 404)
-  await audit(c, c.get('user').id, 'backup_download', 'system', `backup #${row.id}`)
+  await audit(c, c.get('user').id, 'backup_download', 'system', `backup #${row.id} (password re-auth)`)
   return new Response(row.payload, {
     headers: {
       'Content-Type': 'application/json',
       'Content-Disposition': `attachment; filename="farmsky-backup-${row.id}.json"`
     }
   })
+})
+// Legacy GET is retired for security — always instruct the client to POST with a
+// password confirmation. Never returns backup data.
+app.get('/api/backups/:id/download', requireAuth, requireRole('admin', 'super_admin'), (c) => {
+  return c.json({ error: 'Password confirmation required. POST to this URL with { password } to download.', reauth_required: true }, 401)
 })
 
 // Endpoint a real external scheduler (cron) can hit to run the auto backup.
@@ -3960,13 +4069,18 @@ app.post('/api/imports/:id/dispatch', requireAuth, requireRole('admin', 'super_a
     try {
       const perms = await permissionsForRole(c, roleForCategory === 'agent' ? 'agent' : roleForCategory === 'partner' ? 'partner' : 'customer', {})
       const placeholder = await hashPassword(genPassword())
+      // Bulk-import roles (agent/partner/customer) never require email; a unique
+      // placeholder (from phone) satisfies central users.email NOT NULL + UNIQUE.
+      const emailRes = resolveEmail(roleForCategory, row.email, phone)
+      if ('error' in emailRes) { skipped++; errors.push(`${row.full_name || phone}: ${emailRes.error}`); continue }
+      const email = emailRes.value
       const ur = impWithOrg
         ? await c.env.DB.prepare(
             `INSERT INTO users (full_name, phone, email, password, role, region, password_set, permissions, created_by, org_id) VALUES (?,?,?,?,?,?,0,?,?,?)`
-          ).bind(row.full_name, phone, row.email || null, placeholder, roleForCategory, row.region || row.county || null, JSON.stringify(perms), creator, impOrgId).run()
+          ).bind(row.full_name, phone, email, placeholder, roleForCategory, row.region || row.county || null, JSON.stringify(perms), creator, impOrgId).run()
         : await c.env.DB.prepare(
             `INSERT INTO users (full_name, phone, email, password, role, region, password_set, permissions, created_by) VALUES (?,?,?,?,?,?,0,?,?)`
-          ).bind(row.full_name, phone, row.email || null, placeholder, roleForCategory, row.region || row.county || null, JSON.stringify(perms), creator).run()
+          ).bind(row.full_name, phone, email, placeholder, roleForCategory, row.region || row.county || null, JSON.stringify(perms), creator).run()
       const userId = ur.meta.last_row_id as any
       // Farmers also get a customer profile with the standardized fields.
       if (roleForCategory === 'customer') {

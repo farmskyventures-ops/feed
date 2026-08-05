@@ -3064,7 +3064,7 @@ async function viewCustomers() {
   const canEditFarmers = isAdmin || state.user.role === 'agent'
   const isAgent = state.user.role === 'agent'
   const actionBar = canDo('add_farmer') || isAdmin
-    ? `<div class="action-bar"><button onclick="viewOnboard()" class="btn brand-bg text-white px-4 py-2 rounded-lg text-sm"><i class="fas fa-user-plus mr-1"></i>Add Farmer</button>${isAgent ? `<button onclick="buyForModal()" class="btn bg-emerald-600 text-white px-4 py-2 rounded-lg text-sm ml-2"><i class="fas fa-cart-plus mr-1"></i>Buy For a Farmer</button>` : ''}</div>`
+    ? `<div class="action-bar"><button onclick="addCustomerModal()" class="btn brand-bg text-white px-4 py-2 rounded-lg text-sm"><i class="fas fa-user-plus mr-1"></i>Add Customer</button><button onclick="viewOnboard()" class="btn bg-slate-100 text-slate-700 px-4 py-2 rounded-lg text-sm ml-2"><i class="fas fa-leaf mr-1"></i>Full Farmer Onboarding</button>${isAgent ? `<button onclick="buyForModal()" class="btn bg-emerald-600 text-white px-4 py-2 rounded-lg text-sm ml-2"><i class="fas fa-cart-plus mr-1"></i>Buy For a Farmer</button>` : ''}</div>`
     : ''
   const counties = [...new Set(_customers.map(c => c.county).filter(Boolean))].map(v => ({ v, t: v }))
   const chains = [...new Set(_customers.map(c => c.value_chain).filter(Boolean))].map(v => ({ v, t: v }))
@@ -3303,26 +3303,14 @@ async function viewAgents() {
       </td></tr>`).join('') || '<tr><td colspan="7" class="text-center py-8 text-slate-400">No agents</td></tr>'}</tbody>
   </table></div>`
 }
-window.addAgentModal = () => {
-  showModal(`<h3 class="font-bold mb-1">Onboard New Agent</h3>
-    <p class="text-xs text-slate-500 mb-3">Enter the agent's details and verify their phone. On successful verification a temporary password is texted to them; they set their own password on first login.</p>
-    <div class="space-y-3 text-sm">
-    <input id="ag_name" placeholder="Full Name" class="w-full px-3 py-2 border rounded-lg">
-    <div class="flex gap-2">
-      <input id="ag_phone" placeholder="Phone (07XX XXX XXX)" class="flex-1 px-3 py-2 border rounded-lg">
-      <button id="ag_otp_btn" onclick="requestOnboardOtp('ag')" class="btn px-3 bg-slate-100 rounded-lg text-xs whitespace-nowrap">Send code</button>
-    </div>
-    <div id="ag_otp_wrap" class="hidden">
-      <input id="ag_otp" placeholder="Enter the 6-digit code sent to the agent" class="w-full px-3 py-2 border rounded-lg">
-      <p id="ag_otp_hint" class="text-xs text-emerald-600 mt-1"></p>
-    </div>
-    <input id="ag_email" placeholder="Email (optional)" class="w-full px-3 py-2 border rounded-lg">
-    <input id="ag_region" placeholder="Region" class="w-full px-3 py-2 border rounded-lg">
-    <details class="text-xs text-slate-500"><summary class="cursor-pointer">Set a password manually instead (skips OTP)</summary>
-      <input id="ag_pwd" placeholder="Password (leave blank to text a temporary one)" class="w-full px-3 py-2 border rounded-lg mt-2">
-    </details>
-  </div><div class="flex gap-2 mt-4"><button onclick="doAddAgent()" class="btn flex-1 brand-bg text-white py-2 rounded-lg text-sm">Create Agent</button><button onclick="closeModal()" class="btn px-4 bg-slate-100 rounded-lg text-sm">Cancel</button></div>`)
-}
+// Adding an Agent uses the SAME unified account-creation flow as "Create User"
+// (Users Accounts), with the role locked to Agent. Identical data collection,
+// validation, error handling and API endpoint (POST /users).
+window.addAgentModal = () => addUserModal({ title: 'Create Agent', heading: 'Create the agent\u2019s account. The role is fixed to Agent; all other fields match the Create User flow.', role: 'agent', lockRole: true })
+// Adding a Customer uses the SAME unified account-creation flow as "Create User",
+// with the role locked to Customer. "Full Farmer Onboarding" (viewOnboard) remains
+// available for capturing the detailed KYC / farming-profile record.
+window.addCustomerModal = () => addUserModal({ title: 'Add Customer', heading: 'Create the customer\u2019s account. The role is fixed to Customer; all other fields match the Create User flow.', role: 'customer', lockRole: true })
 // Request an onboarding OTP to the new user's phone (shared by agent + user modals).
 window.requestOnboardOtp = async (prefix) => {
   const phone = $(prefix + '_phone').value.trim()
@@ -3544,51 +3532,50 @@ window.deleteRoleTemplate = async (key) => {
 function canAssignUserPerms() {
   return !!state.user && ['admin', 'super_admin'].includes(state.user.role)
 }
-window.addUserModal = async () => {
+// UNIFIED account-creation flow. The SAME modal, data collection, validation and
+// API endpoint (POST /users) back the "Create User" button (Users Accounts), the
+// "Add Farmer" button (Customers) and the "Create Agent" button (Agents). Callers
+// may lock the role via opts so a section-specific button pre-selects (and locks)
+// customer / agent while still collecting the identical set of fields.
+//   opts = { title, role, lockRole, heading }
+window.addUserModal = async (opts = {}) => {
   await ensurePermissionMeta()
-  const defaultRole = getRoleTemplate('agent')?.role_key || 'agent'
+  const lockRole = !!opts.lockRole
+  const defaultRole = opts.role || getRoleTemplate('agent')?.role_key || 'agent'
   const allowCustomPerms = canAssignUserPerms()
-  showModal(`<h3 class="font-bold mb-1">Create User Account</h3>
-    <p class="text-xs text-slate-500 mb-3">Choose the user category, label, and permission check-boxes that should apply.</p>
+  const roleField = lockRole
+    ? `<input type="hidden" id="nu_role" value="${esc(defaultRole)}"><input value="${esc(roleLabel(defaultRole))}" disabled class="w-full px-3 py-2 border rounded-lg bg-slate-100 text-slate-500">`
+    : `<select id="nu_role" class="w-full px-3 py-2 border rounded-lg">${userRoleOptions(defaultRole)}</select>`
+  showModal(`<h3 class="font-bold mb-1">${esc(opts.title || 'Create User Account')}</h3>
+    <p class="text-xs text-slate-500 mb-3">${esc(opts.heading || 'Choose the user category, label, and permission check-boxes that should apply.')}</p>
     <div class="space-y-3 text-sm">
       <input id="nu_name" placeholder="Full Name" class="w-full px-3 py-2 border rounded-lg">
       <input id="nu_phone" placeholder="Phone" class="w-full px-3 py-2 border rounded-lg">
       <input id="nu_email" placeholder="Email (optional)" class="w-full px-3 py-2 border rounded-lg">
-      <div class="flex gap-2">
-        <button id="nu_otp_btn" type="button" onclick="requestOnboardOtp('nu')" class="btn px-3 bg-slate-100 rounded-lg text-xs whitespace-nowrap">Send code</button>
-        <span class="text-xs text-slate-400 self-center">Verify the user's phone (a temporary password is texted on verification)</span>
-      </div>
-      <div id="nu_otp_wrap" class="hidden">
-        <input id="nu_otp" placeholder="Enter the 6-digit code sent to the user" class="w-full px-3 py-2 border rounded-lg">
-        <p id="nu_otp_hint" class="text-xs text-emerald-600 mt-1"></p>
-      </div>
-      <select id="nu_role" class="w-full px-3 py-2 border rounded-lg">${userRoleOptions(defaultRole)}</select>
+      ${roleField}
       <input id="nu_label" placeholder="Label (for example: Western Cluster Agent)" class="w-full px-3 py-2 border rounded-lg">
       <input id="nu_region" placeholder="Region" class="w-full px-3 py-2 border rounded-lg">
-      <details class="text-xs text-slate-500"><summary class="cursor-pointer">Set a password manually instead (skips OTP)</summary>
-        <input id="nu_pwd" placeholder="Password (leave blank to text a temporary one)" class="w-full px-3 py-2 border rounded-lg mt-2">
-      </details>
+      <input id="nu_pwd" placeholder="Password (optional — auto-generated if blank)" class="w-full px-3 py-2 border rounded-lg">
       <div><div class="field-label">Permission check-boxes</div><div id="nu_perm_box" class="responsive-grid cols-2">${permissionChecklist('nu_perm', templatePermissions(defaultRole), !allowCustomPerms)}</div><div class="help-text">${allowCustomPerms ? 'Toggle the exact permissions to assign to this user.' : 'Only Super Admin can customize the check-box selection. Admin users see role-based defaults.'}</div></div>
       ${allowCustomPerms ? `<div><div class="field-label">Time-Based Access Control (login window)</div>${scheduleEditor('nu', {}, false)}<div class="help-text">Optional. Overrides the role login window for this user.</div></div>` : ''}
     </div>
     <div class="flex gap-2 mt-4"><button onclick="doAddUser()" class="btn flex-1 brand-bg text-white py-2 rounded-lg text-sm">Create User</button><button onclick="closeModal()" class="btn px-4 bg-slate-100 rounded-lg text-sm">Cancel</button></div>`)
-  $('nu_role').onchange = () => refreshPermissionChecklist('nu_perm', 'nu_role', !allowCustomPerms)
+  if (!lockRole) $('nu_role').onchange = () => refreshPermissionChecklist('nu_perm', 'nu_role', !allowCustomPerms)
 }
 window.doAddUser = async () => {
   try {
-    const body = { full_name: $('nu_name').value, phone: $('nu_phone').value, email: $('nu_email').value, role: $('nu_role').value, label: $('nu_label').value, region: $('nu_region').value }
-    const manualPwd = $('nu_pwd') && $('nu_pwd').value
-    if (manualPwd) { body.password = manualPwd }
-    else {
-      const otp = $('nu_otp') ? $('nu_otp').value.trim() : ''
-      if (!otp) { toast("Verify the user's phone first (send + enter the code), or set a password manually", false); return }
-      body.otp_code = otp
-    }
+    const role = $('nu_role').value
+    const body = { full_name: $('nu_name').value, phone: $('nu_phone').value, email: $('nu_email').value, role, label: $('nu_label').value, region: $('nu_region').value }
+    if ($('nu_pwd') && $('nu_pwd').value) body.password = $('nu_pwd').value
     if (canAssignUserPerms()) { body.permissions = selectedPermissions('nu_perm'); Object.assign(body, collectSchedule('nu')) }
     const { data } = await api.post('/users', body)
     closeModal()
     showCredential('User Created', body.full_name, body.phone, data.password, data.password_was_set_by_admin, data.temporary, data.expires_at, data.sms_simulated)
-    viewUsers()
+    // Return to the section that matches the created role so the new account is
+    // immediately visible where the admin was working.
+    if (role === 'agent') viewAgents()
+    else if (role === 'customer') viewCustomers()
+    else viewUsers()
   } catch (err) { toast(err.response?.data?.error || 'Failed', false) }
 }
 window.editUserModal = async (id) => {
@@ -4265,26 +4252,79 @@ function exFilename(ext) {
 window.downloadExport = async (fmt) => {
   if (!_lastExport) { await runExport() }
   if (!_lastExport || !_lastExport.rows.length) return toast('Nothing to download — preview first', false)
-  const { cols, rows } = _lastExport
-  if (fmt === 'csv') {
-    const esc2 = v => { const s = v == null ? '' : String(v); return /[",\n]/.test(s) ? '"' + s.replace(/"/g,'""') + '"' : s }
-    const csv = cols.join(',') + '\n' + rows.map(r => cols.map(c => esc2(r[c])).join(',')).join('\n')
-    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' })
-    triggerDownload(blob, exFilename('csv'))
-  } else {
-    // Real .xlsx via SheetJS
-    const aoa = [cols, ...rows.map(r => cols.map(c => r[c]))]
-    const ws = XLSX.utils.aoa_to_sheet(aoa)
-    const wb = XLSX.utils.book_new()
-    XLSX.utils.book_append_sheet(wb, ws, 'Export')
-    XLSX.writeFile(wb, exFilename('xlsx'))
+  // SENSITIVE: platform data download requires password re-auth. The server
+  // /export/download endpoint verifies the password and returns the authoritative
+  // CSV, so we always confirm the download server-side before writing any file.
+  const pw = await promptPassword('Download platform data', 'Downloading platform data exports records from the database. Re-enter your password to continue.')
+  if (pw == null) return
+  try {
+    if (fmt === 'csv') {
+      await postDownload('/export/download', { ...exParams(), password: pw }, exFilename('csv'))
+    } else {
+      // XLSX: verify the password server-side (returns CSV), then build the .xlsx
+      // locally from the server-authoritative rows via SheetJS.
+      const res = await api.post('/export/download', { ...exParams(), password: pw }, { responseType: 'text' })
+      const csv = typeof res.data === 'string' ? res.data : await res.data.text()
+      const lines = csv.split('\n')
+      // Parse CSV honouring quoted fields.
+      const parseLine = (line) => {
+        const out = []; let cur = ''; let q = false
+        for (let i = 0; i < line.length; i++) {
+          const ch = line[i]
+          if (q) { if (ch === '"') { if (line[i + 1] === '"') { cur += '"'; i++ } else q = false } else cur += ch }
+          else { if (ch === '"') q = true; else if (ch === ',') { out.push(cur); cur = '' } else cur += ch }
+        }
+        out.push(cur); return out
+      }
+      const aoa = lines.filter(l => l.length).map(parseLine)
+      const ws = XLSX.utils.aoa_to_sheet(aoa)
+      const wb = XLSX.utils.book_new()
+      XLSX.utils.book_append_sheet(wb, ws, 'Export')
+      XLSX.writeFile(wb, exFilename('xlsx'))
+    }
+    toast('Download started')
+  } catch (err) {
+    const d = await blobErrorMessage(err)
+    toast(d?.error || err.response?.data?.error || 'Download failed', false)
   }
-  toast('Download started')
 }
 function triggerDownload(blob, name) {
   const url = URL.createObjectURL(blob)
   const a = document.createElement('a'); a.href = url; a.download = name; document.body.appendChild(a); a.click()
   setTimeout(() => { a.remove(); URL.revokeObjectURL(url) }, 1000)
+}
+// Password re-authentication modal for sensitive downloads. Resolves with the
+// typed password, or null if cancelled. Admins/super-admins must confirm their
+// password before any full-data download (backup snapshot or platform export).
+window.promptPassword = (title, message) => new Promise((resolve) => {
+  showModal(`<h3 class="font-bold mb-1"><i class="fas fa-shield-halved text-amber-600 mr-2"></i>${esc(title || 'Confirm your password')}</h3>
+    <p class="text-xs text-slate-500 mb-3">${esc(message || 'For security, re-enter your account password to download this data.')}</p>
+    <label class="text-sm font-medium">Password</label>
+    <input id="reauth_pw" type="password" autocomplete="current-password" placeholder="Your account password" class="w-full mt-1 mb-2 px-3 py-2 border border-slate-300 rounded-lg">
+    <p id="reauth_err" class="text-xs text-red-600 mb-3 hidden"></p>
+    <div class="flex gap-2">
+      <button id="reauth_ok" class="btn flex-1 brand-bg text-white py-2.5 rounded-lg text-sm">Confirm &amp; Download</button>
+      <button id="reauth_cancel" class="btn px-4 bg-slate-100 rounded-lg text-sm">Cancel</button>
+    </div>`)
+  const input = $('reauth_pw')
+  if (input) input.focus()
+  const done = (val) => { closeModal(); resolve(val) }
+  $('reauth_ok').onclick = () => { const v = input.value; if (!v) { const e = $('reauth_err'); e.textContent = 'Enter your password.'; e.classList.remove('hidden'); return } done(v) }
+  $('reauth_cancel').onclick = () => done(null)
+  if (input) input.onkeydown = (ev) => { if (ev.key === 'Enter') $('reauth_ok').click() }
+})
+
+// POST a JSON body and download the response as a file (used for password-gated
+// downloads that must send the password in the body, not the URL).
+async function postDownload(path, body, filename) {
+  const res = await api.post(path, body, { responseType: 'blob' })
+  triggerDownload(res.data, filename)
+}
+// If a blob response actually contained a JSON error (e.g. reauth failed), read it.
+async function blobErrorMessage(err) {
+  const d = err.response?.data
+  if (d instanceof Blob) { try { return JSON.parse(await d.text()) } catch (_) { return null } }
+  return d || null
 }
 window.emailExportModal = () => {
   const emailLive = _exportMeta?.email_configured
@@ -4356,11 +4396,15 @@ window.runBackupNow = async () => {
   } catch (err) { done(); toast(err.response?.data?.error || 'Backup failed', false) }
 }
 window.downloadBackup = async (id) => {
+  const pw = await promptPassword('Download system backup', 'Downloading a full system backup exports the entire database. Re-enter your password to continue.')
+  if (pw == null) return
   try {
-    const res = await api.get(`/backups/${id}/download`, { responseType: 'blob' })
-    triggerDownload(res.data, `farmsky-backup-${id}.json`)
+    await postDownload(`/backups/${id}/download`, { password: pw }, `farmsky-backup-${id}.json`)
     toast('Download started')
-  } catch (err) { toast('Download failed', false) }
+  } catch (err) {
+    const d = await blobErrorMessage(err)
+    toast(d?.error || 'Download failed', false)
+  }
 }
 
 // ---------------------------------------------------------------------------
