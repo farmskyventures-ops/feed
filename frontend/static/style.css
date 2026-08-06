@@ -2,7 +2,8 @@
   --brand: #0f766e;
   --brand-dark: #115e59;
   --brand-darker: #064e3b;
-  --content-pad: 2rem;
+  /* Fluid content padding scales smoothly with the viewport width */
+  --content-pad: clamp(0.85rem, 2.5vw, 2rem);
 }
 
 * { box-sizing: border-box; }
@@ -47,6 +48,10 @@ img, video { max-width: 100%; height: auto; }
 
 table tbody tr:hover { background:#f8fafc; }
 .modal-overlay { background: rgba(15,23,42,.55); backdrop-filter: blur(2px); }
+/* Modal content never overflows its container horizontally */
+.modal-overlay input,
+.modal-overlay select,
+.modal-overlay textarea { max-width: 100%; }
 
 /* --- UPDATED INPUTS RULE --- */
 input, select, textarea {
@@ -74,16 +79,78 @@ input:-webkit-autofill:focus {
 .field-label {
   display: block;
   font-weight: 600;
-  color: #334155;
+  color: #1e293b;                 /* high-contrast slate-800 */
   font-size: .8rem;
-  text-transform: uppercase;
-  letter-spacing: .04em;
+  letter-spacing: .01em;
   margin-bottom: 6px;
+  line-height: 1.3;
+  /* Persistent visibility: never truncate or clip long labels */
+  white-space: normal;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  max-width: 100%;
 }
+.field-label .req { color: #dc2626; margin-left: 2px; font-weight: 700; }
 .help-text {
   font-size: .75rem;
   color: #64748b;
   margin-top: 4px;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
+/* ------------------------------------------------------------------ */
+/* Top-stacked form architecture                                       */
+/* Labels sit directly above their input so forms fill vertically,     */
+/* eliminating horizontal scroll and boosting mobile completion rates. */
+/* ------------------------------------------------------------------ */
+.form-field {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;                   /* allow the field to shrink inside grids */
+}
+.form-field > label,
+.form-field > .field-label {
+  order: -1;                      /* label always above input */
+}
+.form-field > input,
+.form-field > select,
+.form-field > textarea {
+  width: 100%;
+}
+/* Any input/select/textarea placed directly in a form grid gets a
+   consistent, high-contrast, comfortably-tappable baseline style. */
+.form-grid input,
+.form-grid select,
+.form-grid textarea,
+.form-field input,
+.form-field select,
+.form-field textarea {
+  padding: .6rem .75rem;
+  border: 1px solid #cbd5e1;
+  border-radius: 10px;
+  min-height: 44px;               /* touch target */
+  line-height: 1.3;
+}
+
+/* Fluid, viewport-adaptive form grid.
+   Columns auto-fit to the available width and never force horizontal
+   scroll: each column is at least min(100%, 220px) wide, so on narrow
+   screens fields naturally stack to a single column. */
+.form-grid {
+  display: grid;
+  gap: 1rem 1.1rem;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 220px), 1fr));
+  align-items: start;
+}
+.form-grid.tight { gap: .75rem .9rem; }
+/* Span helpers that degrade gracefully on small viewports */
+.form-grid .span-2 { grid-column: span 2; }
+.form-grid .span-all { grid-column: 1 / -1; }
+@media (max-width: 560px) {
+  .form-grid { grid-template-columns: 1fr; }
+  .form-grid .span-2,
+  .form-grid .span-all { grid-column: auto; }
 }
 .section-title {
   display: flex;
@@ -149,10 +216,17 @@ input:-webkit-autofill:focus {
   margin-bottom: 1rem;
 }
 
-.responsive-grid { display: grid; gap: .75rem; }
-.responsive-grid.cols-2 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-.responsive-grid.cols-3 { grid-template-columns: repeat(3, minmax(0, 1fr)); }
-.responsive-grid.cols-4 { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+/* Fluid grids: columns auto-fit to the viewport instead of a fixed count,
+   so layouts scale smoothly across phones, tablets and desktops without
+   ever forcing horizontal scroll. */
+.responsive-grid { display: grid; gap: 1rem; align-items: start; }
+.responsive-grid.cols-2 { grid-template-columns: repeat(auto-fit, minmax(min(100%, 240px), 1fr)); }
+.responsive-grid.cols-3 { grid-template-columns: repeat(auto-fit, minmax(min(100%, 220px), 1fr)); }
+.responsive-grid.cols-4 { grid-template-columns: repeat(auto-fit, minmax(min(100%, 190px), 1fr)); }
+.responsive-grid .col-span-2 { grid-column: span 2; }
+@media (max-width: 560px) {
+  .responsive-grid .col-span-2 { grid-column: auto; }
+}
 
 .upload-tile {
   display: flex;
@@ -180,22 +254,17 @@ input:-webkit-autofill:focus {
 .confirm-modal[data-tone="danger"] h3 { color: #b91c1c; }
 
 @media (max-width: 900px) {
-  :root { --content-pad: 1rem; }
   .menu-toggle { display: inline-flex; align-items: center; justify-content: center; }
   .sidebar { transform: translateX(-105%); box-shadow: 0 12px 24px rgba(15,23,42,.18); }
   .sidebar.open { transform: translateX(0); }
   .main-area { margin-left: 0; }
   .topbar { padding: .75rem 1rem; }
-  .responsive-grid.cols-2,
-  .responsive-grid.cols-3,
-  .responsive-grid.cols-4 { grid-template-columns: minmax(0, 1fr); }
   .action-bar { justify-content: stretch; }
   .action-bar > * { flex: 1 1 100%; }
   .nav-link { padding: 14px 18px; }
   table { font-size: .85rem; }
 }
 @media (max-width: 600px) {
-  :root { --content-pad: .75rem; }
   .modal-overlay > div { padding: 1.25rem; }
 }
 

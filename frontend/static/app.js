@@ -3287,39 +3287,39 @@ window.runChecks = async (id, returnToShop) => {
 // ONBOARD (agent)
 // ---------------------------------------------------------------------------
 function viewOnboard() {
-  $('content').innerHTML = `<div class="card p-6 max-w-3xl"><form id="onbForm" class="space-y-5">
-    <div><h3 class="font-bold text-teal-700 mb-2"><i class="fas fa-user mr-2"></i>Personal Information</h3>
-      <div class="responsive-grid cols-2 text-sm">
-        <input name="full_name" placeholder="Full Name *" required class="px-3 py-2 border rounded-lg col-span-2">
-        <input name="national_id" placeholder="National ID *" required class="px-3 py-2 border rounded-lg">
-        <input name="date_of_birth" type="date" class="px-3 py-2 border rounded-lg">
-        <select name="gender" class="px-3 py-2 border rounded-lg"><option value="">Gender</option><option>Female</option><option>Male</option></select>
-        <input name="mobile" placeholder="Mobile *" required class="px-3 py-2 border rounded-lg">
-        <input name="alt_mobile" placeholder="Alternative Number" class="px-3 py-2 border rounded-lg">
+  $('content').innerHTML = `<div class="card p-6 max-w-3xl w-full"><form id="onbForm" class="space-y-6">
+    <div><h3 class="section-title"><i class="fas fa-user"></i>Personal Information</h3>
+      <div class="form-grid">
+        <div class="form-field span-all"><label class="field-label">Full Name <span class="req">*</span></label><input name="full_name" required></div>
+        <div class="form-field"><label class="field-label">National ID <span class="req">*</span></label><input name="national_id" required></div>
+        <div class="form-field"><label class="field-label">Date of Birth</label><input name="date_of_birth" type="date"></div>
+        <div class="form-field"><label class="field-label">Gender</label><select name="gender"><option value="">Select gender</option><option>Female</option><option>Male</option></select></div>
+        <div class="form-field"><label class="field-label">Mobile Number <span class="req">*</span></label><input name="mobile" type="tel" inputmode="tel" required></div>
+        <div class="form-field"><label class="field-label">Alternative Number</label><input name="alt_mobile" type="tel" inputmode="tel"></div>
       </div></div>
-    <div><h3 class="font-bold text-teal-700 mb-2"><i class="fas fa-map-marker-alt mr-2"></i>Location</h3>
-      <div class="responsive-grid cols-2 text-sm">
-        <input name="county" placeholder="County" class="px-3 py-2 border rounded-lg">
-        <input name="sub_county" placeholder="Sub-county" class="px-3 py-2 border rounded-lg">
-        <input name="ward" placeholder="Ward" class="px-3 py-2 border rounded-lg">
-        <input name="village" placeholder="Village" class="px-3 py-2 border rounded-lg">
-        <input name="latitude" id="lat" placeholder="Latitude" class="px-3 py-2 border rounded-lg">
-        <input name="longitude" id="lng" placeholder="Longitude" class="px-3 py-2 border rounded-lg">
+    <div><h3 class="section-title"><i class="fas fa-map-marker-alt"></i>Location</h3>
+      <div class="form-grid">
+        <div class="form-field"><label class="field-label">County</label><input name="county"></div>
+        <div class="form-field"><label class="field-label">Sub-county</label><input name="sub_county"></div>
+        <div class="form-field"><label class="field-label">Ward</label><input name="ward"></div>
+        <div class="form-field"><label class="field-label">Village</label><input name="village"></div>
+        <div class="form-field"><label class="field-label">Latitude</label><input name="latitude" id="lat" inputmode="decimal"></div>
+        <div class="form-field"><label class="field-label">Longitude</label><input name="longitude" id="lng" inputmode="decimal"></div>
       </div>
-      <button type="button" onclick="captureGPS()" class="btn mt-2 text-xs bg-slate-100 px-3 py-1.5 rounded-lg"><i class="fas fa-location-crosshairs mr-1"></i>Auto-capture GPS</button></div>
-    <div><h3 class="font-bold text-teal-700 mb-2"><i class="fas fa-leaf mr-2"></i>Farming Profile</h3>
-      <div class="responsive-grid cols-2 text-sm">
-        <select name="value_chain_type" id="vct" onchange="updateChain()" class="px-3 py-2 border rounded-lg"><option value="">Value Chain Type</option><option value="crop">Crop</option><option value="livestock">Livestock</option></select>
-        <select name="value_chain" id="vc" class="px-3 py-2 border rounded-lg"><option value="">Select type first</option></select>
-        <input name="acreage" type="number" step="0.1" placeholder="Acreage" class="px-3 py-2 border rounded-lg">
-        <input name="herd_size" type="number" placeholder="Herd Size" class="px-3 py-2 border rounded-lg">
-        <input name="farm_experience" type="number" placeholder="Years experience" class="px-3 py-2 border rounded-lg">
-        <input name="annual_production" placeholder="Annual production" class="px-3 py-2 border rounded-lg">
+      <button type="button" onclick="captureGPS()" class="btn mt-3 text-xs bg-slate-100 px-3 py-2 rounded-lg"><i class="fas fa-location-crosshairs mr-1"></i>Auto-capture GPS</button></div>
+    <div><h3 class="section-title"><i class="fas fa-leaf"></i>Farming Profile</h3>
+      <div class="form-grid">
+        <div class="form-field"><label class="field-label">Value Chain Type</label><select name="value_chain_type" id="vct" onchange="updateChain()"><option value="">Select value chain type</option><option value="crop">Crop</option><option value="livestock">Livestock</option></select></div>
+        <div class="form-field"><label class="field-label">Value Chain</label><select name="value_chain" id="vc"><option value="">Select type first</option></select></div>
+        <div class="form-field"><label class="field-label">Acreage</label><input name="acreage" type="number" step="0.01" min="0" inputmode="decimal" placeholder="e.g. 0.25, 1.50" title="Enter acreage with up to 2 decimal places, e.g. 0.25 or 1.50"></div>
+        <div class="form-field"><label class="field-label">Herd Size</label><input name="herd_size" type="number" min="0" inputmode="numeric"></div>
+        <div class="form-field"><label class="field-label">Years of Experience</label><input name="farm_experience" type="number" min="0" inputmode="numeric"></div>
+        <div class="form-field"><label class="field-label">Annual Production</label><input name="annual_production"></div>
       </div></div>
-    <div><h3 class="font-bold text-teal-700 mb-2"><i class="fas fa-wallet mr-2"></i>Financial Profile</h3>
-      <div class="responsive-grid cols-2 text-sm">
-        <div><label class="field-label">Current loan amount</label><input name="existing_loans" placeholder="Loan amount" class="px-3 py-2 border rounded-lg"></div>
-        <div><label class="field-label">SACCO membership</label><select name="sacco_membership" class="px-3 py-2 border rounded-lg"><option value="no">No</option><option value="yes">Yes</option></select></div>
+    <div><h3 class="section-title"><i class="fas fa-wallet"></i>Financial Profile</h3>
+      <div class="form-grid">
+        <div class="form-field"><label class="field-label">Current Loan Amount</label><input name="existing_loans" inputmode="numeric" placeholder="Loan amount"></div>
+        <div class="form-field"><label class="field-label">SACCO Membership</label><select name="sacco_membership"><option value="no">No</option><option value="yes">Yes</option></select></div>
       </div></div>
     <div class="bg-amber-50 border border-amber-200 rounded-lg p-3 text-xs text-amber-700"><i class="fas fa-info-circle mr-1"></i>ID upload and manual selfie capture now happen during "Complete User Registration" — run it from the Customers page after onboarding.</div>
     <button class="btn brand-bg text-white px-6 py-2.5 rounded-lg text-sm"><i class="fas fa-paper-plane mr-1"></i>Submit Onboarding</button>
@@ -3760,7 +3760,7 @@ async function viewProfile() {
           <div><label class="field-label">Ward</label><input id="pf_ward" value="${esc(c?.ward || '')}" class="px-3 py-2 border rounded-lg"></div>
           <div><label class="field-label">Village</label><input id="pf_village" value="${esc(c?.village || '')}" class="px-3 py-2 border rounded-lg"></div>
           <div><label class="field-label">Value chain</label><input id="pf_value_chain" value="${esc(c?.value_chain || '')}" class="px-3 py-2 border rounded-lg"></div>
-          <div><label class="field-label">Acreage</label><input id="pf_acreage" value="${esc(c?.acreage || '')}" class="px-3 py-2 border rounded-lg"></div>
+          <div><label class="field-label">Acreage</label><input id="pf_acreage" type="number" step="0.01" min="0" inputmode="decimal" value="${esc(c?.acreage || '')}" placeholder="e.g. 0.25, 1.50" title="Enter acreage with up to 2 decimal places, e.g. 0.25 or 1.50" class="px-3 py-2 border rounded-lg"></div>
           <div><label class="field-label">Current loan amount</label><input id="pf_loans" value="${esc(c?.existing_loans || '')}" class="px-3 py-2 border rounded-lg"></div>
           <div><label class="field-label">SACCO membership</label><select id="pf_sacco" class="px-3 py-2 border rounded-lg"><option value="yes" ${(c?.sacco_membership || '').toLowerCase() === 'yes' ? 'selected' : ''}>Yes</option><option value="no" ${(c?.sacco_membership || '').toLowerCase() !== 'yes' ? 'selected' : ''}>No</option></select></div>
         </div>
