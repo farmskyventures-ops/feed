@@ -497,7 +497,15 @@ function authSignIn() {
     const done = btnLoading('loginBtn', 'Signing in…')
     try {
       const { data } = await api.post('/login', { phone: $('phone').value, password: $('password').value })
-      // Multi-user onboarding: a temporary password forces an immediate change.
+      // Multi-user onboarding lifecycle:
+      //   STEP 1 (this call) verifies phone + temporary password.
+      //   STEP 2 verifies a 2FA OTP (renderLoginOtp).
+      //   STEP 3 forces a password change (renderForceChangePassword).
+      if (data.must_change_password && data.needs_otp) {
+        done()
+        renderLoginOtp({ phone: data.phone || $('phone').value, password: $('password').value, user: data.user, message: data.message, demo_otp: data.demo_otp })
+        return
+      }
       if (data.must_change_password) { done(); renderForceChangePassword(data.user); return }
       state.user = data.user; toast('Welcome, ' + data.user.full_name); renderApp()
     } catch (err) {
@@ -508,6 +516,50 @@ function authSignIn() {
       toast(resp.error || 'Login failed', false)
     }
   }
+}
+// STEP 2 of the temporary-password lifecycle: verify the 2FA OTP that /login
+// dispatched to the registered phone. Holds the phone + temp password in a
+// closure so verify-otp can re-authenticate before minting the change token.
+let _loginOtpCtx = null
+function renderLoginOtp(ctx) {
+  _loginOtpCtx = ctx
+  const f = $('authForm') || $('content')
+  f.innerHTML = `<div class="max-w-sm mx-auto">
+    <h2 class="text-xl font-bold mb-1">Verify it's you</h2>
+    <p class="text-sm text-slate-500 mb-4">${esc(ctx.message || 'Enter the verification code sent to your phone to continue.')}${ctx.demo_otp ? ` <b class="text-teal-700">Demo code: ${esc(ctx.demo_otp)}</b>` : ''}</p>
+    <div class="space-y-3">
+      <input id="lo_code" type="text" inputmode="numeric" autocomplete="one-time-code" placeholder="6-digit code" class="w-full px-3 py-2 border rounded-lg tracking-widest text-center">
+      <button id="loBtn" onclick="doLoginVerifyOtp()" class="btn w-full brand-bg text-white py-2.5 rounded-lg font-semibold">Verify & Continue</button>
+      <button onclick="doLoginResendOtp()" class="btn w-full bg-slate-100 py-2 rounded-lg text-sm">Resend code</button>
+    </div></div>`
+  const el = $('lo_code'); if (el) el.focus()
+}
+window.doLoginVerifyOtp = async () => {
+  if (!_loginOtpCtx) { renderLogin('signin'); return }
+  const code = String($('lo_code')?.value || '').trim()
+  if (!code) { toast('Enter the verification code', false); return }
+  const done = btnLoading('loBtn', 'Verifying…')
+  try {
+    const { data } = await api.post('/login/verify-otp', { phone: _loginOtpCtx.phone, password: _loginOtpCtx.password, code })
+    // OTP passed → STEP 3: mandatory password change (change-session token is set).
+    if (data.must_change_password) { renderForceChangePassword(data.user); return }
+    state.user = data.user; toast('Welcome, ' + data.user.full_name); renderApp()
+  } catch (err) {
+    done()
+    const resp = err.response?.data || {}
+    if (resp.temp_expired) { renderTempExpired(resp.phone || _loginOtpCtx.phone); return }
+    toast(resp.error || 'Verification failed', false)
+  }
+}
+window.doLoginResendOtp = async () => {
+  if (!_loginOtpCtx) { renderLogin('signin'); return }
+  try {
+    const { data } = await api.post('/login', { phone: _loginOtpCtx.phone, password: _loginOtpCtx.password })
+    if (data.must_change_password && data.needs_otp) {
+      renderLoginOtp({ phone: data.phone || _loginOtpCtx.phone, password: _loginOtpCtx.password, user: data.user, message: data.message, demo_otp: data.demo_otp })
+      toast('New code sent')
+    }
+  } catch (err) { toast(err.response?.data?.error || 'Could not resend code', false) }
 }
 // Mandatory password update on first login with a temporary password.
 function renderForceChangePassword(user) {
@@ -3063,9 +3115,18 @@ async function viewCustomers() {
   const isAdmin = ['admin', 'super_admin'].includes(state.user.role)
   const canEditFarmers = isAdmin || state.user.role === 'agent'
   const isAgent = state.user.role === 'agent'
-  const actionBar = canDo('add_farmer') || isAdmin
-    ? `<div class="action-bar"><button onclick="addCustomerModal()" class="btn brand-bg text-white px-4 py-2 rounded-lg text-sm"><i class="fas fa-user-plus mr-1"></i>Add Customer</button><button onclick="viewOnboard()" class="btn bg-slate-100 text-slate-700 px-4 py-2 rounded-lg text-sm ml-2"><i class="fas fa-leaf mr-1"></i>Full Farmer Onboarding</button>${isAgent ? `<button onclick="buyForModal()" class="btn bg-emerald-600 text-white px-4 py-2 rounded-lg text-sm ml-2"><i class="fas fa-cart-plus mr-1"></i>Buy For a Farmer</button>` : ''}</div>`
-    : ''
+  // "Add Customer" mirrors the full Add-User flow and is a delegated user-creation
+  // action. It is visible ONLY to admins and to accounts explicitly granted the
+  // `add_customer` permission via the SuperAdmin/Admin panel — never to agents or
+  // other non-admin users by default. "Onboard a Farmer" (viewOnboard) remains
+  // available to anyone who can add farmers (agents included).
+  const canAddCustomer = canDo('add_customer')
+  const canOnboardFarmer = canDo('add_farmer')
+  const bar = []
+  if (canAddCustomer) bar.push(`<button onclick="addCustomerModal()" class="btn brand-bg text-white px-4 py-2 rounded-lg text-sm"><i class="fas fa-user-plus mr-1"></i>Add Customer</button>`)
+  if (canOnboardFarmer) bar.push(`<button onclick="viewOnboard()" class="btn bg-slate-100 text-slate-700 px-4 py-2 rounded-lg text-sm${canAddCustomer ? ' ml-2' : ''}"><i class="fas fa-leaf mr-1"></i>Onboard a Farmer</button>`)
+  if (isAgent) bar.push(`<button onclick="buyForModal()" class="btn bg-emerald-600 text-white px-4 py-2 rounded-lg text-sm${bar.length ? ' ml-2' : ''}"><i class="fas fa-cart-plus mr-1"></i>Buy For a Farmer</button>`)
+  const actionBar = bar.length ? `<div class="action-bar">${bar.join('')}</div>` : ''
   const counties = [...new Set(_customers.map(c => c.county).filter(Boolean))].map(v => ({ v, t: v }))
   const chains = [...new Set(_customers.map(c => c.value_chain).filter(Boolean))].map(v => ({ v, t: v }))
   const kycs = [...new Set(_customers.map(c => c.kyc_status).filter(Boolean))].map(v => ({ v, t: v }))

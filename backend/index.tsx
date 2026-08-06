@@ -76,6 +76,7 @@ function rateLimit(bucket: string, max: number, windowMs: number) {
 }
 // Brute-force protection on credential + OTP surfaces.
 app.use('/api/login', rateLimit('login', 10, 60_000))
+app.use('/api/login/verify-otp', rateLimit('login', 10, 60_000))
 app.use('/api/signup/request-otp', rateLimit('otp', 8, 60_000))
 app.use('/api/reset-password/request-otp', rateLimit('otp', 8, 60_000))
 // Abuse protection on payment initiation surfaces.
@@ -99,7 +100,7 @@ function safeJson<T = any>(value: any, fallback: T): T {
 // Fallback permissions when role catalog has not loaded yet.
 function builtinDefaults(role: string): Record<string, boolean> {
   if (['super_admin', 'admin'].includes(role)) {
-    return { view: true, edit: true, delete: true, deactivate: true, approve: true, dispatch: true, add_farmer: true, view_farmers: true, view_credit_purchases: true, manage_users: true, request_admin_action: true, can_manage_inventory: true, can_manage_finance_settings: true, view_wallet: true, manage_wallets: true, can_manage_contracts: true, can_delete_users: true }
+    return { view: true, edit: true, delete: true, deactivate: true, approve: true, dispatch: true, add_farmer: true, add_customer: true, view_farmers: true, view_credit_purchases: true, manage_users: true, request_admin_action: true, can_manage_inventory: true, can_manage_finance_settings: true, view_wallet: true, manage_wallets: true, can_manage_contracts: true, can_delete_users: true }
   }
   if (role === 'operations_finance') {
     return { view: true, approve: true, dispatch: true, view_farmers: true, view_credit_purchases: true, request_admin_action: true, can_manage_finance_settings: true, can_manage_contracts: true }
@@ -722,11 +723,21 @@ function genTempPassword(len = 10): string {
   return out
 }
 
-// Milliseconds a temporary password stays valid before it must be reset (3 hours).
-const TEMP_PASSWORD_TTL_MS = 3 * 60 * 60 * 1000
+// Milliseconds a temporary password stays valid before it must be reset (24 hours).
+const TEMP_PASSWORD_TTL_MS = 24 * 60 * 60 * 1000
+
+// The public host for THIS marketplace, used in delegated-user onboarding SMS.
+// Feed -> feeds.farmsky.africa, Equipment -> equipment.farmsky.africa. When a
+// PUBLIC_BASE_URL is configured we strip its scheme so the SMS shows a bare host.
+function appHost(env: any): string {
+  const explicit = String(env?.PUBLIC_BASE_URL || '').trim()
+  if (explicit) return explicit.replace(/^https?:\/\//i, '').replace(/\/+$/, '')
+  const appType = String(env?.APP_TYPE || 'feed').toLowerCase()
+  return appType === 'equipment' ? 'equipment.farmsky.africa' : 'feeds.farmsky.africa'
+}
 
 // Stamp a freshly-created user with a temporary password + lifecycle flags and
-// SMS it to them with the mandatory "do not share / expires in 3 hours" notice.
+// SMS it to them with the mandatory welcome + "expires in 24 hours" notice.
 // Returns the plaintext temp password (also surfaced to the creator's UI as a
 // fallback for when SMS is not configured / delivery is delayed).
 async function issueTempPassword(
@@ -739,11 +750,16 @@ async function issueTempPassword(
   await c.env.DB.prepare(
     `UPDATE users SET password=?, password_set=0, must_change_password=1, is_temp_password=1, temp_password_expires_at=? WHERE id=?`
   ).bind(hashed, expiresAt, opts.userId).run()
+  // Marketplace-aware onboarding SMS. The link is the app where the account was
+  // created (feeds.farmsky.africa / equipment.farmsky.africa) per APP_TYPE.
+  const host = appHost(c.env)
+  const firstName = String(opts.fullName || '').trim().split(/\s+/)[0] || 'there'
   const msg =
-    `Farmsky account created${opts.fullName ? ' for ' + opts.fullName : ''}. ` +
-    `Temporary password: ${tempPassword}. ` +
-    `Do not share this password. It expires within 3 hours. ` +
-    `Log in and set your own password.`
+    `${firstName} Welcome to Farmsky,\n` +
+    `Click the Link ${host}\n` +
+    `Phone Number - ${opts.phone}\n` +
+    `Your First time Password ${tempPassword}\n` +
+    `Please change this password as it will expire in 24 hours`
   let sms: any = { simulated: true, success: true }
   try { sms = await sendSms(c.env, opts.phone, msg) } catch (e: any) { sms = { success: false, error: e?.message || 'SMS failed' } }
   return { tempPassword, expiresAt, sms }
@@ -809,14 +825,21 @@ app.post('/api/login', async (c) => {
   if (check.legacy) {
     try { await c.env.DB.prepare(`UPDATE users SET password=? WHERE id=?`).bind(await hashPassword(String(password)), user.id).run() } catch (_) {}
   }
-  // First-login with a temporary password: authenticate, but force an immediate
-  // password change before granting a full session / app access.
+  // First-login with a temporary password: STEP 1 (primary credentials) has now
+  // succeeded. Before we grant any session — even the restricted change-password
+  // session — we require STEP 2: a 2FA OTP delivered to the registered phone.
+  // The forced password update (STEP 3) happens after OTP verification, via
+  // POST /api/login/verify-otp. No session token is issued here.
   if (user.must_change_password) {
-    const changeToken = await createSession(c, user)
-    await audit(c, user.id, 'login', 'user', `${user.role} logged in with temporary password (must change)`)
+    const { sms, demo_otp } = await issueOtp(c, user.phone, 'login_2fa')
+    if (!sms.simulated && !sms.success) return c.json({ error: sms.error || 'Failed to send verification code' }, 502)
+    await audit(c, user.id, 'login', 'user', `${user.role} passed temp-password step 1; 2FA OTP sent`)
     return c.json({
-      token: changeToken,
       must_change_password: true,
+      needs_otp: true,
+      phone: user.phone,
+      message: sms.simulated ? 'Demo mode: use the code shown below.' : `Verification code sent to ${maskPhone(user.phone)}.`,
+      demo_otp,
       user: { id: user.id, full_name: user.full_name, phone: user.phone, role: user.role }
     })
   }
@@ -828,6 +851,34 @@ app.post('/api/login', async (c) => {
   await audit(c, user.id, 'login', 'user', `${user.role} logged in`)
   const loginFallback = await loadRoleTemplate(c, user.role)
   return c.json({ token, user: { id: user.id, full_name: user.full_name, phone: user.phone, role: user.role, region: user.region, label: user.label || null, permissions: parsePermissions(user.permissions, user.role, loginFallback) } })
+})
+// STEP 2 of the temporary-password lifecycle: verify the 2FA OTP that /api/login
+// issued. On success we re-validate the primary credentials, then mint the
+// restricted "change password" session token. The client uses it to force the
+// STEP 3 password update (PUT /api/me/password) before the user reaches the app.
+app.post('/api/login/verify-otp', async (c) => {
+  const { phone, password, code } = await c.req.json()
+  const raw = String(phone || '').trim()
+  const norm = normalizePhone(raw)
+  const user = await c.env.DB.prepare(`SELECT * FROM users WHERE phone = ? OR phone = ?`).bind(raw, norm).first<any>()
+  const check = user ? await verifyPassword(String(password), user.password) : { ok: false, legacy: false }
+  if (!user || !check.ok) return c.json({ error: 'Invalid phone number or password' }, 401)
+  if (user.status !== 'active') return c.json({ error: 'Account suspended' }, 403)
+  if (user.is_temp_password && user.temp_password_expires_at && Number(user.temp_password_expires_at) < Date.now()) {
+    return c.json({ error: 'Your temporary password has expired. Please ask an admin to reset it.', temp_expired: true, phone: user.phone }, 403)
+  }
+  // Only the temporary-password flow uses this OTP purpose. A normal account
+  // should never reach here — send it back through the standard login.
+  if (!user.must_change_password) return c.json({ error: 'This account does not require verification.' }, 400)
+  const v = await verifyOtp(c, user.phone, String(code || ''), 'login_2fa')
+  if (!v.ok) return c.json({ error: v.error }, 400)
+  const changeToken = await createSession(c, user)
+  await audit(c, user.id, 'login', 'user', `${user.role} verified 2FA; forced password change pending`)
+  return c.json({
+    token: changeToken,
+    must_change_password: true,
+    user: { id: user.id, full_name: user.full_name, phone: user.phone, role: user.role }
+  })
 })
 app.post('/api/logout', async (c) => {
   const token = getCookie(c, 'session')
