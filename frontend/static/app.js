@@ -914,7 +914,8 @@ function navItems() {
     { k: 'exports', i: 'fa-database', t: 'Data Export' },
     { k: 'imports', i: 'fa-file-arrow-up', t: 'Bulk Import' },
     { k: 'backups', i: 'fa-shield-halved', t: 'Backups' },
-    { k: 'api_management', i: 'fa-plug', t: 'API Management' }])
+    { k: 'api_management', i: 'fa-plug', t: 'API Management' },
+    { k: 'tenants', i: 'fa-cubes', t: 'Payment Tenants' }])
   if (r === 'operations_finance') return withAccount([...common,
     { k: 'approvals', i: 'fa-clipboard-check', t: 'Approvals' },
     financeQueue,
@@ -984,9 +985,9 @@ function renderApp() {
 }
 window.go = (r) => { state.route = r; toggleSidebar(false); renderApp() }
 function route() {
-  const titles = { dashboard: 'Dashboard', approvals: 'Financing Approvals', inventory: 'Inventory', finance_queue: 'Finance Approval Queue', customers: 'Customers', contracts: 'Purchases & Contracts', agents: 'Agent Management', users: 'User Accounts & Access', amendments: 'Pending Profile Amendments', ledger: 'Unified Payment Ledger', repayments: 'Repayment Performance', onboard: 'Farmer Onboarding', shop: 'Feed Shop', marketplace: 'Equipment Marketplace', exports: 'Data Export & Reports', imports: 'Bulk User Data Upload', backups: 'Automated System Backups', settings: 'Financing & Markup Settings', profile: 'My Account', wallet: 'My Wallet', wallets: 'Wallets & Payouts', api_access: 'API Access', api_management: 'API Management' }
+  const titles = { dashboard: 'Dashboard', approvals: 'Financing Approvals', inventory: 'Inventory', finance_queue: 'Finance Approval Queue', customers: 'Customers', contracts: 'Purchases & Contracts', agents: 'Agent Management', users: 'User Accounts & Access', amendments: 'Pending Profile Amendments', ledger: 'Unified Payment Ledger', repayments: 'Repayment Performance', onboard: 'Farmer Onboarding', shop: 'Feed Shop', marketplace: 'Equipment Marketplace', exports: 'Data Export & Reports', imports: 'Bulk User Data Upload', backups: 'Automated System Backups', settings: 'Financing & Markup Settings', profile: 'My Account', wallet: 'My Wallet', wallets: 'Wallets & Payouts', api_access: 'API Access', api_management: 'API Management', tenants: 'Payment Tenants (Gateway Clients)' }
   $('pageTitle').textContent = titles[state.route] || 'Dashboard'
-  const map = { dashboard: viewDashboard, approvals: viewApprovals, inventory: viewInventory, finance_queue: viewFinanceQueue, customers: viewCustomers, contracts: viewContracts, agents: viewAgents, users: viewUsers, amendments: viewAmendments, ledger: viewLedger, repayments: viewRepayments, onboard: viewOnboard, shop: viewShop, marketplace: viewMarketplace, exports: viewExports, imports: viewImports, backups: viewBackups, settings: viewSettings, profile: viewProfile, wallet: viewMyWallet, wallets: viewWallets, api_access: viewApiAccess, api_management: viewApiManagement }
+  const map = { dashboard: viewDashboard, approvals: viewApprovals, inventory: viewInventory, finance_queue: viewFinanceQueue, customers: viewCustomers, contracts: viewContracts, agents: viewAgents, users: viewUsers, amendments: viewAmendments, ledger: viewLedger, repayments: viewRepayments, onboard: viewOnboard, shop: viewShop, marketplace: viewMarketplace, exports: viewExports, imports: viewImports, backups: viewBackups, settings: viewSettings, profile: viewProfile, wallet: viewMyWallet, wallets: viewWallets, api_access: viewApiAccess, api_management: viewApiManagement, tenants: viewTenants }
   ;(map[state.route] || viewDashboard)()
 }
 
@@ -4618,5 +4619,184 @@ function showModal(html) {
     <div class="bg-white rounded-2xl p-6 w-full max-w-lg max-h-[90vh] overflow-y-auto fade-in">${html}</div></div>`
 }
 window.closeModal = () => { stopLive(); $('modal').innerHTML = '' }
+
+// ---------------------------------------------------------------------------
+// PAYMENT TENANTS (Admin-facing) — dynamic provisioning of client apps
+// (Credit / Score / sibling marketplaces) that delegate their financial
+// transactions to this central payment gateway. Operators can register / edit
+// a tenant, update its webhook, rotate its HMAC secret and toggle its active
+// status WITHOUT a restart. Backs GET/POST /api/v1/admin/tenants and the
+// rotate-secret / status endpoints. The full HMAC secret is only ever revealed
+// at the moment it is minted/rotated.
+// ---------------------------------------------------------------------------
+async function viewTenants() {
+  let tenants = []
+  try {
+    const { data } = await api.get('/v1/admin/tenants')
+    tenants = data.tenants || []
+  } catch (e) {
+    $('content').innerHTML = `<div class="card p-6 text-sm text-red-600"><i class="fas fa-triangle-exclamation mr-2"></i>Failed to load tenants: ${esc(e?.response?.data?.error || e.message)}</div>`
+    return
+  }
+  const provBadge = (p) => {
+    const map = { admin_ui: ['Dashboard', 'bg-teal-100 text-teal-700'], env: ['Env var', 'bg-indigo-100 text-indigo-700'], seed: ['Seed', 'bg-slate-100 text-slate-600'] }
+    const [t, cls] = map[p] || [p || 'seed', 'bg-slate-100 text-slate-600']
+    return `<span class="px-2 py-0.5 rounded-full text-[11px] font-medium ${cls}">${esc(t)}</span>`
+  }
+  const rows = tenants.length
+    ? tenants.map(t => `<tr class="border-t border-slate-100">
+        <td class="px-4 py-3 font-mono text-xs font-semibold text-slate-800">${esc(t.client_key)}</td>
+        <td class="px-4 py-3">${esc(t.display_name || '—')}</td>
+        <td class="px-4 py-3 text-xs text-slate-500 break-all">${esc(t.webhook_url || '—')}</td>
+        <td class="px-4 py-3">${provBadge(t.provisioned_via)}</td>
+        <td class="px-4 py-3">${t.is_active ? '<span class="px-2 py-0.5 rounded-full text-[11px] font-medium bg-emerald-100 text-emerald-700">Active</span>' : '<span class="px-2 py-0.5 rounded-full text-[11px] font-medium bg-red-100 text-red-700">Disabled</span>'}</td>
+        <td class="px-4 py-3 text-right whitespace-nowrap">
+          <button onclick='editTenantModal(${JSON.stringify(t).replace(/'/g, "&#39;")})' class="text-teal-600 hover:underline text-xs mr-2">Edit</button>
+          <button onclick="rotateTenantSecret('${esc(t.client_key)}')" class="text-amber-600 hover:underline text-xs mr-2">Rotate secret</button>
+          <button onclick="toggleTenantStatus('${esc(t.client_key)}', ${t.is_active ? 'false' : 'true'})" class="${t.is_active ? 'text-red-600' : 'text-emerald-600'} hover:underline text-xs">${t.is_active ? 'Disable' : 'Enable'}</button>
+        </td></tr>`).join('')
+    : `<tr><td colspan="6" class="px-4 py-8 text-center text-slate-400 text-sm">No payment tenants provisioned yet. Click <button onclick="newTenantModal()" class="text-teal-600 hover:underline">Add tenant</button> to register one.</td></tr>`
+  $('content').innerHTML = `
+    <div class="card p-6 mb-4">
+      <div class="flex flex-col md:flex-row md:items-center md:justify-between gap-4">
+        <div>
+          <h2 class="text-lg font-bold text-slate-800"><i class="fas fa-cubes text-emerald-600 mr-2"></i>Payment Gateway Tenants</h2>
+          <p class="text-sm text-slate-600 mt-1">Client apps that delegate their payments, credit-pack top-ups and pay-as-you-go wallet debits to this central gateway. Each tenant authenticates with an HMAC secret (<code class="text-xs bg-slate-100 px-1 rounded">X-Farmsky-*</code> headers).</p>
+        </div>
+        <div class="flex flex-wrap gap-3">
+          <button onclick="newTenantModal()" class="btn inline-flex items-center gap-2 bg-teal-600 hover:bg-teal-700 text-white px-5 py-2.5 rounded-lg text-sm font-medium"><i class="fas fa-plus"></i>Add tenant</button>
+        </div>
+      </div>
+    </div>
+    <div class="grid grid-cols-1 sm:grid-cols-3 gap-4 mb-4">
+      <div class="card p-4"><div class="text-slate-500 text-xs uppercase tracking-wide">Total tenants</div><div class="text-2xl font-bold text-slate-800 mt-1">${tenants.length}</div></div>
+      <div class="card p-4"><div class="text-slate-500 text-xs uppercase tracking-wide">Active</div><div class="text-2xl font-bold text-emerald-700 mt-1">${tenants.filter(t => t.is_active).length}</div></div>
+      <div class="card p-4"><div class="text-slate-500 text-xs uppercase tracking-wide">Env-provisioned</div><div class="text-2xl font-bold text-indigo-700 mt-1">${tenants.filter(t => t.provisioned_via === 'env').length}</div></div>
+    </div>
+    <div class="card table-card">
+      <div class="px-4 py-3 border-b border-slate-100 font-semibold text-slate-700 text-sm">Registered gateway clients</div>
+      <div class="overflow-x-auto"><table class="w-full text-sm">
+        <thead><tr class="text-left text-xs uppercase tracking-wide text-slate-400">
+          <th class="px-4 py-2">Client key</th><th class="px-4 py-2">Display name</th><th class="px-4 py-2">Webhook URL</th><th class="px-4 py-2">Source</th><th class="px-4 py-2">Status</th><th class="px-4 py-2 text-right">Actions</th>
+        </tr></thead>
+        <tbody>${rows}</tbody>
+      </table></div>
+    </div>`
+}
+
+function tenantFormFields(t) {
+  const v = t || {}
+  const editing = !!t
+  return `
+    <div class="space-y-3 text-sm">
+      <div>
+        <label class="block text-xs font-medium text-slate-600 mb-1">Client key ${editing ? '(read-only)' : '<span class="text-red-500">*</span>'}</label>
+        <input id="tn_client_key" value="${esc(v.client_key || '')}" ${editing ? 'readonly' : ''} placeholder="e.g. credit" class="w-full px-3 py-2 border rounded-lg ${editing ? 'bg-slate-50 text-slate-500' : ''}">
+      </div>
+      <div>
+        <label class="block text-xs font-medium text-slate-600 mb-1">Display name</label>
+        <input id="tn_display_name" value="${esc(v.display_name || '')}" placeholder="e.g. Farmsky Credit" class="w-full px-3 py-2 border rounded-lg">
+      </div>
+      <div>
+        <label class="block text-xs font-medium text-slate-600 mb-1">Origin URL</label>
+        <input id="tn_origin_url" value="${esc(v.origin_url || '')}" placeholder="https://credit.farmsky.africa" class="w-full px-3 py-2 border rounded-lg">
+      </div>
+      <div>
+        <label class="block text-xs font-medium text-slate-600 mb-1">Webhook URL (WALLET_LOW_BALANCE + settlement events)</label>
+        <input id="tn_webhook_url" value="${esc(v.webhook_url || '')}" placeholder="https://credit.farmsky.africa/api/v1/payment-webhook" class="w-full px-3 py-2 border rounded-lg">
+      </div>
+      ${editing ? '' : `<div>
+        <label class="block text-xs font-medium text-slate-600 mb-1">HMAC secret (optional — leave blank to auto-generate a 256-bit secret)</label>
+        <input id="tn_hmac_secret" value="" placeholder="Auto-generated if empty" class="w-full px-3 py-2 border rounded-lg font-mono text-xs">
+      </div>`}
+      <label class="flex items-center gap-2 text-sm"><input id="tn_is_active" type="checkbox" ${v.is_active === false ? '' : 'checked'} class="rounded"> Active</label>
+    </div>`
+}
+
+window.newTenantModal = () => {
+  showModal(`<h3 class="font-bold mb-1"><i class="fas fa-plus text-teal-600 mr-1"></i>Add Payment Tenant</h3>
+    <p class="text-xs text-slate-500 mb-3">Register a client app to delegate its payments to this gateway.</p>
+    ${tenantFormFields(null)}
+    <div class="flex gap-2 mt-4">
+      <button onclick="saveTenant(false)" class="btn flex-1 brand-bg text-white py-2 rounded-lg text-sm">Create tenant</button>
+      <button onclick="closeModal()" class="btn px-4 bg-slate-100 rounded-lg text-sm">Cancel</button>
+    </div>`)
+}
+
+window.editTenantModal = (t) => {
+  showModal(`<h3 class="font-bold mb-1"><i class="fas fa-pen text-teal-600 mr-1"></i>Edit Tenant — ${esc(t.client_key)}</h3>
+    <p class="text-xs text-slate-500 mb-3">Update the display name, origin and webhook. Use "Rotate secret" to change the HMAC secret.</p>
+    ${tenantFormFields(t)}
+    <div class="flex gap-2 mt-4">
+      <button onclick="saveTenant(true)" class="btn flex-1 brand-bg text-white py-2 rounded-lg text-sm">Save changes</button>
+      <button onclick="closeModal()" class="btn px-4 bg-slate-100 rounded-lg text-sm">Cancel</button>
+    </div>`)
+}
+
+window.saveTenant = async (editing) => {
+  const clientKey = ($('tn_client_key')?.value || '').trim()
+  if (!clientKey) return toast('Client key is required', false)
+  const body = {
+    client_key: clientKey,
+    display_name: ($('tn_display_name')?.value || '').trim(),
+    origin_url: ($('tn_origin_url')?.value || '').trim(),
+    webhook_url: ($('tn_webhook_url')?.value || '').trim() || null,
+    is_active: $('tn_is_active')?.checked !== false,
+  }
+  if (!editing) {
+    const s = ($('tn_hmac_secret')?.value || '').trim()
+    if (s) body.hmac_secret = s
+  }
+  try {
+    const { data } = await api.post('/v1/admin/tenants', body)
+    closeModal()
+    if (data.hmac_secret_new) revealSecretModal(clientKey, data.hmac_secret_new, 'created')
+    else { toast('Tenant saved'); viewTenants() }
+  } catch (e) {
+    toast(e?.response?.data?.error || 'Failed to save tenant', false)
+  }
+}
+
+window.rotateTenantSecret = async (clientKey) => {
+  if (!confirm(`Rotate the HMAC secret for "${clientKey}"?\n\nThe current secret will stop working immediately. You must update the tenant app with the new secret.`)) return
+  try {
+    const { data } = await api.post(`/v1/admin/tenants/${encodeURIComponent(clientKey)}/rotate-secret`, {})
+    revealSecretModal(clientKey, data.hmac_secret_new, 'rotated')
+  } catch (e) {
+    toast(e?.response?.data?.error || 'Failed to rotate secret', false)
+  }
+}
+
+window.toggleTenantStatus = async (clientKey, makeActive) => {
+  try {
+    await api.put(`/v1/admin/tenants/${encodeURIComponent(clientKey)}/status`, { is_active: makeActive })
+    toast(`Tenant ${makeActive ? 'enabled' : 'disabled'}`)
+    viewTenants()
+  } catch (e) {
+    toast(e?.response?.data?.error || 'Failed to update status', false)
+  }
+}
+
+function revealSecretModal(clientKey, secret, verb) {
+  showModal(`<h3 class="font-bold mb-1"><i class="fas fa-key text-amber-600 mr-1"></i>HMAC secret ${verb}</h3>
+    <p class="text-xs text-red-600 mb-3"><i class="fas fa-triangle-exclamation mr-1"></i>Copy this now — it is shown only once and cannot be retrieved later.</p>
+    <div class="text-xs text-slate-500 mb-1">Tenant: <span class="font-mono">${esc(clientKey)}</span></div>
+    <div class="flex gap-2 items-stretch">
+      <input id="tn_reveal" value="${esc(secret)}" readonly class="flex-1 px-3 py-2 border rounded-lg font-mono text-xs bg-slate-50">
+      <button onclick="copyTenantSecret()" class="btn px-4 bg-slate-800 text-white rounded-lg text-sm"><i class="fas fa-copy"></i></button>
+    </div>
+    <p class="text-xs text-slate-500 mt-3">Set this on the tenant app as its <code class="bg-slate-100 px-1 rounded">PAYMENT_HMAC_SECRET</code> (with <code class="bg-slate-100 px-1 rounded">PAYMENT_CLIENT_KEY=${esc(clientKey)}</code>).</p>
+    <div class="flex gap-2 mt-4">
+      <button onclick="closeModal(); viewTenants()" class="btn flex-1 brand-bg text-white py-2 rounded-lg text-sm">Done</button>
+    </div>`)
+}
+
+window.copyTenantSecret = () => {
+  const el = $('tn_reveal')
+  if (!el) return
+  el.select()
+  try { navigator.clipboard.writeText(el.value); toast('Secret copied to clipboard') }
+  catch (_) { document.execCommand('copy'); toast('Secret copied') }
+}
 
 init()

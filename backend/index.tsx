@@ -18,9 +18,38 @@ import { hashPassword, verifyPassword, isHashed } from './password'
 import { initiatePayment as gatewayInitiate, getPaymentStatus as gatewayStatus, processPayment as gatewayProcess, payoutPayment as gatewayPayout, gatewayConfigured } from './payment-gateway-client'
 import { validateImageDataUrl, validateDocDataUrl, validateText, validateTextFields } from './upload-validation'
 import merchantApi from './merchant-api'
-import { mintHandoffToken, verifyHandoffToken } from './cross-app'
+import walletGateway, { settings as walletSettings } from './wallet-gateway'
+import { mintHandoffToken, verifyHandoffToken, handoffClientFingerprint } from './cross-app'
+import { sanitizeUrl } from './url-utils'
+import { hmacSha256Hex } from './payment-gateway-shared'
 
 const app = new Hono<{ Bindings: Bindings; Variables: { user: SessionUser } }>()
+
+// ----------------------------------------------------------------------------
+// GLOBAL ERROR BOUNDARY
+//   Any uncaught throw in a handler — most importantly a failed OUTBOUND HTTP
+//   call (M-Pesa / SasaPay / cross-app) or a JSON-parse error on a bad upstream
+//   response — is converted into a clean JSON error response instead of
+//   bubbling up as an opaque 500/502 process error. This is the safety net
+//   that guarantees the platform safely catches outbound HTTP errors and
+//   returns a clean JSON error response instead of a 502 process crash.
+// ----------------------------------------------------------------------------
+app.onError((err, c) => {
+  const message = (err as any)?.message || 'Unexpected server error'
+  // Network-level fetch failures surface as TypeError('fetch failed') on
+  // Node/undici; treat those (and explicit gateway/timeout errors) as a
+  // 502 Bad Gateway with a clean JSON body, everything else as a 500.
+  const isUpstream = /fetch failed|ECONNREFUSED|ETIMEDOUT|ENOTFOUND|network|timeout|socket hang up|getaddrinfo/i.test(message)
+  const status = isUpstream ? 502 : 500
+  try { console.error(`[onError] ${c.req.method} ${new URL(c.req.url).pathname} -> ${status}: ${message}`) } catch { /* noop */ }
+  return c.json({
+    success: false,
+    error: isUpstream ? 'upstream_unavailable' : 'server_error',
+    message: isUpstream
+      ? 'A payment/upstream service is temporarily unreachable. Please try again shortly.'
+      : message,
+  }, status)
+})
 
 // ----------------------------------------------------------------------------
 // ISSUE 7 — SECURITY HARDENING
@@ -651,6 +680,40 @@ function requirePermission(...perms: string[]) {
     await next()
   }
 }
+// ----------------------------------------------------------------------------
+// SUPER-ADMIN CREDENTIAL ACCESS CONTROL
+//   Viewing, editing, resetting the password of, suspending, deleting,
+//   creating or promoting a Super-Admin account is restricted EXCLUSIVELY to
+//   Super-Admins. Lower-tier roles (Admin, Agent, Support) are blocked (403)
+//   across every /api/users* endpoint, and Super-Admin rows are withheld from
+//   the GET /api/users list for non-super callers.
+// ----------------------------------------------------------------------------
+function isSuperAdmin(user: SessionUser | undefined | null): boolean {
+  return !!user && String(user.role || '').toLowerCase() === 'super_admin'
+}
+/** True if the target user row (by id) is a Super-Admin. */
+async function targetIsSuperAdmin(c: any, id: string | number): Promise<boolean> {
+  const row = await c.env.DB.prepare(`SELECT role FROM users WHERE id=?`).bind(id).first<any>()
+  return String(row?.role || '').toLowerCase() === 'super_admin'
+}
+/**
+ * Guard a mutation whose TARGET is a specific user: if that target is a
+ * Super-Admin, only a Super-Admin caller may proceed. Returns a 403 JSON
+ * Response to short-circuit, or null when the caller is allowed to continue.
+ * Also blocks a non-super caller from ASSIGNING the super_admin role
+ * (privilege escalation) when `attemptedRole` is supplied.
+ */
+async function guardSuperAdminTarget(c: any, id: string | number, attemptedRole?: string): Promise<Response | null> {
+  const caller = c.get('user') as SessionUser
+  if (isSuperAdmin(caller)) return null
+  if (await targetIsSuperAdmin(c, id)) {
+    return c.json({ error: 'Forbidden — only a Super Admin may view or modify Super Admin credentials' }, 403)
+  }
+  if (attemptedRole && String(attemptedRole).toLowerCase() === 'super_admin') {
+    return c.json({ error: 'Forbidden — only a Super Admin may grant the Super Admin role' }, 403)
+  }
+  return null
+}
 async function audit(c: any, userId: number | null, action: string, entity: string, detail: string) {
   try {
     await c.env.DB.prepare(`INSERT INTO audit_logs (user_id, action, entity, detail) VALUES (?,?,?,?)`)
@@ -887,6 +950,82 @@ app.post('/api/logout', async (c) => {
   return c.json({ ok: true })
 })
 app.get('/api/me', requireAuth, (c) => c.json({ user: c.get('user') }))
+
+// ----------------------------------------------------------------------------
+// CROSS-APP PASSWORD VERIFICATION (machine-to-machine)
+//   POST /api/auth/verify-password
+//     Authorization: Bearer {shared app-key}
+//     body: { email, password, source }
+//   → 200 { valid: true,  user: { email, phone, name } }   (correct password)
+//   → 200 { valid: false }                                  (wrong password)
+//   → 401 (bad app-key) / 400 (bad input)
+//
+// This is a machine-to-machine endpoint: it is gated ONLY by the shared app-key
+// Bearer, never a user session. Without it, the Super-Admin password step
+// silently 404s on the sibling app, blocking Super-Admin access. Rate-limited by
+// IP to blunt any credential-stuffing via this path.
+// ----------------------------------------------------------------------------
+app.post('/api/auth/verify-password', rateLimit('verify-password', 30, 60_000), async (c) => {
+  // Accept ANY of the shared Score<->Feed secrets as the Bearer app-key.
+  //
+  // WHY A MULTI-KEY CHAIN: the sibling's outbound key chain may present
+  // FEED_APP_KEY → SCORE_CROSS_APP_HMAC_SECRET → CROSS_APP_HMAC_SECRET. We accept
+  // the SCORE_APP_KEY → SCORE_API_SECRET → SCORE_HMAC_SECRET chain AND the shared
+  // cross-app HMAC secrets so the already-shared handoff secret authorizes the
+  // password check too — no new key needs provisioning on either app.
+  const acceptedKeys = [
+    c.env.SCORE_APP_KEY,
+    c.env.SCORE_API_SECRET,
+    c.env.SCORE_HMAC_SECRET,
+    c.env.SCORE_CROSS_APP_HMAC_SECRET,
+    c.env.CROSS_APP_HMAC_SECRET,
+  ].map((k) => String(k || '').trim()).filter(Boolean)
+  const bearer = (c.req.header('Authorization') || '').replace(/^Bearer\s+/i, '').trim()
+  if (acceptedKeys.length === 0) {
+    // No shared secret configured → refuse rather than authenticate blindly.
+    console.error('[verify-password] rejected: no shared app-key configured on Feed (set SCORE_APP_KEY or share SCORE_CROSS_APP_HMAC_SECRET/CROSS_APP_HMAC_SECRET with Score)')
+    return c.json({ valid: false, error: 'cross_app_not_configured' }, 401)
+  }
+  const bearerOk = bearer.length > 0 && acceptedKeys.some((k) => k.length === bearer.length && k === bearer)
+  if (!bearerOk) {
+    console.error(`[verify-password] rejected: Bearer app-key mismatch (presented ${bearer ? 'a key of len=' + bearer.length : 'no key'}; Feed accepts ${acceptedKeys.length} configured key(s)).`)
+    return c.json({ valid: false, error: 'unauthorized' }, 401)
+  }
+
+  const body = await c.req.json().catch(() => ({}))
+  const email = String(body?.email || '').trim().toLowerCase()
+  const password = String(body?.password || '')
+  if (!email || !password) {
+    return c.json({ valid: false, error: 'email_and_password_required' }, 400)
+  }
+
+  // Look up the Feed user by email (case-insensitive).
+  const user = await c.env.DB.prepare(
+    `SELECT id, full_name, phone, email, password, status FROM users WHERE LOWER(email) = ? LIMIT 1`
+  ).bind(email).first<any>().catch(() => null)
+
+  // Uniform "valid:false" (200) for both "no such user" and "wrong password"
+  // so this endpoint never reveals which emails exist.
+  if (!user) return c.json({ valid: false })
+  const check = await verifyPassword(String(password), user.password)
+  if (!check.ok) return c.json({ valid: false })
+  if (user.status && String(user.status) !== 'active') {
+    return c.json({ valid: false, error: 'account_inactive' })
+  }
+  // Opportunistically upgrade a legacy plaintext password to the hashed form.
+  if (check.legacy) {
+    try { await c.env.DB.prepare(`UPDATE users SET password=? WHERE id=?`).bind(await hashPassword(String(password)), user.id).run() } catch (_) {}
+  }
+
+  return c.json({
+    valid: true,
+    user: {
+      email: user.email || email,
+      phone: user.phone || null,
+      name: user.full_name || null,
+    },
+  })
+})
 
 // ----------------------------------------------------------------------------
 // SELF-SERVICE PROFILE (Instruction 3)
@@ -1683,6 +1822,164 @@ app.post('/api/murabaha/apply', requireAuth, async (c) => {
     farmer: { id: custRow.id, name: custRow.full_name || 'Farmer', phone: custRow.mobile || '' }
   })
 })
+
+// ---------------------------------------------------------------------------
+// KYC PRE-CHECK for checkout. The client calls this before opening the cart so
+// it can warn (and route to Complete Registration) if the selected farmer is
+// not yet verified — required before any financing item can be ordered.
+// ---------------------------------------------------------------------------
+app.post('/api/checkout/kyc-check', requireAuth, async (c) => {
+  const user = c.get('user')
+  const { customer_id } = await c.req.json().catch(() => ({}))
+  let custId = customer_id
+  if (user.role === 'customer') {
+    const myCust = await withAdminContext(c, async () => await c.env.DB.prepare(`SELECT id FROM customers WHERE user_id=?`).bind(user.id).first<any>())
+    if (!myCust) return c.json({ error: 'Customer profile not found' }, 404)
+    custId = myCust.id
+  }
+  if (!custId) return c.json({ error: 'No buyer selected for this order' }, 400)
+  const custRow = await withAdminContext(c, async () => await c.env.DB.prepare(`SELECT id, full_name, mobile, agent_id, kyc_status FROM customers WHERE id=?`).bind(custId).first<any>())
+  if (!custRow) return c.json({ error: 'Farmer not found' }, 404)
+  // Agents may only run this for a farmer on their own roster.
+  if (user.role === 'agent' && String(custRow.agent_id) !== String(user.id)) {
+    return c.json({ error: 'You can only place orders for farmers assigned to you.' }, 403)
+  }
+  const verified = custRow.kyc_status === 'verified'
+  return c.json({
+    verified,
+    kyc_status: custRow.kyc_status || 'pending',
+    customer_id: custRow.id,
+    farmer: { id: custRow.id, name: custRow.full_name || 'Farmer', phone: custRow.mobile || '' }
+  })
+})
+
+// ---------------------------------------------------------------------------
+// MULTI-PRODUCT BUNDLED CHECKOUT. Groups several products into ONE checkout,
+// creating one murabaha_contracts row per item under a shared bundle_ref. Each
+// item independently keeps its own payment_type / term / deposit so it respects
+// its own listing or finance-specified conditions. Works for both AGENTS
+// (Buy-For a farmer on their roster) and FARMERS (ordering for themselves).
+// ---------------------------------------------------------------------------
+app.post('/api/murabaha/apply-bundle', requireAuth, async (c) => {
+  const user = c.get('user')
+  const { customer_id, delivery_location, consent, items } = await c.req.json()
+  if (!consent) return c.json({ error: 'Customer consent to the configured terms is required' }, 400)
+  if (!Array.isArray(items) || items.length === 0) return c.json({ error: 'Add at least one product to the order' }, 400)
+  if (items.length > 50) return c.json({ error: 'Too many items in a single order' }, 400)
+
+  // Resolve the buyer once. Farmers order for themselves; agents/staff pass a
+  // customer_id (the roster guard below restricts agents to their own farmers).
+  let custId = customer_id
+  if (user.role === 'customer') {
+    const myCust = await withAdminContext(c, async () => await c.env.DB.prepare(`SELECT id, agent_id FROM customers WHERE user_id=?`).bind(user.id).first<any>())
+    if (!myCust) return c.json({ error: 'Customer profile not found' }, 404)
+    custId = myCust.id
+  }
+  const custRow = await withAdminContext(c, async () => await c.env.DB.prepare(`SELECT * FROM customers WHERE id=?`).bind(custId).first<any>())
+  if (!custRow) return c.json({ error: 'Farmer not found' }, 404)
+  // AGENT "BUY FOR" GUARD: an agent may only order for a farmer on their roster.
+  if (user.role === 'agent' && String(custRow.agent_id ?? '') !== String(user.id ?? '')) {
+    return c.json({ error: 'You can only place orders for farmers assigned to you.' }, 403)
+  }
+
+  const feeCfg = await getSetting(c, 'processing_fee', DEFAULT_PROCESSING_FEE)
+  const bundleRef = ref('BND')
+
+  // ---- PASS 1: validate & quote every item BEFORE writing anything, so a bad
+  // item (out of stock / unknown product / KYC-gated financing) fails the whole
+  // bundle atomically instead of leaving a half-created order. ----
+  const prepared: Array<{ p: any; qty: number; ptype: string; q: any }> = []
+  for (const raw of items) {
+    const productId = raw?.product_id
+    const p = await withAdminContext(c, async () => await c.env.DB.prepare(`SELECT * FROM products WHERE id=?`).bind(productId).first<any>())
+    if (!p) return c.json({ error: `Product not found (id ${productId})` }, 404)
+    if (p.finance_status && p.finance_status !== 'published') return c.json({ error: `"${p.name}" is not yet available for purchase` }, 400)
+    const qty = Math.max(1, Number(raw?.quantity) || 1)
+    if (p.quantity < qty) return c.json({ error: `Insufficient stock for "${p.name}"` }, 400)
+    const ptype = raw?.payment_type === 'cash' ? 'cash' : 'financing'
+    // Each item independently respects its listing/finance conditions: cash must
+    // be enabled for cash items, financing enabled for financed items.
+    if (ptype === 'cash' && p.cash_enabled === 0) return c.json({ error: `"${p.name}" cannot be bought with cash` }, 400)
+    if (ptype === 'financing' && p.financing_enabled === 0) return c.json({ error: `"${p.name}" is not available on financing` }, 400)
+    // Financing requires a verified farmer (TransUnion/KYC), same as single apply.
+    if (ptype === 'financing' && custRow?.kyc_status !== 'verified') {
+      return c.json({
+        error: 'kyc_required',
+        message: 'Complete registration (TransUnion credit check, ID upload, and liveness verification) before financing purchases.',
+        customer_id: custId,
+        product_name: p.name
+      }, 412)
+    }
+    const q = financingQuote(p, qty, ptype, raw?.term_months, feeCfg)
+    prepared.push({ p, qty, ptype, q })
+  }
+
+  // ---- PASS 2: create one contract per item, all under the shared bundle_ref.
+  // Inserts run under admin context so ownership RLS (which scopes contracts to
+  // agents/onboarders) doesn't block a buyer creating a contract on their behalf.
+  const created: any[] = []
+  let depositDueNow = 0
+  let bundleTotal = 0
+  let bundleOutstanding = 0
+  for (const it of prepared) {
+    const { p, qty, ptype, q } = it
+    const contractRef = ref(ptype === 'cash' ? 'CSH' : (q.financing_model === 'paygo' ? 'PGO' : 'FIN'))
+    const status = ptype === 'cash'
+      ? (q.amount_due_now > 0 ? 'pending_payment' : 'awaiting_cash_balance')
+      : 'pending'
+    const r = await withAdminContext(c, async () => await c.env.DB.prepare(
+      `INSERT INTO murabaha_contracts (contract_ref,bundle_ref,customer_id,agent_id,created_by,product_id,quantity,payment_type,supplier_cost,markup_pct,murabaha_price,term_months,monthly_payment,delivery_location,status,ownership_recorded,consent_given,amount_paid,outstanding,financing_model,interest_rate_pct,deposit_pct,deposit_amount,finance_principal,payment_frequency,installment_amount,dispatch_status,terms_document_url,terms_text)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
+    ).bind(
+      contractRef, bundleRef, custId, custRow?.agent_id || null, custRow?.onboarded_by || custRow?.agent_id || user.id, p.id, qty, ptype, q.supplier_cost, q.markup_pct,
+      q.total_payable, q.term_months, q.monthly_payment || q.installment_amount || 0, delivery_location || '', status,
+      0, 1, 0, q.total_payable, q.financing_model, q.interest_rate_pct || 0, q.deposit_pct, q.deposit_amount,
+      q.finance_principal, q.payment_frequency, q.installment_amount || 0, 'pending', q.terms_document_url || null, q.terms_text || null
+    ).run())
+    const contractId = r.meta.last_row_id
+    // Only cash deposits are collected via the upfront checkout prompt; financing
+    // deposits are collected on their own schedule at approval time.
+    const itemDueNow = ptype === 'cash' ? numberVal(q.amount_due_now, 0) : 0
+    depositDueNow = roundMoney(depositDueNow + itemDueNow)
+    bundleTotal = roundMoney(bundleTotal + numberVal(q.total_payable, 0))
+    bundleOutstanding = roundMoney(bundleOutstanding + numberVal(q.total_payable, 0))
+    created.push({
+      id: contractId,
+      contract_ref: contractRef,
+      product_id: p.id,
+      product_name: p.name,
+      quantity: qty,
+      payment_type: ptype,
+      status,
+      amount_due_now: itemDueNow,
+      deposit_amount: q.deposit_amount,
+      total_payable: q.total_payable
+    })
+  }
+
+  await audit(c, user.id, 'apply_bundle', 'financing', `${bundleRef} (${created.length} items)`)
+  const cashItems = created.filter(x => x.payment_type === 'cash')
+  return c.json({
+    ok: true,
+    bundle_ref: bundleRef,
+    items: created,
+    item_count: created.length,
+    // Aggregated cash deposit across all cash items in the bundle. When > 0 the
+    // client raises a SINGLE payment prompt (directed to the farmer for Buy-For).
+    deposit_due_now: depositDueNow,
+    requires_payment: depositDueNow > 0,
+    // Settle the combined cash deposit against the first cash item's contract;
+    // remaining cash items with a due deposit are listed so the client can chain
+    // their prompts if a provider requires one STK per contract.
+    pay_contract_id: cashItems.find(x => x.amount_due_now > 0)?.id || null,
+    cash_deposit_contract_ids: cashItems.filter(x => x.amount_due_now > 0).map(x => x.id),
+    bundle_total: bundleTotal,
+    bundle_outstanding: bundleOutstanding,
+    buy_for: user.role === 'agent',
+    farmer: { id: custRow.id, name: custRow.full_name || 'Farmer', phone: custRow.mobile || '' }
+  })
+})
+
 app.get('/api/murabaha', requireAuth, async (c) => {
   const user = c.get('user')
   let q = `SELECT mc.*, p.name as product_name, cu.full_name as customer_name
@@ -2773,6 +3070,112 @@ app.get('/api/buni/status', requireAuth, (c) => {
 // ----------------------------------------------------------------------------
 app.route('/api/v1/payments', paymentGateway)
 
+// ----------------------------------------------------------------------------
+// CENTRAL MASTER WALLET GATEWAY (metered API-call billing for client tenants)
+// Public endpoint URLs:
+//   {host}/api/v1/wallet/{debit,credit,balance}
+//   {host}/api/v1/settings/thresholds
+// Same X-Farmsky-* HMAC discipline as /api/v1/payments/*. Used by the Credit
+// app (credit.farmsky.africa) to debit the master wallet per scoring call and
+// to sync low-balance alert thresholds. See backend/wallet-gateway.ts.
+// ----------------------------------------------------------------------------
+app.route('/api/v1/wallet', walletGateway)
+app.route('/api/v1/settings', walletSettings)
+
+// ----------------------------------------------------------------------------
+// TENANT MANAGEMENT DASHBOARD API (Option A — dynamic provisioning)
+// Admin-only CRUD over app_clients so operators can register / edit client
+// tenants, rotate HMAC secrets and toggle status WITHOUT a service restart.
+// Backs the /admin/tenants dashboard page. HMAC secrets are never returned in
+// full — only a masked preview — except at the moment of rotation.
+// ----------------------------------------------------------------------------
+function maskSecret(s: string | null | undefined): string {
+  const v = String(s || '')
+  if (!v) return ''
+  if (v.length <= 8) return '••••'
+  return `${v.slice(0, 4)}••••${v.slice(-4)}`
+}
+function genTenantSecret(): string {
+  // 256-bit hex secret.
+  const bytes = new Uint8Array(32)
+  crypto.getRandomValues(bytes)
+  return Array.from(bytes).map((b) => b.toString(16).padStart(2, '0')).join('')
+}
+
+app.get('/api/v1/admin/tenants', requireAuth, requireRole('admin', 'super_admin'), async (c) => {
+  const { results } = await c.env.DB.prepare(
+    `SELECT client_key, display_name, origin_url, callback_url, webhook_url, is_active, provisioned_via, secret_rotated_at, updated_at
+       FROM app_clients ORDER BY client_key`
+  ).all().catch(() => ({ results: [] as any[] }))
+  const rows = (results || []).map((r: any) => ({
+    client_key: r.client_key,
+    display_name: r.display_name,
+    origin_url: r.origin_url,
+    callback_url: r.callback_url,
+    webhook_url: r.webhook_url || r.callback_url || null,
+    is_active: Number(r.is_active) !== 0,
+    provisioned_via: r.provisioned_via || 'seed',
+    secret_rotated_at: r.secret_rotated_at || null,
+    updated_at: r.updated_at || null,
+  }))
+  return c.json({ success: true, tenants: rows })
+})
+
+app.post('/api/v1/admin/tenants', requireAuth, requireRole('admin', 'super_admin'), async (c) => {
+  const b = await c.req.json().catch(() => ({}))
+  const clientKey = String(b.client_key || '').trim()
+  if (!clientKey) return c.json({ success: false, error: 'client_key is required' }, 400)
+  const displayName = String(b.display_name || clientKey).slice(0, 120)
+  const originUrl = String(b.origin_url || '').replace(/\/+$/, '')
+  const callbackUrl = b.callback_url ? String(b.callback_url) : null
+  const webhookUrl = b.webhook_url ? String(b.webhook_url) : null
+  // Use supplied secret or mint a fresh 256-bit one.
+  const secret = String(b.hmac_secret || '').trim() || genTenantSecret()
+  const isActive = b.is_active === false ? 0 : 1
+  try {
+    await c.env.DB.prepare(
+      `INSERT INTO app_clients (client_key, display_name, origin_url, hmac_secret, callback_url, webhook_url, is_active, provisioned_via, secret_rotated_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, 'admin_ui', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+       ON CONFLICT (client_key) DO UPDATE SET
+         display_name = EXCLUDED.display_name,
+         origin_url = COALESCE(NULLIF(EXCLUDED.origin_url, ''), app_clients.origin_url),
+         callback_url = COALESCE(EXCLUDED.callback_url, app_clients.callback_url),
+         webhook_url = COALESCE(EXCLUDED.webhook_url, app_clients.webhook_url),
+         is_active = EXCLUDED.is_active,
+         provisioned_via = 'admin_ui',
+         updated_at = CURRENT_TIMESTAMP`
+    ).bind(clientKey, displayName, originUrl || 'https://example.invalid', secret, callbackUrl, webhookUrl, isActive).run()
+  } catch (e: any) {
+    return c.json({ success: false, error: e?.message || 'Failed to save tenant' }, 500)
+  }
+  // Return the secret ONLY on create/rotate so the operator can copy it.
+  const created = String(b.hmac_secret || '').trim() ? undefined : secret
+  return c.json({ success: true, client_key: clientKey, hmac_secret_new: created, hmac_secret_masked: maskSecret(secret) })
+})
+
+app.post('/api/v1/admin/tenants/:client_key/rotate-secret', requireAuth, requireRole('admin', 'super_admin'), async (c) => {
+  const clientKey = c.req.param('client_key')
+  const existing = await c.env.DB.prepare(`SELECT client_key FROM app_clients WHERE client_key = ?`).bind(clientKey).first<any>()
+  if (!existing) return c.json({ success: false, error: 'Tenant not found' }, 404)
+  const secret = genTenantSecret()
+  await c.env.DB.prepare(
+    `UPDATE app_clients SET hmac_secret = ?, secret_rotated_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE client_key = ?`
+  ).bind(secret, clientKey).run()
+  return c.json({ success: true, client_key: clientKey, hmac_secret_new: secret, hmac_secret_masked: maskSecret(secret), note: 'Update the tenant app with this new secret immediately.' })
+})
+
+app.put('/api/v1/admin/tenants/:client_key/status', requireAuth, requireRole('admin', 'super_admin'), async (c) => {
+  const clientKey = c.req.param('client_key')
+  const b = await c.req.json().catch(() => ({}))
+  const isActive = b.is_active === false ? 0 : 1
+  const res = await c.env.DB.prepare(
+    `UPDATE app_clients SET is_active = ?, updated_at = CURRENT_TIMESTAMP WHERE client_key = ?`
+  ).bind(isActive, clientKey).run()
+  const changed = Number((res as any)?.meta?.changes ?? (res as any)?.changes ?? 1)
+  if (!changed) return c.json({ success: false, error: 'Tenant not found' }, 404)
+  return c.json({ success: true, client_key: clientKey, is_active: isActive !== 0 })
+})
+
 // Admin-only view of cross-app payment activity
 app.get('/api/v1/payments-admin/summary', requireAuth, requireRole('admin', 'super_admin'), async (c) => {
   const res = await fetch(new URL('/api/v1/payments/admin/summary', c.req.url).toString())
@@ -2813,20 +3216,210 @@ app.get('/api/ledger', requireAuth, requireRole('admin', 'super_admin'), async (
 })
 
 // ----------------------------------------------------------------------------
+// SCORE WALLET LEDGER MIRROR RECEIVER (Phase 3)
+// Score is the PRIMARY wallet ledger; every wallet transaction on Score is
+// mirrored here for cross-app audit. Score POSTs a signed JSON payload with:
+//   X-Score-Signature: sha256=<hmacSha256Hex(secret, rawBody)>
+// where secret = SCORE_LEDGER_HMAC_SECRET || SCORE_HMAC_SECRET ||
+// SCORE_CROSS_APP_HMAC_SECRET || CROSS_APP_HMAC_SECRET. Idempotent on
+// score_tx_id.
+// ----------------------------------------------------------------------------
+function timingSafeEqualHex(a: string, b: string): boolean {
+  if (typeof a !== 'string' || typeof b !== 'string') return false
+  if (a.length !== b.length) return false
+  let diff = 0
+  for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i)
+  return diff === 0
+}
+
+app.post('/api/score-ledger/mirror', async (c) => {
+  // Read raw body first (needed for HMAC verification of the exact bytes signed)
+  const raw = await c.req.text()
+
+  const secret =
+    c.env.SCORE_LEDGER_HMAC_SECRET ||
+    c.env.SCORE_HMAC_SECRET ||
+    c.env.SCORE_CROSS_APP_HMAC_SECRET ||
+    c.env.CROSS_APP_HMAC_SECRET ||
+    ''
+
+  if (!secret) {
+    console.warn('[score-ledger] mirror rejected: no HMAC secret configured')
+    return c.json({ error: 'mirror_not_configured' }, 503)
+  }
+
+  const header = c.req.header('X-Score-Signature') || c.req.header('x-score-signature') || ''
+  const provided = header.replace(/^sha256=/i, '').trim().toLowerCase()
+  if (!provided) {
+    return c.json({ error: 'missing_signature' }, 401)
+  }
+
+  const expected = (await hmacSha256Hex(secret, raw)).toLowerCase()
+  if (!timingSafeEqualHex(provided, expected)) {
+    console.warn('[score-ledger] mirror rejected: signature mismatch')
+    return c.json({ error: 'invalid_signature' }, 401)
+  }
+
+  let payload: any
+  try {
+    payload = JSON.parse(raw)
+  } catch {
+    return c.json({ error: 'invalid_json' }, 400)
+  }
+
+  const scoreTxId = String(payload.score_tx_id ?? '').trim()
+  if (!scoreTxId) {
+    return c.json({ error: 'missing_score_tx_id' }, 400)
+  }
+
+  const orgRef = payload.org_id != null ? String(payload.org_id) : null
+  const direction = String(payload.direction ?? '').trim() || null
+  const amountKes = payload.amount_kes != null ? Number(payload.amount_kes) : null
+  const balanceAfter = payload.balance_after != null ? Number(payload.balance_after) : null
+  const kind = payload.kind != null ? String(payload.kind) : null
+  const serviceKey = payload.service_key != null ? String(payload.service_key) : null
+  const reference = payload.reference != null ? String(payload.reference) : null
+  const source = payload.source != null ? String(payload.source) : 'score'
+
+  try {
+    // Idempotency: skip if this Score tx has already been mirrored.
+    const existing = await withAdminContext(c, async () => await c.env.DB.prepare(
+      `SELECT id FROM score_wallet_ledger WHERE score_tx_id = ?`
+    ).bind(scoreTxId).first<any>())
+    if (existing) {
+      return c.json({ ok: true, mirrored: false, duplicate: true, score_tx_id: scoreTxId })
+    }
+
+    await withAdminContext(c, async () => await c.env.DB.prepare(
+      `INSERT INTO score_wallet_ledger
+         (score_org_ref, score_tx_id, direction, amount_kes, balance_after, kind, service_key, reference, source)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    ).bind(orgRef, scoreTxId, direction, amountKes, balanceAfter, kind, serviceKey, reference, source).run())
+
+    return c.json({ ok: true, mirrored: true, duplicate: false, score_tx_id: scoreTxId })
+  } catch (err: any) {
+    // If a concurrent request inserted the same score_tx_id, treat as duplicate.
+    const msg = String(err?.message || err)
+    if (/unique|duplicate/i.test(msg)) {
+      return c.json({ ok: true, mirrored: false, duplicate: true, score_tx_id: scoreTxId })
+    }
+    console.error('[score-ledger] mirror insert failed:', msg)
+    return c.json({ error: 'mirror_failed' }, 500)
+  }
+})
+
+// ----------------------------------------------------------------------------
+// SCORE LENDER API WALLETS (Phase 3) — read model over the mirrored ledger.
+// Farmsky Score (credit.farmsky.africa) owns the PRIMARY lender API wallets;
+// Feed's Wallets & Payouts dashboard shows Score activity from the locally
+// mirrored score_wallet_ledger (pushed via /api/score-ledger/mirror).
+// ----------------------------------------------------------------------------
+app.get('/api/score-wallets', requireAuth, requirePermission('manage_wallets'), async (c) => {
+  // Reconstruct a wallet list from the mirrored ledger so the dashboard shows
+  // Score activity from the last mirror push.
+  const rows = await withAdminContext(c, async () => await c.env.DB.prepare(
+    `SELECT score_org_ref AS org_id,
+            COUNT(*) AS entries,
+            MAX(created_at) AS last_activity_at,
+            COALESCE(
+              (SELECT balance_after FROM score_wallet_ledger s2
+                WHERE s2.score_org_ref = s.score_org_ref AND s2.balance_after IS NOT NULL
+                ORDER BY s2.created_at DESC LIMIT 1), 0) AS balance_kes
+       FROM score_wallet_ledger s
+      WHERE score_org_ref IS NOT NULL
+      GROUP BY score_org_ref
+      ORDER BY last_activity_at DESC`
+  ).all<any>())
+  const wallets = (rows.results || []).map((r: any) => ({
+    org_id: String(r.org_id),
+    display_name: `Lender ${String(r.org_id).slice(0, 8)}`,
+    legal_name: null,
+    merchant_id: null,
+    plan: null,
+    currency: 'KES',
+    balance_kes: Number(r.balance_kes) || 0,
+    low_threshold: 0,
+    status: (Number(r.balance_kes) || 0) <= 0 ? 'empty' : 'active',
+    active_keys: null,
+    balance_updated_at: r.last_activity_at || null,
+    last_activity_at: r.last_activity_at || null,
+    entries: Number(r.entries) || 0,
+  }))
+  return c.json({ wallets, source: 'mirror_fallback' })
+})
+
+// Drill-down for one Score lender API wallet: snapshot + time-stamped ledger
+// (incoming credits, outgoing debits) from the mirrored ledger.
+app.get('/api/score-wallets/:orgId', requireAuth, requirePermission('manage_wallets'), async (c) => {
+  const orgId = String(c.req.param('orgId') || '').trim()
+  if (!orgId) return c.json({ error: 'org_id required' }, 400)
+  const rows = await withAdminContext(c, async () => await c.env.DB.prepare(
+    `SELECT id, direction, amount_kes, balance_after, kind, service_key, reference, source, created_at
+       FROM score_wallet_ledger WHERE score_org_ref = ? ORDER BY created_at DESC LIMIT 300`
+  ).bind(orgId).all<any>())
+  const ledger = (rows.results || []).map((t: any) => {
+    const dir = String(t.direction || '').toLowerCase()
+    return {
+      id: String(t.id),
+      direction: dir,
+      category: dir === 'credit' ? 'settlement' : 'debit',
+      amount_kes: Number(t.amount_kes) || 0,
+      balance_after: t.balance_after != null ? Number(t.balance_after) : null,
+      kind: t.kind || 'topup',
+      reference: t.reference || null,
+      status: 'completed',
+      created_at: t.created_at,
+      service_key: t.service_key || null,
+    }
+  })
+  return c.json({
+    source: 'mirror_fallback',
+    wallet: { org_id: orgId, display_name: `Lender ${orgId.slice(0, 8)}`, currency: 'KES', balance_kes: ledger[0]?.balance_after ?? 0, status: 'active' },
+    ledger,
+    consumption: { endpoints: [], service_fees: [] },
+  })
+})
+
+// ----------------------------------------------------------------------------
 // CROSS-APP SSO HANDOFF (Phase 2) — no second login between Equipment & Feed
 // ----------------------------------------------------------------------------
 // Signed-in user requests a handoff URL to the sibling app.
 app.get('/api/cross/handoff', requireAuth, async (c) => {
   const user = c.get('user') as SessionUser
-  const secret = c.env.CROSS_APP_HMAC_SECRET || ''
   const target = String(c.req.query('target') || '')
+  // SECRET SELECTION by target:
+  //  * Score channel uses the DEDICATED SCORE_CROSS_APP_HMAC_SECRET when set,
+  //    falling back to the legacy shared CROSS_APP_HMAC_SECRET so existing
+  //    single-secret deployments keep working. This must match Score's /sso
+  //    verifier.
+  //  * Equipment (and any other sibling marketplace) keeps the legacy shared
+  //    CROSS_APP_HMAC_SECRET, untouched by the Score-channel rename.
+  const secret = (target === 'score'
+    ? (c.env.SCORE_CROSS_APP_HMAC_SECRET || c.env.CROSS_APP_HMAC_SECRET)
+    : c.env.CROSS_APP_HMAC_SECRET) || ''
   // Choose the destination origin by target: 'score' -> SCORE_APP_URL,
   // anything else -> the configured sibling marketplace (Equipment).
-  const siblingUrl = (target === 'score'
+  const siblingUrl = sanitizeUrl(target === 'score'
     ? String(c.env.SCORE_APP_URL || '')
     : String(c.env.CROSS_APP_URL || '')
-  ).replace(/\/+$/, '')
-  if (!secret || !siblingUrl) return c.json({ error: 'Cross-app navigation is not configured' }, 503)
+  )
+  if (!secret || !siblingUrl) {
+    const missing: string[] = []
+    if (!secret) missing.push(target === 'score' ? 'SCORE_CROSS_APP_HMAC_SECRET/CROSS_APP_HMAC_SECRET' : 'CROSS_APP_HMAC_SECRET')
+    if (!siblingUrl) missing.push(target === 'score' ? 'SCORE_APP_URL' : 'CROSS_APP_URL')
+    console.error(`[cross/handoff] not configured for target=${target} — missing: ${missing.join(', ')}`)
+    return c.json({ error: 'Cross-app navigation is not configured' }, 503)
+  }
+  // Score is EMAIL-KEYED: it resolves the user by email, so refuse to mint a
+  // Score handoff for an account with no email rather than land on a dead /sso.
+  if (target === 'score' && !String((user as any).email || '').trim()) {
+    return c.json({ error: 'An email address is required on your account to open Farmsky Score.' }, 400)
+  }
+  // Anti-hijack: bind the token to the requesting client (IP + User-Agent) so a
+  // stolen handoff URL cannot be replayed from a different browser.
+  const clientIp = c.req.header('cf-connecting-ip') || c.req.header('x-forwarded-for') || ''
+  const userAgent = c.req.header('user-agent') || ''
+  const fingerprint = handoffClientFingerprint(clientIp, userAgent)
   // The same short-lived HMAC-signed token is accepted by every Farmsky app's
   // /sso endpoint, so no second login is needed at the destination. Email +
   // name are carried so email-keyed apps (Score) can resolve/create the
@@ -2839,6 +3432,7 @@ app.get('/api/cross/handoff', requireAuth, async (c) => {
     name: user.full_name,
     role: user.role,
     super_admin: isSuper,
+    fingerprint,
   })
   // Optional deep-link: `dest` tells the destination app which view to open
   // after SSO. Allow-listed slug to avoid open-redirect abuse.
@@ -2863,8 +3457,20 @@ app.post('/api/cross/use-apis', requireAuth, async (c) => {
 // Sibling app lands here: verify HMAC token, issue a local session, redirect.
 app.get('/sso', async (c) => {
   const token = c.req.query('token') || ''
-  const secret = c.env.CROSS_APP_HMAC_SECRET || ''
-  const v = await verifyHandoffToken(secret, token)
+  // Re-derive the presenting client's fingerprint so a token that was minted
+  // WITH an IP+UA binding only verifies from the same browser (anti-hijack).
+  const clientIp = c.req.header('cf-connecting-ip') || c.req.header('x-forwarded-for') || ''
+  const userAgent = c.req.header('user-agent') || ''
+  const fingerprint = handoffClientFingerprint(clientIp, userAgent)
+  // A handoff may be signed with the dedicated Score secret OR the legacy shared
+  // secret. Try the dedicated Score secret first (when distinct), then fall back
+  // to the shared CROSS_APP_HMAC_SECRET, so both channels land here cleanly.
+  const scoreSecret = c.env.SCORE_CROSS_APP_HMAC_SECRET || ''
+  const sharedSecret = c.env.CROSS_APP_HMAC_SECRET || ''
+  let v = await verifyHandoffToken(sharedSecret, token, fingerprint)
+  if (!v.ok && scoreSecret && scoreSecret !== sharedSecret) {
+    v = await verifyHandoffToken(scoreSecret, token, fingerprint)
+  }
   const escHtml = (s: string) => String(s).replace(/[&<>"']/g, ch => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch] as string))
   if (!v.ok) return c.html(`<h3>Sign-in link invalid or expired</h3><p>${escHtml(v.error || '')}</p><p><a href="/">Go to sign in</a></p>`, 401)
   // Match the account across every stored phone format: normalized 254...,
@@ -2884,11 +3490,11 @@ app.get('/api/cross/config', requireAuth, (c) => {
   return c.json({
     app_type: String(c.env.APP_TYPE || 'equipment'),
     cross_app_configured: !!(c.env.CROSS_APP_HMAC_SECRET && c.env.CROSS_APP_URL),
-    cross_app_url: c.env.CROSS_APP_URL || null,
+    cross_app_url: sanitizeUrl(c.env.CROSS_APP_URL) || null,
     // Score SSO button is shown when the shared handoff secret AND the Score
     // origin are configured. Reuses the same session (no re-login).
-    score_configured: !!(c.env.CROSS_APP_HMAC_SECRET && c.env.SCORE_APP_URL),
-    score_url: c.env.SCORE_APP_URL || null
+    score_configured: !!((c.env.SCORE_CROSS_APP_HMAC_SECRET || c.env.CROSS_APP_HMAC_SECRET) && c.env.SCORE_APP_URL),
+    score_url: sanitizeUrl(c.env.SCORE_APP_URL) || null
   })
 })
 
@@ -3145,7 +3751,11 @@ app.post('/api/users/:id/reset-password', requireAuth, requireRole('admin', 'sup
   const id = c.req.param('id')
   const target = await c.env.DB.prepare(`SELECT id, full_name, phone, role FROM users WHERE id=?`).bind(id).first<any>()
   if (!target) return c.json({ error: 'User not found' }, 404)
-  if (target.role === 'super_admin' && Number(id) !== c.get('user').id) return c.json({ error: 'Cannot reset another Super Admin password' }, 400)
+  // Super-Admin credentials (incl. password) may be reset only by a Super-Admin.
+  // A non-super caller (admin) is fully blocked from any Super-Admin target.
+  if (String(target.role || '').toLowerCase() === 'super_admin' && !isSuperAdmin(c.get('user'))) {
+    return c.json({ error: 'Forbidden — only a Super Admin may reset a Super Admin password' }, 403)
+  }
   const body = await c.req.json().catch(() => ({}))
   const provided = body?.password && String(body.password).length >= 4
   // Admin-triggered reset. When no explicit password is supplied (the normal
@@ -3189,9 +3799,15 @@ app.put('/api/agents/:id', requireAuth, requireRole('admin', 'super_admin'), asy
 // USER ACCOUNTS (admin) - create, edit, activate/deactivate, delete
 // ----------------------------------------------------------------------------
 app.get('/api/users', requireAuth, requireRole('admin', 'super_admin'), async (c) => {
+  const caller = c.get('user') as SessionUser
+  const callerIsSuper = isSuperAdmin(caller)
   const { results } = await c.env.DB.prepare(`SELECT id, full_name, phone, email, role, label, permissions, status, region, schedule_enabled, access_days, access_start, access_end, created_at FROM users ORDER BY id`).all()
   const usersWithPerms = [] as any[]
   for (const u of results as any[]) {
+    // Super-Admin credential/profile data is visible ONLY to Super-Admins.
+    // A non-super caller (e.g. admin) may still see their OWN row, but every
+    // OTHER Super-Admin account is withheld entirely.
+    if (String(u.role || '').toLowerCase() === 'super_admin' && !callerIsSuper && String(u.id) !== String(caller.id)) continue
     const fallback = await loadRoleTemplate(c, u.role)
     usersWithPerms.push({ ...u, permissions: parsePermissions(u.permissions, u.role, fallback), access_days: safeJson(u.access_days, []) })
   }
@@ -3201,6 +3817,10 @@ app.post('/api/users', requireAuth, requireRole('admin', 'super_admin'), async (
   const b = await c.req.json()
   const p = normalizePhone(b.phone || '')
   if (!b.full_name || !p || !b.role) return c.json({ error: 'Name, phone and role are required' }, 400)
+  // Only a Super-Admin may create another Super-Admin (block privilege escalation).
+  if (String(b.role).toLowerCase() === 'super_admin' && !isSuperAdmin(c.get('user'))) {
+    return c.json({ error: 'Forbidden — only a Super Admin may create a Super Admin account' }, 403)
+  }
   const dup = await c.env.DB.prepare(`SELECT id FROM users WHERE phone=?`).bind(p).first<any>()
   if (dup) return c.json({ error: 'A user with this phone already exists' }, 409)
   const provided = b.password && String(b.password).length >= 4
@@ -3247,6 +3867,10 @@ app.post('/api/users', requireAuth, requireRole('admin', 'super_admin'), async (
 app.put('/api/users/:id', requireAuth, requireRole('admin', 'super_admin'), async (c) => {
   const id = c.req.param('id')
   const b = await c.req.json()
+  // Block a non-super caller from editing a Super-Admin target OR promoting
+  // anyone to super_admin (privilege escalation).
+  const denied = await guardSuperAdminTarget(c, id, b.role)
+  if (denied) return denied
   const perms = await permissionsForRole(c, String(b.role), b.permissions || {})
   const schedEnabled = boolInt(b.schedule_enabled, false) ? 1 : 0
   const schedDays = Array.isArray(b.access_days) ? JSON.stringify(b.access_days) : null
@@ -3265,6 +3889,9 @@ app.put('/api/users/:id', requireAuth, requireRole('admin', 'super_admin'), asyn
 })
 app.put('/api/users/:id/status', requireAuth, requireRole('admin', 'super_admin'), async (c) => {
   const id = c.req.param('id')
+  // A non-super caller may not suspend/activate a Super-Admin account.
+  const denied = await guardSuperAdminTarget(c, id)
+  if (denied) return denied
   const { status } = await c.req.json()
   if (Number(id) === c.get('user').id) return c.json({ error: 'You cannot change your own status' }, 400)
   await c.env.DB.prepare(`UPDATE users SET status=? WHERE id=?`).bind(status, id).run()
@@ -3289,7 +3916,11 @@ app.delete('/api/users/:id', requireAuth, async (c) => {
   if (Number(id) === actor.id) return c.json({ error: 'You cannot delete your own account' }, 400)
   const u = await c.env.DB.prepare(`SELECT role FROM users WHERE id=?`).bind(id).first<any>()
   if (!u) return c.json({ error: 'Not found' }, 404)
-  if (u?.role === 'super_admin') return c.json({ error: 'Cannot delete a Super Admin account' }, 400)
+  // A Super-Admin account may be deleted only by a Super-Admin; a non-super
+  // caller (admin) is blocked from touching Super-Admin accounts entirely.
+  if (String(u?.role || '').toLowerCase() === 'super_admin' && !isSuperAdmin(actor)) {
+    return c.json({ error: 'Forbidden — only a Super Admin may delete a Super Admin account' }, 403)
+  }
   // Contracts link to the user via their customer profile (customers.user_id).
   const cust = await c.env.DB.prepare(`SELECT id FROM customers WHERE user_id=?`).bind(id).first<any>()
   // Non-admin managers must first ensure ALL the user's contracts are cancelled.
