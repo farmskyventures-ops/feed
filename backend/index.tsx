@@ -986,7 +986,9 @@ app.post('/api/auth/verify-password', rateLimit('verify-password', 30, 60_000), 
     console.error('[verify-password] rejected: no shared app-key configured on Feed (set SCORE_APP_KEY or share SCORE_CROSS_APP_HMAC_SECRET/CROSS_APP_HMAC_SECRET with Score)')
     return c.json({ valid: false, error: 'cross_app_not_configured' }, 401)
   }
-  const bearerOk = bearer.length > 0 && acceptedKeys.some((k) => k.length === bearer.length && k === bearer)
+  // Constant-time comparison against every accepted key: never leak, via timing,
+  // which/whether a shared app-key matched. (timingSafeEqualHex is hoisted.)
+  const bearerOk = bearer.length > 0 && acceptedKeys.some((k) => timingSafeEqualHex(k, bearer))
   if (!bearerOk) {
     console.error(`[verify-password] rejected: Bearer app-key mismatch (presented ${bearer ? 'a key of len=' + bearer.length : 'no key'}; Feed accepts ${acceptedKeys.length} configured key(s)).`)
     return c.json({ valid: false, error: 'unauthorized' }, 401)

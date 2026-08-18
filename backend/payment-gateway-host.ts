@@ -40,7 +40,7 @@
 
 import { Hono } from 'hono'
 import { stkPush, stkQuery, normalizePhone } from './mpesa'
-import { sasapayStkPush, sasapayQuery } from './sasapay'
+import { sasapayStkPush, sasapayQuery, sasapayProcessPayment, sasapayB2C, channelByCode } from './sasapay'
 import { buniStkPush, buniQuery } from './buni'
 import { verifySignature, verifySignatureMulti } from './payment-gateway-shared'
 import { getCookie } from 'hono/cookie'
@@ -101,6 +101,59 @@ gateway.use('/admin/*', async (c, next) => {
 // ----------------------------------------------------------------------------
 function genRef(): string {
   return 'FSK-' + crypto.randomUUID().replace(/-/g, '').slice(0, 18).toUpperCase()
+}
+
+// ----------------------------------------------------------------------------
+// Decide whether a NON-ZERO provider status-query code is a GENUINELY TERMINAL
+// failure (the buyer cancelled, entered the wrong PIN, had insufficient funds,
+// or the STK request truly expired) versus a TRANSIENT "still processing"
+// reply returned while the buyer is still on the handset entering their PIN.
+//
+// Only terminal codes may flip a PENDING transaction to FAILED. Transient codes
+// MUST leave the transaction PENDING so the asynchronous provider callback (the
+// authoritative settlement channel) — or a later poll — records the true
+// outcome. This is the core of the "false failure" fix: a synchronous status
+// query is advisory, the callback is authoritative.
+//
+// M-Pesa Daraja stkpushquery result codes (the important ones):
+//   0     -> success (handled elsewhere)
+//   1032  -> Request cancelled by user (TERMINAL failure)
+//   1037  -> DS timeout / user cannot be reached (TERMINAL failure)
+//   1025 / 9999 / 1001 -> system/internal or "unable to lock subscriber" — these
+//           frequently appear WHILE the prompt is still live, so treat as transient
+//   2001  -> wrong PIN (TERMINAL failure)
+//   17    -> M-Pesa internal system error (transient)
+//   1     -> "The transaction is being processed" / generic pending (TRANSIENT)
+//   500.001.1001 -> "The transaction is being processed" (TRANSIENT)
+// Anything unmapped is treated conservatively as TRANSIENT (stay PENDING) so a
+// customer whose money may already be moving is never shown a false failure.
+// ----------------------------------------------------------------------------
+function isTerminalFailureCode(method: string, code: unknown): boolean {
+  if (code === undefined || code === null) return false
+  const s = String(code).trim()
+  if (s === '' || s === '0') return false
+
+  if (method === 'mpesa') {
+    // Explicit, well-known TERMINAL M-Pesa failure codes only.
+    const MPESA_TERMINAL = new Set(['1032', '1037', '2001', '1019', '1101'])
+    // Explicit TRANSIENT codes that must NOT fail the transaction.
+    const MPESA_TRANSIENT = new Set(['1', '17', '1025', '1001', '9999', '500.001.1001', '500.001.1019'])
+    if (MPESA_TERMINAL.has(s)) return true
+    if (MPESA_TRANSIENT.has(s)) return false
+    // Unknown non-zero code: be conservative and treat as transient (stay PENDING).
+    return false
+  }
+
+  if (method === 'buni') {
+    // Buni: '00' is success (handled elsewhere). Only a small set of explicit
+    // decline codes are terminal; unknown codes stay pending.
+    const BUNI_TERMINAL = new Set(['1032', '2001'])
+    return BUNI_TERMINAL.has(s)
+  }
+
+  // SasaPay settlement is asynchronous (callback-driven); its status query is
+  // never treated as a terminal failure here — the callback is authoritative.
+  return false
 }
 
 async function loadClient(c: any, client_key: string) {
@@ -395,7 +448,19 @@ gateway.get('/status/:ref', async (c) => {
               WHERE transaction_ref=?`
           ).bind(String(code ?? '0'), String(pr?.ResultDesc || pr?.ResultDescription || pr?.message || 'Success'), receipt, transaction_ref).run()
           tx.status = 'SUCCESS'
-        } else if (code !== undefined && code !== null && code !== 0 && code !== '0') {
+        } else if (isTerminalFailureCode(tx.payment_method, code)) {
+          // ------------------------------------------------------------------
+          // RACE-CONDITION FIX: Only mark FAILED when the provider has returned
+          // a GENUINELY TERMINAL failure code. While the buyer is still on their
+          // handset entering the PIN, Daraja's stkpushquery replies with a
+          // transient "still being processed" code (e.g. ResultCode '1',
+          // '500.001.1001', or an empty/errored body from stkQuery's own guard).
+          // Previously ANY non-zero code was written as FAILED on the FIRST poll,
+          // so Score received 'failed' → returned HTTP 402 → the UI showed
+          // "payment failed or cancelled" even though the money was later debited.
+          // We now leave the transaction PENDING for transient codes; the async
+          // provider callback (or a later poll) settles the true outcome.
+          // ------------------------------------------------------------------
           await c.env.DB.prepare(
             `UPDATE central_transactions
                 SET status='FAILED', result_code=?, result_desc=?, updated_at=CURRENT_TIMESTAMP, completed_at=CURRENT_TIMESTAMP
@@ -403,6 +468,8 @@ gateway.get('/status/:ref', async (c) => {
           ).bind(String(code), String(pr?.ResultDesc || pr?.message || 'Failed'), transaction_ref).run()
           tx.status = 'FAILED'
         }
+        // Any other non-zero code (transient / "still processing") => keep
+        // status PENDING and simply return it; the caller keeps polling.
       }
     } catch (_) {}
   }
@@ -424,6 +491,201 @@ gateway.get('/status/:ref', async (c) => {
 })
 
 // ----------------------------------------------------------------------------
+// POST /process
+// Complete a SasaPay wallet checkout that requires an OTP / verification code.
+// The satellite forwards the buyer's verification_code; the host runs the
+// SasaPay process-payment call using the host's own credentials. HMAC-signed
+// exactly like /initiate. The transaction must belong to THIS client.
+// ----------------------------------------------------------------------------
+gateway.post('/process', async (c) => {
+  const rawBody = await c.req.text()
+
+  const client_key = c.req.header('X-Farmsky-Client') || ''
+  const timestamp = c.req.header('X-Farmsky-Timestamp') || ''
+  const nonce = c.req.header('X-Farmsky-Nonce') || ''
+  const signature = c.req.header('X-Farmsky-Signature') || ''
+
+  if (!client_key) return c.json({ success: false, error: 'Missing X-Farmsky-Client header' }, 401)
+
+  const client = await loadClient(c, client_key)
+  if (!client || !client.is_active) {
+    await auditSecurity(c, 'UNKNOWN_CLIENT', 'WARN', { originApp: client_key, detail: 'process from unknown/inactive client' })
+    return c.json({ success: false, error: 'Unknown or inactive client app' }, 401)
+  }
+
+  const marketplace = await loadMarketplace(c, client_key)
+  const marketplaceId = marketplace?.id ?? null
+  await setTenantScope(c, marketplaceId, false)
+
+  const v = await verifySignatureMulti(candidateSecrets(c, client), client_key, timestamp, nonce, rawBody, signature)
+  if (!v.ok) {
+    await auditSecurity(c, 'SIGNATURE_FAIL', 'CRITICAL', { marketplaceId, originApp: client_key, detail: v.error || 'invalid HMAC signature on /process' })
+    return c.json({ success: false, error: v.error || 'Invalid signature' }, 401)
+  }
+  if (typeof v.matchedIndex === 'number' && v.matchedIndex > 0) {
+    try { console.warn(`[gateway] /process signature matched fallback secret #${v.matchedIndex} for client '${client_key}'. Align SCORE_HMAC_SECRET / CROSS_APP_HMAC_SECRET across Score and Feed.`) } catch { /* noop */ }
+  }
+
+  let body: any = {}
+  try { body = rawBody ? JSON.parse(rawBody) : {} } catch { return c.json({ success: false, error: 'Body must be JSON' }, 400) }
+
+  const transaction_ref = String(body.transaction_ref || '').trim()
+  const verification_code = String(body.verification_code || '').trim()
+  if (!transaction_ref) return c.json({ success: false, error: 'transaction_ref is required' }, 400)
+  if (!verification_code) return c.json({ success: false, error: 'verification_code is required' }, 400)
+
+  // The transaction must belong to THIS client and still be awaiting completion.
+  const tx = await c.env.DB.prepare(
+    `SELECT * FROM central_transactions WHERE transaction_ref = ? AND origin_app = ? LIMIT 1`
+  ).bind(transaction_ref, client_key).first<any>()
+  if (!tx) return c.json({ success: false, error: 'Transaction not found' }, 404)
+  if (tx.payment_method !== 'sasapay') return c.json({ success: false, error: 'Only SasaPay wallet checkouts require OTP completion' }, 400)
+
+  const pr = await sasapayProcessPayment(c.env, String(tx.provider_request_id || ''), verification_code)
+  if (!pr.success) {
+    await auditSecurity(c, 'PROCESS_FAIL', 'WARN', { marketplaceId, originApp: client_key, transactionRef: transaction_ref, detail: pr.error || 'process-payment rejected' })
+    return c.json({ success: false, error: pr.error || 'OTP verification failed' }, 502)
+  }
+
+  return c.json({
+    success: true,
+    transaction_ref,
+    payment_method: 'sasapay',
+    simulated: !!pr.simulated,
+    customer_message: pr.customer_message || 'Payment is being processed.',
+    status: 'PENDING'
+  })
+})
+
+// ----------------------------------------------------------------------------
+// POST /payout
+// Disburse funds OUT to a mobile / bank / SasaPay-wallet destination on behalf
+// of a satellite (B2C). The satellite has already debited its own internal
+// wallet ledger; this call moves the real money using the HOST's SasaPay
+// credentials. Idempotency-Key prevents a double payout on retry. The async
+// result is delivered to the host's own SasaPay B2C callback and reconciled
+// there; the satellite records 'processing' and reconciles via its own ledger.
+// HMAC-signed exactly like /initiate.
+// ----------------------------------------------------------------------------
+gateway.post('/payout', async (c) => {
+  const rawBody = await c.req.text()
+
+  const client_key = c.req.header('X-Farmsky-Client') || ''
+  const timestamp = c.req.header('X-Farmsky-Timestamp') || ''
+  const nonce = c.req.header('X-Farmsky-Nonce') || ''
+  const signature = c.req.header('X-Farmsky-Signature') || ''
+  const idempotencyKey = c.req.header('Idempotency-Key') || null
+
+  if (!client_key) return c.json({ success: false, error: 'Missing X-Farmsky-Client header' }, 401)
+
+  const client = await loadClient(c, client_key)
+  if (!client || !client.is_active) {
+    await auditSecurity(c, 'UNKNOWN_CLIENT', 'WARN', { originApp: client_key, detail: 'payout from unknown/inactive client' })
+    return c.json({ success: false, error: 'Unknown or inactive client app' }, 401)
+  }
+
+  const marketplace = await loadMarketplace(c, client_key)
+  const marketplaceId = marketplace?.id ?? null
+  await setTenantScope(c, marketplaceId, false)
+
+  const v = await verifySignatureMulti(candidateSecrets(c, client), client_key, timestamp, nonce, rawBody, signature)
+  if (!v.ok) {
+    await auditSecurity(c, 'SIGNATURE_FAIL', 'CRITICAL', { marketplaceId, originApp: client_key, detail: v.error || 'invalid HMAC signature on /payout' })
+    return c.json({ success: false, error: v.error || 'Invalid signature' }, 401)
+  }
+  if (typeof v.matchedIndex === 'number' && v.matchedIndex > 0) {
+    try { console.warn(`[gateway] /payout signature matched fallback secret #${v.matchedIndex} for client '${client_key}'. Align SCORE_HMAC_SECRET / CROSS_APP_HMAC_SECRET across Score and Feed.`) } catch { /* noop */ }
+  }
+
+  // Replay protection (same nonce table as /initiate).
+  if (nonce) {
+    try {
+      const existingNonce = await c.env.DB.prepare(
+        `SELECT 1 FROM payment_nonces WHERE client_key = ? AND nonce = ? LIMIT 1`
+      ).bind(client_key, nonce).first<any>()
+      if (existingNonce) {
+        await auditSecurity(c, 'REPLAY', 'CRITICAL', { marketplaceId, originApp: client_key, detail: `replayed nonce ${nonce}` })
+        return c.json({ success: false, error: 'Replay detected' }, 401)
+      }
+      await c.env.DB.prepare(`INSERT INTO payment_nonces (client_key, nonce) VALUES (?, ?)`).bind(client_key, nonce).run()
+    } catch (e: any) {
+      const code = e?.code || ''
+      if (code === '23505' || /unique|duplicate/i.test(String(e?.message || ''))) {
+        await auditSecurity(c, 'REPLAY', 'CRITICAL', { marketplaceId, originApp: client_key, detail: `replayed nonce ${nonce}` })
+        return c.json({ success: false, error: 'Replay detected' }, 401)
+      }
+    }
+  }
+
+  let body: any = {}
+  try { body = rawBody ? JSON.parse(rawBody) : {} } catch { return c.json({ success: false, error: 'Body must be JSON' }, 400) }
+
+  const amount = Number(body.amount)
+  const channelCode = String(body.channelCode || body.channel_code || '').trim()
+  const receiver = String(body.receiver_number || body.account_number || '').trim()
+  const reason = String(body.reason || 'Farmsky payout').slice(0, 100)
+  const origin_reference = body.origin_reference ? String(body.origin_reference) : null
+
+  if (!Number.isFinite(amount) || amount <= 0) return c.json({ success: false, error: 'amount must be > 0' }, 400)
+  const chan = channelByCode(channelCode)
+  if (!chan) return c.json({ success: false, error: 'A valid payout channelCode is required' }, 400)
+  if (!receiver) return c.json({ success: false, error: 'receiver_number is required' }, 400)
+
+  // Idempotent replay: return the prior payout if this key was already used.
+  if (idempotencyKey) {
+    const existing = await c.env.DB.prepare(
+      `SELECT transaction_ref, status FROM central_transactions WHERE origin_app = ? AND idempotency_key = ? LIMIT 1`
+    ).bind(client_key, idempotencyKey).first<any>()
+    if (existing) {
+      return c.json({ success: true, idempotent_replay: true, transaction_ref: existing.transaction_ref, status: existing.status })
+    }
+  }
+
+  const transaction_ref = genRef()
+  const payout = await sasapayB2C(c.env, { amount, receiverNumber: receiver, channel: channelCode, reason, reference: transaction_ref })
+  if (!payout.success) {
+    await auditSecurity(c, 'PAYOUT_FAIL', 'WARN', { marketplaceId, originApp: client_key, transactionRef: transaction_ref, detail: payout.error || 'B2C rejected' })
+    return c.json({ success: false, error: payout.error || 'Payout rejected by provider' }, 502)
+  }
+
+  const ip = c.req.header('CF-Connecting-IP') || c.req.header('X-Forwarded-For') || null
+  await c.env.DB.prepare(
+    `INSERT INTO central_transactions
+        (transaction_ref, idempotency_key, origin_app, marketplace_id, origin_reference, payment_method,
+         provider_request_id, phone, amount, currency, description, status, direction, ip_address)
+      VALUES (?,?,?,?,?, 'sasapay', ?,?,?,?,?, ?, 'payout', ?)`
+  ).bind(
+    transaction_ref, idempotencyKey, client_key, marketplaceId, origin_reference,
+    payout.b2c_request_id || payout.conversation_id || null, receiver, amount, 'KES',
+    reason.slice(0, 40), payout.simulated ? 'SUCCESS' : 'PENDING', ip
+  ).run().catch(async () => {
+    // Older host schemas may not have a `direction` column; fall back gracefully.
+    await c.env.DB.prepare(
+      `INSERT INTO central_transactions
+          (transaction_ref, idempotency_key, origin_app, marketplace_id, origin_reference, payment_method,
+           provider_request_id, phone, amount, currency, description, status, ip_address)
+        VALUES (?,?,?,?,?, 'sasapay', ?,?,?,?,?, ?, ?)`
+    ).bind(
+      transaction_ref, idempotencyKey, client_key, marketplaceId, origin_reference,
+      payout.b2c_request_id || payout.conversation_id || null, receiver, amount, 'KES',
+      reason.slice(0, 40), payout.simulated ? 'SUCCESS' : 'PENDING', ip
+    ).run()
+  })
+
+  return c.json({
+    success: true,
+    transaction_ref,
+    payment_method: 'sasapay',
+    simulated: !!payout.simulated,
+    b2c_request_id: payout.b2c_request_id || null,
+    conversation_id: payout.conversation_id || null,
+    transaction_charges: payout.transaction_charges || '0.00',
+    customer_message: payout.customer_message || (payout.simulated ? 'Payout completed (simulation).' : 'Payout is being processed.'),
+    status: payout.simulated ? 'SUCCESS' : 'PENDING'
+  })
+})
+
+// ----------------------------------------------------------------------------
 // CALLBACKS (provider IPNs)
 // ----------------------------------------------------------------------------
 async function settleCallback(c: any, method: PaymentMethod, providerReqId: string | null, success: boolean, receipt: string | null, resultCode: string | null, resultDesc: string | null, rawBody: string) {
@@ -440,6 +702,24 @@ async function settleCallback(c: any, method: PaymentMethod, providerReqId: stri
     return
   }
   if (tx.status !== 'PENDING') {
+    // Normally settlement is idempotent: a second callback for an already-settled
+    // transaction is just logged. EXCEPTION: a genuine SUCCESS callback (real
+    // money moved, provider receipt present) is allowed to OVERRIDE a prior
+    // FAILED that a transient status poll may have written. This guarantees a
+    // customer who was debited is never left stuck in FAILED.
+    if (success && tx.status === 'FAILED') {
+      await c.env.DB.prepare(
+        `UPDATE central_transactions
+            SET status='SUCCESS', provider_receipt=COALESCE(?, provider_receipt),
+                result_code=?, result_desc=?, updated_at=CURRENT_TIMESTAMP, completed_at=CURRENT_TIMESTAMP
+          WHERE transaction_ref=?`
+      ).bind(receipt, resultCode, resultDesc, tx.transaction_ref).run()
+      await logCallback(c, tx.transaction_ref, method, providerReqId, rawBody, true, tx.marketplace_id ?? null)
+      const client = await loadClient(c, tx.origin_app)
+      const refreshed = await c.env.DB.prepare(`SELECT * FROM central_transactions WHERE transaction_ref=?`).bind(tx.transaction_ref).first<any>()
+      if (client && refreshed) await notifyOriginApp(c, client, refreshed)
+      return
+    }
     await logCallback(c, tx.transaction_ref, method, providerReqId, rawBody, true, tx.marketplace_id ?? null)
     return
   }
