@@ -74,7 +74,13 @@ app.use('*', async (c, next) => {
   c.header('X-Frame-Options', 'SAMEORIGIN')
   c.header('Referrer-Policy', 'strict-origin-when-cross-origin')
   c.header('X-XSS-Protection', '0')
-  c.header('Permissions-Policy', 'geolocation=(), microphone=(), camera=()')
+  // Allow the app's OWN origin (self) to use the camera and geolocation so the
+  // KYC live-selfie capture (getUserMedia) and GPS onboarding work. An empty
+  // allowlist "()" disables the feature for everyone INCLUDING this document,
+  // which made the browser block getUserMedia/geolocation before the native
+  // permission prompt could appear ("camera is not allowed in this document").
+  // Microphone stays denied — the app never requests audio (audio:false).
+  c.header('Permissions-Policy', 'geolocation=(self), microphone=(), camera=(self)')
   c.header('Cross-Origin-Opener-Policy', 'same-origin')
 })
 
