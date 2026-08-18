@@ -675,14 +675,18 @@ async function requireAuth(c: any, next: any) {
 function requireRole(...roles: string[]) {
   return async (c: any, next: any) => {
     const user = c.get('user') as SessionUser
-    if (!roles.includes(user.role)) return c.json({ error: 'Forbidden' }, 403)
+    if (!roles.includes(user.role)) {
+      return c.json({ error: "You don't have permission to perform this action. Please contact your administrator if you believe this is a mistake." }, 403)
+    }
     await next()
   }
 }
 function requirePermission(...perms: string[]) {
   return async (c: any, next: any) => {
     const user = c.get('user') as SessionUser
-    if (!perms.some((perm) => hasPermission(user, perm))) return c.json({ error: 'Forbidden' }, 403)
+    if (!perms.some((perm) => hasPermission(user, perm))) {
+      return c.json({ error: "You don't have permission to perform this action. Please contact your administrator if you believe this is a mistake." }, 403)
+    }
     await next()
   }
 }
@@ -713,10 +717,10 @@ async function guardSuperAdminTarget(c: any, id: string | number, attemptedRole?
   const caller = c.get('user') as SessionUser
   if (isSuperAdmin(caller)) return null
   if (await targetIsSuperAdmin(c, id)) {
-    return c.json({ error: 'Forbidden — only a Super Admin may view or modify Super Admin credentials' }, 403)
+    return c.json({ error: 'Only a Super Admin can view or modify Super Admin credentials.' }, 403)
   }
   if (attemptedRole && String(attemptedRole).toLowerCase() === 'super_admin') {
-    return c.json({ error: 'Forbidden — only a Super Admin may grant the Super Admin role' }, 403)
+    return c.json({ error: 'Only a Super Admin can grant the Super Admin role.' }, 403)
   }
   return null
 }
@@ -1211,11 +1215,15 @@ app.post('/api/signup/verify', async (c) => {
   const tv = validateTextFields(b, [
     { key: 'full_name', label: 'Full name', max: 120 },
     { key: 'national_id', label: 'National ID', max: 40 },
+    { key: 'gender', label: 'Gender', max: 20 },
     { key: 'county', label: 'County', max: 80 }, { key: 'sub_county', label: 'Sub-county', max: 80 },
     { key: 'ward', label: 'Ward', max: 80 }, { key: 'village', label: 'Village', max: 120 },
     { key: 'value_chain', label: 'Value chain', max: 120 }, { key: 'value_chain_type', label: 'Value chain type', max: 120 }
   ])
   if (!tv.ok) return c.json({ error: tv.error }, 400)
+  // SACCO membership is a Yes/No flag — normalise to the same 'yes'/'no' the
+  // agent onboarding handler (POST /api/customers) stores.
+  const saccoMember = ['yes', 'true', '1', 'on'].includes(String(b.sacco_membership || '').toLowerCase())
   const v = await verifyOtp(c, p, code, 'signup')
   if (!v.ok) return c.json({ error: v.error }, 400)
   const existing = await c.env.DB.prepare(`SELECT id FROM users WHERE phone=?`).bind(p).first()
@@ -1255,15 +1263,20 @@ app.post('/api/signup/verify', async (c) => {
           `INSERT INTO users (full_name, phone, email, password, role, status, region, password_set, label, permissions) VALUES (?,?,?,?, ?, 'active', ?, 1, ?, ?)`
         ).bind(String(full_name).trim(), p, signupEmail, await hashPassword(String(password)), role, region || null, 'Farmer', JSON.stringify(farmerPerms)).run()
     const uid = r.meta.last_row_id
-    // Create the customer profile with the SAME standard fields an agent captures.
+    // Create the customer profile with the SAME full field set an agent captures
+    // when onboarding a farmer (Personal / Location / Farming / Financial).
     // KYC stays 'not_started' until ID documents are uploaded (required before financing).
     await c.env.DB.prepare(
-      `INSERT INTO customers (user_id, full_name, mobile, national_id, county, sub_county, ward, village, value_chain_type, value_chain, onboarded_by, kyc_status)
-       VALUES (?,?,?,?,?,?,?,?,?,?,?, 'not_started')`
+      `INSERT INTO customers (user_id, onboarded_by, full_name, national_id, date_of_birth, gender, mobile, alt_mobile, county, sub_county, ward, village, latitude, longitude, value_chain_type, value_chain, acreage, herd_size, farm_experience, annual_production, existing_loans, sacco_membership, kyc_status)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?, 'not_started')`
     ).bind(
-      uid, String(full_name).trim(), p, national_id, county,
-      b.sub_county || null, b.ward || null, b.village || null,
-      b.value_chain_type || null, b.value_chain || null, uid
+      uid, uid,
+      String(full_name).trim(), national_id, b.date_of_birth || null, b.gender || null, p, b.alt_mobile || null,
+      county, b.sub_county || null, b.ward || null, b.village || null,
+      b.latitude || null, b.longitude || null,
+      b.value_chain_type || null, b.value_chain || null,
+      b.acreage || null, b.herd_size || null, b.farm_experience || null, b.annual_production || null,
+      b.existing_loans || null, saccoMember ? 'yes' : 'no'
     ).run()
     return uid
   })
@@ -1637,8 +1650,18 @@ app.put('/api/customers/:id', requireAuth, async (c) => {
   if (!cust) return c.json({ error: 'Not found' }, 404)
   const isAdmin = ['admin', 'super_admin'].includes(user.role)
   const isOwningAgent = user.role === 'agent' && cust.agent_id === user.id
-  if (!isAdmin && !isOwningAgent) return c.json({ error: 'Forbidden' }, 403)
+  // The owning customer may update their OWN record here — this is what the
+  // Step-3 "Complete Registration" KYC document upload (ID front/back) uses.
+  // Without this a farmer saving their own KYC images was rejected with 403.
+  const isOwningCustomer = user.role === 'customer' && cust.user_id === user.id
+  if (!isAdmin && !isOwningAgent && !isOwningCustomer) {
+    return c.json({ error: "You can only update your own profile. If this is your record, please sign out and sign back in, then try again." }, 403)
+  }
   const b = await c.req.json()
+  // Immutable identity fields: national_id and mobile can never be changed after
+  // creation (uniqueness + integrity). Only a fresh admin create can set them.
+  b.national_id = undefined
+  b.mobile = undefined
   // KYC ID images must be uploaded files (no external links / disguised files).
   for (const f of ['id_front_url', 'id_back_url', 'selfie_url']) {
     if (b[f] !== undefined && b[f] !== null && b[f] !== '') {
@@ -1731,9 +1754,11 @@ app.post('/api/customers/:id/verify', requireAuth, async (c) => {
   const cust = await c.env.DB.prepare(`SELECT * FROM customers WHERE id=?`).bind(id).first<any>()
   if (!cust) return c.json({ error: 'Not found' }, 404)
   if (!['admin', 'super_admin', 'agent', 'operations_finance'].includes(user.role)) {
-    if (!(user.role === 'customer' && cust.user_id === user.id)) return c.json({ error: 'Forbidden' }, 403)
+    if (!(user.role === 'customer' && cust.user_id === user.id)) {
+      return c.json({ error: "You can only verify your own profile. If this is your record, please sign out and sign back in, then try again." }, 403)
+    }
   }
-  if (!cust.id_front_url || !cust.id_back_url) return c.json({ error: 'Front and back national ID uploads are required before verification' }, 400)
+  if (!cust.id_front_url || !cust.id_back_url) return c.json({ error: 'Please capture both the front and back of your national ID before running verification.' }, 400)
   const transunionLive = Boolean(c.env.TRANSUNION_API_URL && c.env.TRANSUNION_API_KEY)
   const score = Math.floor(Math.random() * 350 + 450)
   const band = score >= 700 ? 'low' : score >= 600 ? 'medium' : 'high'
@@ -2295,7 +2320,7 @@ app.post('/api/mpesa/stkpush', requireAuth, async (c) => {
   // are already scoped by the storefront and cannot address arbitrary contracts.
   if (user.role === 'customer') {
     const myCust = await withAdminContext(c, async () => await c.env.DB.prepare(`SELECT id FROM customers WHERE user_id=?`).bind(user.id).first<any>())
-    if (!myCust || Number(contract.customer_id) !== Number(myCust.id)) return c.json({ error: 'Forbidden' }, 403)
+    if (!myCust || Number(contract.customer_id) !== Number(myCust.id)) return c.json({ error: 'You can only make payments on your own contracts.' }, 403)
   }
   if (contract.payment_type === 'cash' && ['pending_payment', 'awaiting_cash_balance', 'completed'].includes(contract.status)) {
     const p = await withAdminContext(c, async () => await c.env.DB.prepare(`SELECT quantity FROM products WHERE id=?`).bind(contract.product_id).first<any>())
@@ -3770,7 +3795,7 @@ app.post('/api/users/:id/reset-password', requireAuth, requireRole('admin', 'sup
   // Super-Admin credentials (incl. password) may be reset only by a Super-Admin.
   // A non-super caller (admin) is fully blocked from any Super-Admin target.
   if (String(target.role || '').toLowerCase() === 'super_admin' && !isSuperAdmin(c.get('user'))) {
-    return c.json({ error: 'Forbidden — only a Super Admin may reset a Super Admin password' }, 403)
+    return c.json({ error: 'Only a Super Admin can reset a Super Admin password.' }, 403)
   }
   const body = await c.req.json().catch(() => ({}))
   const provided = body?.password && String(body.password).length >= 4
@@ -3842,7 +3867,7 @@ app.post('/api/users', requireAuth, requireRole('admin', 'super_admin'), async (
   if (!b.full_name || !p || !b.role) return c.json({ error: 'Name, phone and role are required' }, 400)
   // Only a Super-Admin may create another Super-Admin (block privilege escalation).
   if (String(b.role).toLowerCase() === 'super_admin' && !isSuperAdmin(c.get('user'))) {
-    return c.json({ error: 'Forbidden — only a Super Admin may create a Super Admin account' }, 403)
+    return c.json({ error: 'Only a Super Admin can create a Super Admin account.' }, 403)
   }
   const dup = await c.env.DB.prepare(`SELECT id FROM users WHERE phone=?`).bind(p).first<any>()
   if (dup) return c.json({ error: 'A user with this phone already exists' }, 409)
@@ -3949,7 +3974,7 @@ app.delete('/api/users/:id', requireAuth, async (c) => {
   // A Super-Admin account may be deleted only by a Super-Admin; a non-super
   // caller (admin) is blocked from touching Super-Admin accounts entirely.
   if (String(u?.role || '').toLowerCase() === 'super_admin' && !isSuperAdmin(actor)) {
-    return c.json({ error: 'Forbidden — only a Super Admin may delete a Super Admin account' }, 403)
+    return c.json({ error: 'Only a Super Admin can delete a Super Admin account.' }, 403)
   }
   // Contracts link to the user via their customer profile (customers.user_id).
   const cust = await c.env.DB.prepare(`SELECT id FROM customers WHERE user_id=?`).bind(id).first<any>()
@@ -4107,7 +4132,7 @@ app.get('/api/settings/withdrawal', requireAuth, async (c) => {
 })
 app.put('/api/settings/withdrawal-charge', requireAuth, async (c) => {
   const user = c.get('user') as SessionUser
-  if (!isAdminRole(user)) return c.json({ error: 'Forbidden' }, 403)
+  if (!isAdminRole(user)) return c.json({ error: 'Only administrators can change withdrawal charge settings.' }, 403)
   const b = await c.req.json()
   const cfg = normalizeWithdrawalCharge(b)
   await setSetting(c, 'withdrawal_charge', cfg)
@@ -4116,7 +4141,7 @@ app.put('/api/settings/withdrawal-charge', requireAuth, async (c) => {
 })
 app.put('/api/settings/support-contact', requireAuth, async (c) => {
   const user = c.get('user') as SessionUser
-  if (!isAdminRole(user)) return c.json({ error: 'Forbidden' }, 403)
+  if (!isAdminRole(user)) return c.json({ error: 'Only administrators can change the support contact settings.' }, 403)
   const b = await c.req.json()
   const cfg = normalizeSupportContact(b)
   await setSetting(c, 'support_contact', cfg)
@@ -4130,7 +4155,7 @@ app.post('/api/settings/quick-product', requireAuth, async (c) => {
   const user = c.get('user') as SessionUser
   const allowed = user.role === 'admin' || user.role === 'super_admin' ||
     hasPermission(user, 'manage_processing_fees') || hasPermission(user, 'manage_markup_pct')
-  if (!allowed) return c.json({ error: 'Forbidden' }, 403)
+  if (!allowed) return c.json({ error: "You don't have permission to add products from the settings builder." }, 403)
   const p = normalizeProductPayload(await c.req.json())
   if (!p.sku || !p.name) return c.json({ error: 'SKU and name are required' }, 400)
   try {
@@ -4154,7 +4179,7 @@ app.post('/api/settings/quick-product', requireAuth, async (c) => {
 
 app.post('/api/change-requests', requireAuth, async (c) => {
   const user = c.get('user') as SessionUser
-  if (!hasPermission(user, 'request_admin_action')) return c.json({ error: 'Forbidden' }, 403)
+  if (!hasPermission(user, 'request_admin_action')) return c.json({ error: "You don't have permission to submit admin change requests." }, 403)
   const { entity_type, entity_id, requested_action, reason } = await c.req.json()
   await c.env.DB.prepare(`INSERT INTO change_requests (requester_id, entity_type, entity_id, requested_action, reason) VALUES (?,?,?,?,?)`).bind(user.id, entity_type, entity_id || null, requested_action, reason || '').run()
   await audit(c, user.id, 'request_admin_action', entity_type || 'entity', `${requested_action || 'request'} ${entity_id || ''}`)
@@ -4211,7 +4236,7 @@ app.get('/api/profile-amendments/mine', requireAuth, async (c) => {
 // List all amendment requests for the review dashboard (default: pending).
 app.get('/api/profile-amendments', requireAuth, async (c) => {
   const user = c.get('user') as SessionUser
-  if (!canReviewAmendments(user)) return c.json({ error: 'Forbidden' }, 403)
+  if (!canReviewAmendments(user)) return c.json({ error: "You don't have permission to review profile amendment requests." }, 403)
   const status = c.req.query('status') || 'pending'
   let q = `SELECT pa.*, u.full_name AS requester_name, u.role AS requester_role, r.full_name AS reviewer_name
            FROM profile_amendments pa
@@ -4227,7 +4252,7 @@ app.get('/api/profile-amendments', requireAuth, async (c) => {
 // Approve / reject an amendment request.
 app.post('/api/profile-amendments/:id/decision', requireAuth, async (c) => {
   const actor = c.get('user') as SessionUser
-  if (!canReviewAmendments(actor)) return c.json({ error: 'Forbidden' }, 403)
+  if (!canReviewAmendments(actor)) return c.json({ error: "You don't have permission to approve or reject amendment requests." }, 403)
   const id = c.req.param('id')
   const { action, notes } = await c.req.json()
   const amend = await c.env.DB.prepare(`SELECT * FROM profile_amendments WHERE id=?`).bind(id).first<any>()
