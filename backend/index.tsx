@@ -1222,6 +1222,14 @@ app.post('/api/signup/verify', async (c) => {
   if (dupId) return c.json({ error: 'A profile with this National ID already exists.' }, 409)
   const role = 'customer'
   const farmerPerms = await permissionsForRole(c, role)
+  // Customers never provide an email at signup — resolveEmail supplies a UNIQUE,
+  // non-deliverable placeholder derived from the phone. This satisfies the
+  // central users.email NOT NULL + UNIQUE constraints (a bare NULL failed with
+  // "null value in column email ... violates not-null constraint", and binding
+  // '' would collide on the 2nd signup → users_email_key / 23505). Parity with
+  // the Equipment signup/verify handler.
+  const signupEmailRes = resolveEmail(role, null, p)
+  const signupEmail = 'value' in signupEmailRes ? signupEmailRes.value : ''
   // Self-registration is a server-authorized write: run under the admin RLS
   // context so the non-superuser DB role can create the user + customer profile
   // (matches every other privileged insert in this file).
@@ -1235,11 +1243,11 @@ app.post('/api/signup/verify', async (c) => {
     const withOrg = (await usersHasOrgId(c)) && orgId != null
     const r = withOrg
       ? await c.env.DB.prepare(
-          `INSERT INTO users (full_name, phone, password, role, status, region, password_set, label, permissions, org_id) VALUES (?,?,?, ?, 'active', ?, 1, ?, ?, ?)`
-        ).bind(String(full_name).trim(), p, await hashPassword(String(password)), role, region || null, 'Farmer', JSON.stringify(farmerPerms), orgId).run()
+          `INSERT INTO users (full_name, phone, email, password, role, status, region, password_set, label, permissions, org_id) VALUES (?,?,?,?, ?, 'active', ?, 1, ?, ?, ?)`
+        ).bind(String(full_name).trim(), p, signupEmail, await hashPassword(String(password)), role, region || null, 'Farmer', JSON.stringify(farmerPerms), orgId).run()
       : await c.env.DB.prepare(
-          `INSERT INTO users (full_name, phone, password, role, status, region, password_set, label, permissions) VALUES (?,?,?, ?, 'active', ?, 1, ?, ?)`
-        ).bind(String(full_name).trim(), p, await hashPassword(String(password)), role, region || null, 'Farmer', JSON.stringify(farmerPerms)).run()
+          `INSERT INTO users (full_name, phone, email, password, role, status, region, password_set, label, permissions) VALUES (?,?,?,?, ?, 'active', ?, 1, ?, ?)`
+        ).bind(String(full_name).trim(), p, signupEmail, await hashPassword(String(password)), role, region || null, 'Farmer', JSON.stringify(farmerPerms)).run()
     const uid = r.meta.last_row_id
     // Create the customer profile with the SAME standard fields an agent captures.
     // KYC stays 'not_started' until ID documents are uploaded (required before financing).
@@ -3791,7 +3799,14 @@ app.put('/api/agents/:id', requireAuth, requireRole('admin', 'super_admin'), asy
   const id = c.req.param('id')
   const b = await c.req.json()
   const perms = await permissionsForRole(c, 'agent', b.permissions || {})
-  await c.env.DB.prepare(`UPDATE users SET full_name=?, phone=?, email=?, region=?, label=?, permissions=? WHERE id=? AND role='agent'`).bind(b.full_name, b.phone, b.email, b.region, b.label || 'Agent', JSON.stringify(perms), id).run()
+  // Agents don't require email — resolveEmail supplies a unique placeholder when
+  // blank so the central users.email NOT NULL + UNIQUE constraints hold on edit
+  // (binding a raw blank/undefined b.email would violate NOT NULL, mirroring the
+  // signup 23502 bug). Parity with the Equipment agents PUT handler.
+  const agUpdEmailRes = resolveEmail('agent', b.email, b.phone)
+  if ('error' in agUpdEmailRes) return c.json({ error: agUpdEmailRes.error }, 400)
+  const agUpdEmail = agUpdEmailRes.value
+  await c.env.DB.prepare(`UPDATE users SET full_name=?, phone=?, email=?, region=?, label=?, permissions=? WHERE id=? AND role='agent'`).bind(b.full_name, b.phone, agUpdEmail, b.region, b.label || 'Agent', JSON.stringify(perms), id).run()
   await c.env.DB.prepare(`UPDATE agents SET region=?, permissions=? WHERE user_id=?`).bind(b.region, JSON.stringify(perms), id).run()
   await audit(c, c.get('user').id, 'update', 'agent', b.full_name)
   return c.json({ ok: true })
@@ -3876,10 +3891,17 @@ app.put('/api/users/:id', requireAuth, requireRole('admin', 'super_admin'), asyn
   const perms = await permissionsForRole(c, String(b.role), b.permissions || {})
   const schedEnabled = boolInt(b.schedule_enabled, false) ? 1 : 0
   const schedDays = Array.isArray(b.access_days) ? JSON.stringify(b.access_days) : null
+  // Same email policy on edit: required for super_admin/admin/lender, otherwise a
+  // unique placeholder so the central users.email NOT NULL + UNIQUE constraints
+  // both hold (binding a raw blank b.email would violate NOT NULL, same class of
+  // bug as signup). Parity with the Equipment users PUT handler.
+  const usrUpdEmailRes = resolveEmail(String(b.role), b.email, b.phone)
+  if ('error' in usrUpdEmailRes) return c.json({ error: usrUpdEmailRes.error }, 400)
+  const usrUpdEmail = usrUpdEmailRes.value
   if (b.password) {
-    await c.env.DB.prepare(`UPDATE users SET full_name=?, phone=?, email=?, role=?, label=?, permissions=?, region=?, schedule_enabled=?, access_days=?, access_start=?, access_end=?, password=? WHERE id=?`).bind(b.full_name, b.phone, b.email, b.role, b.label || null, JSON.stringify(perms), b.region, schedEnabled, schedDays, b.access_start || null, b.access_end || null, await hashPassword(String(b.password)), id).run()
+    await c.env.DB.prepare(`UPDATE users SET full_name=?, phone=?, email=?, role=?, label=?, permissions=?, region=?, schedule_enabled=?, access_days=?, access_start=?, access_end=?, password=? WHERE id=?`).bind(b.full_name, b.phone, usrUpdEmail, b.role, b.label || null, JSON.stringify(perms), b.region, schedEnabled, schedDays, b.access_start || null, b.access_end || null, await hashPassword(String(b.password)), id).run()
   } else {
-    await c.env.DB.prepare(`UPDATE users SET full_name=?, phone=?, email=?, role=?, label=?, permissions=?, region=?, schedule_enabled=?, access_days=?, access_start=?, access_end=? WHERE id=?`).bind(b.full_name, b.phone, b.email, b.role, b.label || null, JSON.stringify(perms), b.region, schedEnabled, schedDays, b.access_start || null, b.access_end || null, id).run()
+    await c.env.DB.prepare(`UPDATE users SET full_name=?, phone=?, email=?, role=?, label=?, permissions=?, region=?, schedule_enabled=?, access_days=?, access_start=?, access_end=? WHERE id=?`).bind(b.full_name, b.phone, usrUpdEmail, b.role, b.label || null, JSON.stringify(perms), b.region, schedEnabled, schedDays, b.access_start || null, b.access_end || null, id).run()
   }
   if (b.role === 'agent') {
     const exists = await c.env.DB.prepare(`SELECT user_id FROM agents WHERE user_id=?`).bind(id).first<any>()
