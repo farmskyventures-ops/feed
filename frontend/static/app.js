@@ -521,9 +521,17 @@ function authSignIn() {
 // dispatched to the registered phone. Holds the phone + temp password in a
 // closure so verify-otp can re-authenticate before minting the change token.
 let _loginOtpCtx = null
+// Resolve the container the auth sub-screens (OTP, force-change) should render
+// into. On the login card the slot is #authBody; once signed in it is #content.
+// Falling back to #app guarantees we NEVER target a null node (the previous
+// `$('authForm') || $('content')` returned null on the login screen, so the OTP
+// verification screen silently failed to load for first-time logins).
+function authScreenHost() {
+  return $('authBody') || $('content') || $('app')
+}
 function renderLoginOtp(ctx) {
   _loginOtpCtx = ctx
-  const f = $('authForm') || $('content')
+  const f = authScreenHost()
   f.innerHTML = `<div class="max-w-sm mx-auto">
     <h2 class="text-xl font-bold mb-1">Verify it's you</h2>
     <p class="text-sm text-slate-500 mb-4">${esc(ctx.message || 'Enter the verification code sent to your phone to continue.')}${ctx.demo_otp ? ` <b class="text-teal-700">Demo code: ${esc(ctx.demo_otp)}</b>` : ''}</p>
@@ -563,20 +571,22 @@ window.doLoginResendOtp = async () => {
 }
 // Mandatory password update on first login with a temporary password.
 function renderForceChangePassword(user) {
-  const f = $('authForm') || $('content')
+  const f = authScreenHost()
   f.innerHTML = `<div class="max-w-sm mx-auto">
     <h2 class="text-xl font-bold mb-1">Set your password</h2>
     <p class="text-sm text-slate-500 mb-4">Welcome${user && user.full_name ? ', ' + esc(user.full_name) : ''}. Your account uses a temporary password. Please choose your own secure password to continue.</p>
     <div class="space-y-3">
-      ${passwordField('fc_new', { placeholder: 'New password (min 4 characters)' })}
-      ${passwordField('fc_confirm', { placeholder: 'Confirm new password' })}
+      <div><label class="text-sm font-medium text-slate-600">New Password</label>
+        ${passwordField('fc_new', { placeholder: 'New password (min 4 characters)' })}</div>
+      <div><label class="text-sm font-medium text-slate-600">Confirm New Password</label>
+        ${passwordField('fc_confirm', { placeholder: 'Re-enter new password' })}</div>
       <button id="fcBtn" onclick="doForceChangePassword()" class="btn w-full brand-bg text-white py-2.5 rounded-lg font-semibold">Save & Continue</button>
     </div></div>`
 }
 window.doForceChangePassword = async () => {
   const pw = $('fc_new').value, cf = $('fc_confirm').value
   if (!pw || pw.length < 4) { toast('Password must be at least 4 characters', false); return }
-  if (pw !== cf) { toast('Passwords do not match', false); return }
+  if (pw !== cf) { toast('Passwords do not match. Please make sure both fields are identical.', false); return }
   const done = btnLoading('fcBtn', 'Saving…')
   try {
     // The session token from login (must_change) is already set; update password.
@@ -1018,7 +1028,9 @@ function authResetVerify(phone, demoOtp) {
       <div><label class="text-sm font-medium text-slate-600">Reset Code</label>
         <input id="rs_code" type="text" inputmode="numeric" placeholder="6-digit code" value="${esc(demoOtp || '')}" class="w-full mt-1 px-4 py-2.5 border border-slate-300 rounded-lg tracking-widest" required></div>
       <div><label class="text-sm font-medium text-slate-600">New Password</label>
-        ${passwordField('rs_pass', { placeholder: 'New password', required: true })}</div>
+        ${passwordField('rs_pass', { placeholder: 'New password (min 4 characters)', required: true })}</div>
+      <div><label class="text-sm font-medium text-slate-600">Confirm New Password</label>
+        ${passwordField('rs_pass_confirm', { placeholder: 'Re-enter new password', required: true })}</div>
       <button id="rsvBtn" class="btn w-full brand-bg text-white py-2.5 rounded-lg font-semibold">Update Password</button>
     </form>
     <div class="text-center mt-3 text-sm text-slate-500">
@@ -1041,9 +1053,12 @@ function authResetVerify(phone, demoOtp) {
   startResendCountdown('rsResendBtn', 30, rsResend)
   $('rsvForm').onsubmit = async (e) => {
     e.preventDefault()
+    const pw = $('rs_pass').value, cf = $('rs_pass_confirm').value
+    if (!pw || pw.length < 4) { toast('Password must be at least 4 characters', false); return }
+    if (pw !== cf) { toast('Passwords do not match. Please make sure both fields are identical.', false); return }
     const done = btnLoading('rsvBtn', 'Updating…')
     try {
-      await api.post('/reset-password/verify', { phone, code: $('rs_code').value, password: $('rs_pass').value })
+      await api.post('/reset-password/verify', { phone, code: $('rs_code').value, password: pw })
       toast('Password updated. Please sign in.'); renderLogin('signin')
     } catch (err) { done(); toast(err.response?.data?.error || 'Reset failed', false) }
   }
@@ -4004,7 +4019,9 @@ async function viewProfile() {
         <p class="text-xs text-slate-500 mb-4">Choose a new password. You'll need your current password to confirm.</p>
         <div class="responsive-grid cols-2 text-sm">
           <div><label class="field-label">Current password</label>${passwordField('pf_cur_pw', { placeholder: 'Current password', cls: 'px-3 py-2 border rounded-lg w-full' })}</div>
-          <div><label class="field-label">New password</label>${passwordField('pf_new_pw', { placeholder: 'New password', cls: 'px-3 py-2 border rounded-lg w-full' })}</div>
+          <div></div>
+          <div><label class="field-label">New Password</label>${passwordField('pf_new_pw', { placeholder: 'New password (min 4 characters)', cls: 'px-3 py-2 border rounded-lg w-full' })}</div>
+          <div><label class="field-label">Confirm New Password</label>${passwordField('pf_new_pw_confirm', { placeholder: 'Re-enter new password', cls: 'px-3 py-2 border rounded-lg w-full' })}</div>
         </div>
         <div class="flex gap-2 mt-4"><button onclick="changeMyPassword()" class="btn brand-bg text-white px-5 py-2 rounded-lg text-sm"><i class="fas fa-lock mr-1"></i>Update Password</button></div>
       </div>
@@ -4049,12 +4066,14 @@ window.saveFarmerProfile = async () => {
   } catch (err) { toast(err.response?.data?.error || 'Failed', false) }
 }
 window.changeMyPassword = async () => {
-  const cur = ($('pf_cur_pw') || {}).value, nw = ($('pf_new_pw') || {}).value
+  const cur = ($('pf_cur_pw') || {}).value, nw = ($('pf_new_pw') || {}).value, cf = ($('pf_new_pw_confirm') || {}).value
   if (!nw || nw.length < 4) return toast('New password must be at least 4 characters', false)
+  if (nw !== cf) return toast('Passwords do not match. Please make sure both fields are identical.', false)
   try {
     await api.put('/me/password', { current_password: cur, new_password: nw })
     if ($('pf_cur_pw')) $('pf_cur_pw').value = ''
     if ($('pf_new_pw')) $('pf_new_pw').value = ''
+    if ($('pf_new_pw_confirm')) $('pf_new_pw_confirm').value = ''
     toast('Password updated')
   } catch (err) { toast(err.response?.data?.error || 'Failed', false) }
 }
