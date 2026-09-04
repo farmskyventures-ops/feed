@@ -1942,17 +1942,36 @@ window.payModal = async (id, amount, outstanding, kind, opts) => {
     <label class="text-sm font-medium">Phone${forFarmer ? ' (farmer)' : ''}</label><input id="mpphone" value="${esc(targetPhone)}" class="w-full mt-1 mb-3 px-3 py-2 border border-slate-300 rounded-lg">
     <label class="text-sm font-medium">Amount (KES)</label><input id="mpamt" type="number" value="${amount}" ${isCash ? 'readonly' : ''} class="w-full mt-1 mb-2 px-3 py-2 border border-slate-300 rounded-lg ${isCash ? 'bg-slate-50' : ''}">
 
-    <!-- Issue 6: Dynamic legal agreement block — toggles between asset financing
-         terms and cash sale terms, both left-aligned to the layout margin. -->
+    <!-- Dynamic legal agreement block — the terms shown here are loaded from the
+         agreement template that matches THIS contract's payment path
+         (cash / murabaha). End-users only ever see the terms relevant to
+         the path they chose at checkout. -->
     <div id="payTermsBlock" class="text-left mb-4 mt-1 p-3 bg-slate-50 border border-slate-200 rounded-lg">
-      <div class="text-[11px] font-semibold text-slate-600 uppercase tracking-wider mb-1 text-left">${isCash ? 'Cash Sale Agreement' : 'Asset Financing Agreement'}</div>
-      <p class="text-[11px] leading-relaxed text-slate-500 text-left">${isCash
-        ? 'This is an outright cash sale. By proceeding you confirm full/settlement payment of the amount due and accept transfer of ownership of the Feed upon settlement. All sales are governed by FarmSky cash sale terms and no financing profit or installment obligations apply.'
-        : 'This is a Sharia-compliant asset financing (Murabaha) transaction. By proceeding you agree to the disclosed murabaha price, deposit and the installment repayment schedule until the outstanding balance is fully settled. Ownership transfers per the executed financing agreement and applicable FarmSky financing terms.'}</p>
+      <div class="text-[11px] font-semibold text-slate-600 uppercase tracking-wider mb-1 text-left">${isCash ? 'Cash Sale Agreement' : 'Murabaha Sale Agreement'}</div>
+      <p class="text-[11px] leading-relaxed text-slate-500 text-left" id="payTermsText">Loading the terms for your selected payment option…</p>
+      <button type="button" onclick="viewDoc(${id})" class="text-[11px] text-teal-600 underline mt-2"><i class="fas fa-file-lines mr-1"></i>View full agreement</button>
     </div>
     <div id="payStatus"></div>
     <div class="flex gap-2"><button id="payBtn" onclick="doPay(${id}, '${kind}')" class="btn flex-1 brand-bg text-white py-2.5 rounded-lg text-sm">Send Payment Prompt</button>
     <button onclick="closeModal()" class="btn px-4 bg-slate-100 rounded-lg text-sm">Cancel</button></div>`)
+  // Load the correct terms for this contract's payment path (dynamic checkout).
+  loadPayTerms(id, isCash)
+}
+// Populate the checkout terms block from the contract's matched agreement.
+async function loadPayTerms(id, isCash) {
+  const el = $('payTermsText')
+  if (!el) return
+  const fallback = isCash
+    ? 'This is an outright cash sale. By proceeding you confirm settlement of the amount due and accept transfer of ownership of the Feed upon payment.'
+    : 'This is a Sharia-compliant Murabaha transaction. By proceeding you agree to the disclosed murabaha price, deposit and installment repayment schedule until the balance is fully settled.'
+  try {
+    const { data } = await api.get('/murabaha/' + id + '/agreement')
+    // Strip tags for the compact preview; the full styled doc is one tap away.
+    const plain = String(data.body_html || data.overview_html || '').replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim()
+    const lbl = $('payTermsBlock')?.querySelector('.uppercase')
+    if (lbl && data.title) lbl.textContent = data.title
+    el.textContent = plain || fallback
+  } catch (_) { el.textContent = fallback }
 }
 
 // Cache of the full SasaPay channel catalogue (wallet + mobile + ALL banks).
@@ -2333,24 +2352,73 @@ window.doSasaOtp = async (checkoutId, id, kind) => {
   }
 }
 
+// Inline CSS built from the configured agreement style (default: justified,
+// 12pt Calibri, 1.5 line spacing) — used both on-screen and for the PDF.
+function agreementStyleCss(style) {
+  const s = style || {}
+  const fam = s.font_family || 'Calibri'
+  const size = Number(s.font_size_pt || 12)
+  const lh = Number(s.line_height || 1.5)
+  const align = s.text_align || 'justify'
+  return `font-family:'${fam}', Calibri, Arial, sans-serif; font-size:${size}pt; line-height:${lh}; text-align:${align};`
+}
+// Render the auto-populated transaction details table.
+function agreementDetailsTable(details) {
+  return `<table style="width:100%; border-collapse:collapse; margin:14px 0;">
+    ${(details || []).map(d => `<tr>
+      <td style="border:1px solid #cbd5e1; padding:6px 10px; font-weight:600; width:42%; background:#f8fafc;">${esc(d.label)}</td>
+      <td style="border:1px solid #cbd5e1; padding:6px 10px;">${esc(d.value)}</td>
+    </tr>`).join('')}
+  </table>`
+}
+// Assemble the full agreement HTML (three sections: overview, details, body).
+function agreementDocumentHtml(ag) {
+  const css = agreementStyleCss(ag.style)
+  return `<div style="${css}">
+    <h1 style="text-align:center; font-size:16pt; margin:0 0 4px;">${esc(ag.title)}</h1>
+    <hr style="border:none; border-top:2px solid #0f766e; margin:8px 0 16px;">
+    <section style="margin-bottom:14px;">${ag.overview_html || ''}</section>
+    <h2 style="font-size:13pt; margin:12px 0 4px;">Transaction Details</h2>
+    ${agreementDetailsTable(ag.details)}
+    <h2 style="font-size:13pt; margin:12px 0 4px;">Terms &amp; Conditions</h2>
+    <section>${ag.body_html || ''}</section>
+  </div>`
+}
 window.viewDoc = async (id) => {
-  // MAINTAINED: Kept local "api" instance intact because agreements live on local backend database
-  const { data } = await api.get('/documents/contract/' + id)
-  const c = data.contract
-  showModal(`<div class="text-center">
-    <h3 class="font-bold text-lg">Murabaha Agreement</h3>
-    <p class="text-xs text-slate-500 mb-3">${esc(c.contract_ref)}</p>
-    <img src="${data.qr}" class="mx-auto mb-3" alt="QR">
-    <div class="text-left text-sm bg-slate-50 p-4 rounded-lg space-y-1">
-      <p><b>Customer:</b> ${esc(c.customer_name)} (ID ${esc(c.national_id || '—')})</p>
-      <p><b>Product:</b> ${esc(c.product_name)} ×${c.quantity}</p>
-      <p><b>Supplier Cost:</b> ${fmt(c.supplier_cost)} · <b>Markup:</b> ${c.markup_pct}%</p>
-      <p><b>Murabaha Price (fixed):</b> ${fmt(c.murabaha_price)}</p>
-      <p class="text-xs italic text-slate-500 pt-2">Compliant with Murabaha principles. No riba, penalties, or compounding applied.</p>
+  let ag, qr = null
+  try {
+    const { data } = await api.get('/murabaha/' + id + '/agreement')
+    ag = data
+  } catch (err) { toast(err.response?.data?.error || 'Could not load agreement', false); return }
+  // QR (optional) from the legacy documents endpoint — non-fatal if unavailable.
+  try { const { data: dd } = await api.get('/documents/contract/' + id); qr = dd.qr } catch (_) {}
+  window._lastAgreement = ag
+  showModal(`<div>
+    <div class="flex items-center justify-between mb-3">
+      <h3 class="font-bold text-lg">${esc(ag.title)}</h3>
+      <span class="badge bg-teal-100 text-teal-700">${esc(ag.type_label)}</span>
     </div>
-    <button onclick="window.print()" class="btn mt-4 bg-slate-800 text-white px-5 py-2 rounded-lg text-sm"><i class="fas fa-print mr-1"></i>Print / Save PDF</button>
-    <button onclick="closeModal()" class="btn mt-4 ml-2 bg-slate-100 px-5 py-2 rounded-lg text-sm">Close</button>
+    ${qr ? `<img src="${qr}" class="mx-auto mb-3 w-24 h-24" alt="QR">` : ''}
+    <div id="agreementDoc" class="border border-slate-200 rounded-lg p-4 bg-white max-h-[55vh] overflow-auto">
+      ${agreementDocumentHtml(ag)}
+    </div>
+    <div class="flex gap-2 mt-4">
+      <button onclick="downloadAgreementPdf()" class="btn flex-1 bg-slate-800 text-white py-2.5 rounded-lg text-sm"><i class="fas fa-file-pdf mr-1"></i>Download PDF</button>
+      <button onclick="closeModal()" class="btn px-4 bg-slate-100 rounded-lg text-sm">Close</button>
+    </div>
   </div>`)
+}
+// Styled PDF export — opens a print window carrying the configured styling so
+// "Save as PDF" produces the justified / Calibri / 1.5-spacing document.
+window.downloadAgreementPdf = () => {
+  const ag = window._lastAgreement
+  if (!ag) return
+  const w = window.open('', '_blank')
+  if (!w) { toast('Please allow pop-ups to download the agreement PDF', false); return }
+  w.document.write(`<!doctype html><html><head><meta charset="utf-8"><title>${esc(ag.title)}</title>
+    <style>@page{margin:24mm 18mm;} body{margin:0;color:#0f172a;}</style></head>
+    <body onload="window.print()">${agreementDocumentHtml(ag)}</body></html>`)
+  w.document.close()
 }
 // ---------------------------------------------------------------------------
 // APPROVALS (admin)
@@ -2411,8 +2479,18 @@ function productForm(prefix, p = {}) {
       <div style="grid-column:1 / -1"><label class="field-label">Feed description</label><textarea id="${prefix}_desc" placeholder="Feed details / description" class="px-3 py-2 border rounded-lg min-h-24">${esc(p.description || '')}</textarea></div>
       <div><label class="field-label">Buying cost</label><input id="${prefix}_buy" type="number" value="${Number(p.buying_price || 0)}" placeholder="Buying price" class="px-3 py-2 border rounded-lg"></div>
       <div><label class="field-label">Quantity in stock</label><input id="${prefix}_qty" type="number" value="${Number(p.quantity || 0)}" placeholder="Quantity" class="px-3 py-2 border rounded-lg"></div>
-      <div><label class="field-label">Cash markup %</label><input id="${prefix}_cm" type="number" value="${Number(p.cash_markup_pct || 10)}" placeholder="Cash markup %" class="px-3 py-2 border rounded-lg"></div>
       <div><label class="field-label">Reorder threshold</label><input id="${prefix}_rt" type="number" value="${Number(p.reorder_threshold || 10)}" placeholder="Reorder threshold" class="px-3 py-2 border rounded-lg"></div>
+      <div style="grid-column:1 / -1" class="border rounded-xl p-3 bg-white">
+        <div class="font-medium text-slate-700 mb-2 text-sm"><i class="fas fa-tags text-teal-600 mr-1"></i>Cash selling price</div>
+        <div class="responsive-grid cols-2">
+          <div><label class="field-label">Cash price mode</label><select id="${prefix}_cash_mode" onchange="onPriceModeChange('${prefix}','cash')" class="px-3 py-2 border rounded-lg">
+            ${['percentage','fixed','manual'].map(v => `<option value="${v}" ${(p.cash_price_mode || 'percentage') === v ? 'selected' : ''}>${PRICE_MODE_LABELS[v]}</option>`).join('')}
+          </select></div>
+          <div id="${prefix}_cash_pct_wrap"><label class="field-label">Cash markup %</label><input id="${prefix}_cm" type="number" value="${Number(p.cash_markup_pct ?? 10)}" placeholder="Cash markup %" class="px-3 py-2 border rounded-lg"></div>
+          <div id="${prefix}_cash_amt_wrap"><label class="field-label">Cash markup amount (KES)</label><input id="${prefix}_cash_amt" type="number" value="${Number(p.cash_markup_amount || 0)}" placeholder="Fixed amount added to cost" class="px-3 py-2 border rounded-lg"></div>
+          <div id="${prefix}_cash_man_wrap"><label class="field-label">Cash selling price (KES)</label><input id="${prefix}_cash_price" type="number" value="${Number(p.cash_price || 0)}" placeholder="Direct selling price" class="px-3 py-2 border rounded-lg"></div>
+        </div>
+      </div>
       <div><label class="field-label">Payment availability</label><select id="${prefix}_mode" class="px-3 py-2 border rounded-lg">
         <option value="both" ${paymentMode === 'both' ? 'selected' : ''}>Cash + Financing</option>
         <option value="cash" ${paymentMode === 'cash' ? 'selected' : ''}>Cash only</option>
@@ -2432,16 +2510,41 @@ function productForm(prefix, p = {}) {
         <i class="fas fa-hand-holding-dollar text-teal-600"></i>Financial components ${canFin ? '' : '<span class="badge bg-amber-100 text-amber-700 ml-1">finance-authorized only</span>'}
       </div>
       ${finNote}
-      <div><label class="field-label">Financing markup %</label><input id="${prefix}_crm" ${finDis} type="number" value="${Number(p.credit_markup_pct || 20)}" placeholder="Financing markup %" class="px-3 py-2 border rounded-lg ${finDis ? 'bg-slate-100 text-slate-400' : ''}"></div>
-      <div><label class="field-label">TransUnion product code</label><input id="${prefix}_tu" ${finDis} value="${esc(p.transunion_product_code || '')}" placeholder="TransUnion product code" class="px-3 py-2 border rounded-lg ${finDis ? 'bg-slate-100 text-slate-400' : ''}"></div>
-      <div><label class="field-label">Financing model</label><select id="${prefix}_fin_model" ${finDis} class="px-3 py-2 border rounded-lg ${finDis ? 'bg-slate-100 text-slate-400' : ''}">
+      <div style="grid-column:1 / -1" class="border rounded-xl p-3 bg-white">
+        <div class="font-medium text-slate-700 mb-2 text-sm"><i class="fas fa-tags text-teal-600 mr-1"></i>Financed selling price</div>
+        <div class="responsive-grid cols-2">
+          <div><label class="field-label">Financed price mode</label><select id="${prefix}_credit_mode" ${finDis} onchange="onPriceModeChange('${prefix}','credit')" class="px-3 py-2 border rounded-lg ${finDis ? 'bg-slate-100 text-slate-400' : ''}">
+            ${['percentage','fixed','manual'].map(v => `<option value="${v}" ${(p.credit_price_mode || 'percentage') === v ? 'selected' : ''}>${PRICE_MODE_LABELS[v]}</option>`).join('')}
+          </select></div>
+          <div id="${prefix}_credit_pct_wrap"><label class="field-label">Financing markup %</label><input id="${prefix}_crm" ${finDis} type="number" value="${Number(p.credit_markup_pct ?? 20)}" placeholder="Financing markup %" class="px-3 py-2 border rounded-lg ${finDis ? 'bg-slate-100 text-slate-400' : ''}"></div>
+          <div id="${prefix}_credit_amt_wrap"><label class="field-label">Financing markup amount (KES)</label><input id="${prefix}_credit_amt" ${finDis} type="number" value="${Number(p.credit_markup_amount || 0)}" placeholder="Fixed amount added to cost" class="px-3 py-2 border rounded-lg ${finDis ? 'bg-slate-100 text-slate-400' : ''}"></div>
+          <div id="${prefix}_credit_man_wrap"><label class="field-label">Financed selling price (KES)</label><input id="${prefix}_credit_price" ${finDis} type="number" value="${Number(p.credit_price || 0)}" placeholder="Direct selling price" class="px-3 py-2 border rounded-lg ${finDis ? 'bg-slate-100 text-slate-400' : ''}"></div>
+        </div>
+      </div>
+      <div><label class="field-label">Financing type</label><select id="${prefix}_fin_type" ${finDis} class="px-3 py-2 border rounded-lg ${finDis ? 'bg-slate-100 text-slate-400' : ''}" data-selected="${esc(p.financing_type_key || p.financing_model || 'murabaha')}">
+        <option value="">Loading types…</option>
+      </select></div>
+      <div><label class="field-label">Financing model (legacy)</label><select id="${prefix}_fin_model" ${finDis} class="px-3 py-2 border rounded-lg ${finDis ? 'bg-slate-100 text-slate-400' : ''}">
         <option value="murabaha" selected>Murabaha</option>
       </select></div>
       <div><label class="field-label">Profit / markup rate %</label><input id="${prefix}_int" ${finDis} type="number" value="${Number(p.financing_interest_pct || 0)}" placeholder="Profit / markup rate %" class="px-3 py-2 border rounded-lg ${finDis ? 'bg-slate-100 text-slate-400' : ''}"></div>
-      <div><label class="field-label">Repayment frequency</label><select id="${prefix}_freq" ${finDis} class="px-3 py-2 border rounded-lg ${finDis ? 'bg-slate-100 text-slate-400' : ''}">
+      <div><label class="field-label">Financing deposit %</label><input id="${prefix}_fin_dep" ${finDis} type="number" value="${Number(p.financing_deposit_pct ?? 10)}" placeholder="Financing deposit %" class="px-3 py-2 border rounded-lg ${finDis ? 'bg-slate-100 text-slate-400' : ''}"></div>
+      <div style="grid-column:1 / -1" class="border rounded-xl p-3 bg-white">
+        <div class="font-medium text-slate-700 mb-2 text-sm"><i class="fas fa-calendar-days text-teal-600 mr-1"></i>Tenure &amp; repayment schedule</div>
+        <div class="responsive-grid cols-2">
+          <div><label class="field-label">Tenure type</label><select id="${prefix}_tenure_unit" ${finDis} onchange="onTenureUnitChange('${prefix}')" class="px-3 py-2 border rounded-lg ${finDis ? 'bg-slate-100 text-slate-400' : ''}">
+            ${['monthly','yearly','custom'].map(v => `<option value="${v}" ${(p.financing_tenure_unit || 'monthly') === v ? 'selected' : ''}>${TENURE_LABELS[v]}</option>`).join('')}
+          </select></div>
+          <div><label class="field-label" id="${prefix}_cyclecount_lbl">Total months</label><input id="${prefix}_cycle_count" ${finDis} type="number" value="${Number(p.financing_cycle_count || 0)}" placeholder="Number of cycles" class="px-3 py-2 border rounded-lg ${finDis ? 'bg-slate-100 text-slate-400' : ''}"></div>
+          <div><label class="field-label" id="${prefix}_ratepc_lbl">Rate % per month</label><input id="${prefix}_rate_pc" ${finDis} type="number" value="${Number(p.financing_rate_per_cycle || 0)}" placeholder="% charged per cycle" class="px-3 py-2 border rounded-lg ${finDis ? 'bg-slate-100 text-slate-400' : ''}"></div>
+          <div><label class="field-label" id="${prefix}_amtpc_lbl">Amount per month (KES)</label><input id="${prefix}_amt_pc" ${finDis} type="number" value="${Number(p.financing_amount_per_cycle || 0)}" placeholder="Fixed amount per cycle" class="px-3 py-2 border rounded-lg ${finDis ? 'bg-slate-100 text-slate-400' : ''}"></div>
+          <div id="${prefix}_cyclelen_wrap"><label class="field-label">Length of each cycle (days)</label><input id="${prefix}_cycle_len" ${finDis} type="number" value="${Number(p.financing_cycle_length_days || 30)}" placeholder="Days per cycle" class="px-3 py-2 border rounded-lg ${finDis ? 'bg-slate-100 text-slate-400' : ''}"></div>
+        </div>
+        <div class="text-[11px] text-slate-400 mt-2">Leave rate/amount at 0 to keep the legacy min/max-months model below. Murabaha stays interest-free — the tenure schedule only structures repayment.</div>
+      </div>
+      <div><label class="field-label">Repayment frequency (legacy)</label><select id="${prefix}_freq" ${finDis} class="px-3 py-2 border rounded-lg ${finDis ? 'bg-slate-100 text-slate-400' : ''}">
         ${['daily','weekly','monthly'].map(v => `<option value="${v}" ${(p.financing_frequency || 'monthly') === v ? 'selected' : ''}>${v}</option>`).join('')}
       </select></div>
-      <div><label class="field-label">Financing deposit %</label><input id="${prefix}_fin_dep" ${finDis} type="number" value="${Number(p.financing_deposit_pct ?? 10)}" placeholder="Financing deposit %" class="px-3 py-2 border rounded-lg ${finDis ? 'bg-slate-100 text-slate-400' : ''}"></div>
       <div><label class="field-label">Minimum term (months)</label><input id="${prefix}_tmin" ${finDis} type="number" value="${Number(p.financing_term_min_months || 3)}" placeholder="Minimum term (months)" class="px-3 py-2 border rounded-lg ${finDis ? 'bg-slate-100 text-slate-400' : ''}"></div>
       <div><label class="field-label">Maximum term (months)</label><input id="${prefix}_tmax" ${finDis} type="number" value="${Number(p.financing_term_max_months || 12)}" placeholder="Maximum term (months)" class="px-3 py-2 border rounded-lg ${finDis ? 'bg-slate-100 text-slate-400' : ''}"></div>
       <div style="grid-column:1 / -1"><label class="field-label">Financing terms summary</label><textarea id="${prefix}_fin_terms" ${finDis} placeholder="Financing terms summary" class="px-3 py-2 border rounded-lg min-h-24 ${finDis ? 'bg-slate-100 text-slate-400' : ''}">${esc(p.financing_terms_text || '')}</textarea></div>
@@ -2455,6 +2558,56 @@ function productForm(prefix, p = {}) {
       </div>
     </div>`
 }
+// ---- Dynamic pricing / tenure form helpers --------------------------------
+const PRICE_MODE_LABELS = { percentage: 'Percentage markup', fixed: 'Fixed amount markup', manual: 'Manual selling price' }
+const TENURE_LABELS = { monthly: 'Monthly', yearly: 'Yearly', custom: 'Custom cycle' }
+// Cached active financing types (loaded from the API) so inventory + checkout
+// dropdowns can render synchronously after the first fetch.
+let _financingTypesCache = null
+async function loadFinancingTypes(force = false) {
+  if (_financingTypesCache && !force) return _financingTypesCache
+  try {
+    const r = await api.get('/financing-types')
+    _financingTypesCache = r.data.financing_types || []
+  } catch (_) { _financingTypesCache = [] }
+  return _financingTypesCache
+}
+// Show only the price input relevant to the chosen mode (pct / fixed / manual).
+window.onPriceModeChange = (prefix, which) => {
+  const mode = $(`${prefix}_${which}_mode`)?.value || 'percentage'
+  const pct = $(`${prefix}_${which}_pct_wrap`)
+  const amt = $(`${prefix}_${which}_amt_wrap`)
+  const man = $(`${prefix}_${which}_man_wrap`)
+  if (pct) pct.style.display = mode === 'percentage' ? '' : 'none'
+  if (amt) amt.style.display = mode === 'fixed' ? '' : 'none'
+  if (man) man.style.display = mode === 'manual' ? '' : 'none'
+}
+// Relabel the tenure inputs to match the chosen unit and toggle cycle-length.
+window.onTenureUnitChange = (prefix) => {
+  const unit = $(`${prefix}_tenure_unit`)?.value || 'monthly'
+  const word = unit === 'yearly' ? 'year' : unit === 'custom' ? 'cycle' : 'month'
+  const setTxt = (id, t) => { const el = $(id); if (el) el.textContent = t }
+  setTxt(`${prefix}_cyclecount_lbl`, `Total ${word}s`)
+  setTxt(`${prefix}_ratepc_lbl`, `Rate % per ${word}`)
+  setTxt(`${prefix}_amtpc_lbl`, `Amount per ${word} (KES)`)
+  const lenWrap = $(`${prefix}_cyclelen_wrap`)
+  if (lenWrap) lenWrap.style.display = unit === 'custom' ? '' : 'none'
+}
+// Populate the financing-type dropdown + apply mode/tenure visibility. Called
+// after the product form HTML is inserted into the DOM.
+async function initProductForm(prefix) {
+  onPriceModeChange(prefix, 'cash')
+  onPriceModeChange(prefix, 'credit')
+  onTenureUnitChange(prefix)
+  const sel = $(`${prefix}_fin_type`)
+  if (sel) {
+    const types = await loadFinancingTypes()
+    const want = sel.getAttribute('data-selected') || 'murabaha'
+    sel.innerHTML = types.map(t => `<option value="${esc(t.type_key)}" ${t.type_key === want ? 'selected' : ''}>${esc(t.label)}</option>`).join('')
+      || '<option value="">No financing types configured</option>'
+  }
+}
+window.initProductForm = initProductForm
 function productPayload(prefix) {
   const mode = $(prefix + '_mode').value
   return {
@@ -2466,25 +2619,38 @@ function productPayload(prefix) {
     unit: $(prefix + '_unit').value,
     buying_price: Number($(prefix + '_buy').value || 0),
     quantity: Number($(prefix + '_qty').value || 0),
-    cash_markup_pct: Number($(prefix + '_cm').value || 0),
-    credit_markup_pct: Number($(prefix + '_crm').value || 0),
+    cash_markup_pct: Number(($(prefix + '_cm') || {}).value || 0),
+    credit_markup_pct: Number(($(prefix + '_crm') || {}).value || 0),
     reorder_threshold: Number($(prefix + '_rt').value || 10),
     image: $(prefix + '_img').value || null,
     payment_option_mode: mode,
     cash_enabled: mode !== 'financing',
     financing_enabled: mode !== 'cash',
+    // Dynamic pricing modes (percentage | fixed | manual) + their inputs.
+    cash_price_mode: ($(prefix + '_cash_mode') || {}).value || 'percentage',
+    cash_markup_amount: Number(($(prefix + '_cash_amt') || {}).value || 0),
+    cash_price: Number(($(prefix + '_cash_price') || {}).value || 0),
+    credit_price_mode: ($(prefix + '_credit_mode') || {}).value || 'percentage',
+    credit_markup_amount: Number(($(prefix + '_credit_amt') || {}).value || 0),
+    credit_price: Number(($(prefix + '_credit_price') || {}).value || 0),
     financing_model: $(prefix + '_fin_model').value,
+    financing_type_key: ($(prefix + '_fin_type') || {}).value || 'murabaha',
     financing_interest_pct: Number($(prefix + '_int').value || 0),
     financing_frequency: $(prefix + '_freq').value,
     financing_term_min_months: Number($(prefix + '_tmin').value || 3),
     financing_term_max_months: Number($(prefix + '_tmax').value || 12),
+    // Flexible tenure parameters.
+    financing_tenure_unit: ($(prefix + '_tenure_unit') || {}).value || 'monthly',
+    financing_rate_per_cycle: Number(($(prefix + '_rate_pc') || {}).value || 0),
+    financing_amount_per_cycle: Number(($(prefix + '_amt_pc') || {}).value || 0),
+    financing_cycle_count: Number(($(prefix + '_cycle_count') || {}).value || 0),
+    financing_cycle_length_days: Number(($(prefix + '_cycle_len') || {}).value || 30),
     cash_deposit_pct: Number($(prefix + '_cash_dep').value || 100),
     financing_deposit_pct: Number($(prefix + '_fin_dep').value || 10),
     cash_terms_text: $(prefix + '_cash_terms').value || null,
     financing_terms_text: $(prefix + '_fin_terms').value || null,
     cash_terms_doc_url: $(prefix + '_cash_doc').value || null,
-    financing_terms_doc_url: $(prefix + '_fin_doc').value || null,
-    transunion_product_code: $(prefix + '_tu').value || null
+    financing_terms_doc_url: $(prefix + '_fin_doc').value || null
   }
 }
 function financeStatusBadge(s) {
@@ -2558,6 +2724,7 @@ window.pickImage = async (input, targetId, previewId) => {
 }
 window.addProductModal = () => {
   showModal(`<h3 class="font-bold mb-3">Add Feed</h3>${productForm('np')}<div class="flex gap-2 mt-4"><button onclick="doAddProduct()" class="btn flex-1 brand-bg text-white py-2 rounded-lg text-sm">Save</button><button onclick="closeModal()" class="btn px-4 bg-slate-100 rounded-lg text-sm">Cancel</button></div>`)
+  initProductForm('np')
 }
 window.doAddProduct = async () => {
   try {
@@ -2568,6 +2735,7 @@ window.doAddProduct = async () => {
 window.editProductModal = (id) => {
   const p = _products.find(x => x.id === id)
   showModal(`<h3 class="font-bold mb-3">Edit Feed</h3>${productForm('ep', p)}<div class="flex gap-2 mt-4"><button onclick="doEditProduct(${id})" class="btn flex-1 brand-bg text-white py-2 rounded-lg text-sm">Save Changes</button><button onclick="closeModal()" class="btn px-4 bg-slate-100 rounded-lg text-sm">Cancel</button></div>`)
+  initProductForm('ep')
 }
 window.doEditProduct = async (id) => {
   if (!confirmEdit('Save changes to this Feed record?')) return
@@ -4206,6 +4374,40 @@ async function viewSettings() {
           : `<p class="text-xs text-amber-600 mt-4"><i class="fas fa-lock mr-1"></i>You lack the "Manage Markup Percentage" permission — read-only.</p>`}
       </div>
 
+      <!-- ============ DEFAULT PRICING RULES ============ -->
+      <div class="card p-6">
+        <h3 class="font-bold text-slate-800 mb-1"><i class="fas fa-sliders text-teal-600 mr-2"></i>Default Markup &amp; Pricing Rules</h3>
+        <p class="text-xs text-slate-500 mb-4">Defaults applied to new inventory when a product does not override them. Each price can use a percentage markup, a fixed amount added to cost, or a manually entered selling price.</p>
+        <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+          <div><label class="field-label">Default cash price mode</label><select id="dp_cash_mode" ${_canManageMarkup ? '' : 'disabled'} class="w-full px-3 py-2 border rounded-lg">
+            ${['percentage','fixed','manual'].map(v => `<option value="${v}" ${(_mkCfg.default_cash_price_mode || 'percentage') === v ? 'selected' : ''}>${PRICE_MODE_LABELS[v]}</option>`).join('')}
+          </select></div>
+          <div><label class="field-label">Default cash markup (% or KES)</label><input id="dp_cash_amt" type="number" step="0.01" value="${Number(_mkCfg.default_cash_price_mode === 'fixed' ? (_mkCfg.default_cash_markup_amount || 0) : (_mkCfg.cash_markup_pct || 10))}" ${_canManageMarkup ? '' : 'disabled'} class="w-full px-3 py-2 border rounded-lg"></div>
+          <div><label class="field-label">Default financed price mode</label><select id="dp_credit_mode" ${_canManageMarkup ? '' : 'disabled'} class="w-full px-3 py-2 border rounded-lg">
+            ${['percentage','fixed','manual'].map(v => `<option value="${v}" ${(_mkCfg.default_credit_price_mode || 'percentage') === v ? 'selected' : ''}>${PRICE_MODE_LABELS[v]}</option>`).join('')}
+          </select></div>
+          <div><label class="field-label">Default financed markup (% or KES)</label><input id="dp_credit_amt" type="number" step="0.01" value="${Number(_mkCfg.default_credit_price_mode === 'fixed' ? (_mkCfg.default_credit_markup_amount || 0) : (_mkCfg.percentage_rate || 20))}" ${_canManageMarkup ? '' : 'disabled'} class="w-full px-3 py-2 border rounded-lg"></div>
+        </div>
+        ${_canManageMarkup
+          ? `<div class="flex gap-2 mt-5"><button onclick="saveDefaultPricing()" class="btn brand-bg text-white px-5 py-2 rounded-lg text-sm"><i class="fas fa-save mr-1"></i>Save Default Pricing Rules</button></div>`
+          : `<p class="text-xs text-amber-600 mt-4"><i class="fas fa-lock mr-1"></i>You lack the "Manage Markup Percentage" permission — read-only.</p>`}
+      </div>
+
+      <!-- ============ FINANCING TYPES ============ -->
+      <div class="card p-6" id="finTypesCard">
+        <h3 class="font-bold text-slate-800 mb-1"><i class="fas fa-layer-group text-teal-600 mr-2"></i>Financing Types</h3>
+        <p class="text-xs text-slate-500 mb-4">Create, edit or remove the financing options offered on this platform. Any active type becomes selectable during inventory listing and drives its own checkout agreement. (Feed is a Sharia-compliant Murabaha marketplace — interest-based types stay disabled.)</p>
+        <div id="finTypesList" class="space-y-2 mb-4"><div class="text-xs text-slate-400">Loading…</div></div>
+        <div id="finTypesAdd"></div>
+      </div>
+
+      <!-- ============ AGREEMENT TEMPLATES ============ -->
+      <div class="card p-6" id="agreementCard">
+        <h3 class="font-bold text-slate-800 mb-1"><i class="fas fa-file-signature text-teal-600 mr-2"></i>Agreement Templates</h3>
+        <p class="text-xs text-slate-500 mb-4">Configure the sale agreement generated for each payment path. Each template has a dynamic overview header, an auto-populated transaction details table, and a rich-text terms body. Default styling: justified, 12pt Calibri, 1.5 line spacing.</p>
+        <div id="agreementList" class="space-y-2"><div class="text-xs text-slate-400">Loading…</div></div>
+      </div>
+
       <!-- ============ PROCESSING FEE ============ -->
       <div class="card p-6">
         <h3 class="font-bold text-slate-800 mb-1"><i class="fas fa-file-invoice-dollar text-teal-600 mr-2"></i>Processing Fee</h3>
@@ -4250,6 +4452,175 @@ async function viewSettings() {
     </div>`
   renderMarkupBuilder()
   renderFeeBuilder()
+  renderFinancingTypes()
+  renderAgreementTemplates()
+}
+// ---- Default pricing rules ------------------------------------------------
+window.saveDefaultPricing = async () => {
+  const cashMode = ($('dp_cash_mode') || {}).value || 'percentage'
+  const creditMode = ($('dp_credit_mode') || {}).value || 'percentage'
+  const cashAmt = Number(($('dp_cash_amt') || {}).value || 0)
+  const creditAmt = Number(($('dp_credit_amt') || {}).value || 0)
+  _mkCfg.default_cash_price_mode = cashMode
+  _mkCfg.default_credit_price_mode = creditMode
+  if (cashMode === 'fixed') _mkCfg.default_cash_markup_amount = cashAmt
+  else { _mkCfg.cash_markup_pct = cashAmt }
+  if (creditMode === 'fixed') _mkCfg.default_credit_markup_amount = creditAmt
+  else { _mkCfg.percentage_rate = creditAmt; _mkCfg.mode = 'percentage' }
+  try { await api.put('/settings/financing-markup', _mkCfg); toast('Default pricing rules saved') }
+  catch (err) { toast(err.response?.data?.error || 'Failed to save', false) }
+}
+// ---- Financing types CRUD -------------------------------------------------
+let _finTypes = []
+let _finTypesCanManage = false
+async function renderFinancingTypes() {
+  const list = $('finTypesList'); if (!list) return
+  try {
+    const { data } = await api.get('/financing-types?all=1')
+    _finTypes = data.financing_types || []
+    _finTypesCanManage = !!data.can_manage
+  } catch (_) { _finTypes = []; }
+  list.innerHTML = _finTypes.length ? _finTypes.map(t => `
+    <div class="flex items-center justify-between border rounded-lg px-3 py-2 text-sm ${Number(t.active) ? '' : 'opacity-60'}">
+      <div>
+        <div class="font-medium text-slate-700">${esc(t.label)} <span class="text-[10px] text-slate-400">(${esc(t.type_key)})</span>
+          ${Number(t.is_system) ? '<span class="badge bg-slate-100 text-slate-500 ml-1">system</span>' : ''}
+          ${Number(t.active) ? '' : '<span class="badge bg-amber-100 text-amber-700 ml-1">inactive</span>'}</div>
+        <div class="text-[11px] text-slate-400">${esc(t.description || '')} · charge: ${esc(t.charge_mode)}</div>
+      </div>
+      ${_finTypesCanManage ? `<div class="flex gap-1">
+        <button onclick="editFinType(${t.id})" class="btn px-2 py-1 bg-slate-100 rounded text-xs"><i class="fas fa-pen"></i></button>
+        <button onclick="toggleFinType(${t.id}, ${Number(t.active) ? 0 : 1})" class="btn px-2 py-1 bg-slate-100 rounded text-xs">${Number(t.active) ? 'Deactivate' : 'Activate'}</button>
+        ${Number(t.is_system) ? '' : `<button onclick="deleteFinType(${t.id})" class="btn px-2 py-1 bg-red-50 text-red-600 rounded text-xs"><i class="fas fa-trash"></i></button>`}
+      </div>` : ''}
+    </div>`).join('') : '<div class="text-xs text-slate-400">No financing types configured.</div>'
+  const add = $('finTypesAdd')
+  if (add) add.innerHTML = _finTypesCanManage ? `
+    <button onclick="addFinType()" class="btn bg-teal-600 text-white px-4 py-2 rounded-lg text-sm"><i class="fas fa-plus mr-1"></i>Add financing type</button>` : ''
+  // Refresh the cache used by the inventory dropdown.
+  loadFinancingTypes(true)
+}
+function finTypeModal(t) {
+  const editing = !!t
+  t = t || { label: '', description: '', charge_mode: 'none', active: 1 }
+  showModal(`<h3 class="font-bold mb-3">${editing ? 'Edit' : 'Add'} financing type</h3>
+    <div class="space-y-3 text-sm">
+      <div><label class="field-label">Label</label><input id="ft_label" value="${esc(t.label)}" class="w-full px-3 py-2 border rounded-lg"></div>
+      ${editing ? '' : '<div class="text-[11px] text-slate-400">A machine key is derived from the label automatically.</div>'}
+      <div><label class="field-label">Description</label><textarea id="ft_desc" class="w-full px-3 py-2 border rounded-lg min-h-16">${esc(t.description || '')}</textarea></div>
+      <div><label class="field-label">Charge mode</label><select id="ft_charge" class="w-full px-3 py-2 border rounded-lg">
+        ${['percentage','fixed','none'].map(v => `<option value="${v}" ${t.charge_mode === v ? 'selected' : ''}>${v}</option>`).join('')}
+      </select></div>
+      <label class="flex items-center gap-2"><input type="checkbox" id="ft_active" ${Number(t.active) ? 'checked' : ''}> Active (selectable during listing)</label>
+    </div>
+    <div class="flex gap-2 mt-4">
+      <button onclick="saveFinType(${editing ? t.id : 'null'})" class="btn flex-1 brand-bg text-white py-2 rounded-lg text-sm">Save</button>
+      <button onclick="closeModal()" class="btn px-4 bg-slate-100 rounded-lg text-sm">Cancel</button>
+    </div>`)
+}
+window.addFinType = () => finTypeModal(null)
+window.editFinType = (id) => finTypeModal(_finTypes.find(x => x.id === id))
+window.saveFinType = async (id) => {
+  const payload = {
+    label: ($('ft_label') || {}).value || '',
+    description: ($('ft_desc') || {}).value || '',
+    charge_mode: ($('ft_charge') || {}).value || 'none',
+    active: !!($('ft_active') || {}).checked
+  }
+  try {
+    if (id) await api.put('/financing-types/' + id, payload)
+    else await api.post('/financing-types', payload)
+    closeModal(); toast('Financing type saved'); renderFinancingTypes(); renderAgreementTemplates()
+  } catch (err) { toast(err.response?.data?.error || 'Failed to save', false) }
+}
+window.toggleFinType = async (id, active) => {
+  try { await api.put('/financing-types/' + id, { active: !!active }); renderFinancingTypes() }
+  catch (err) { toast(err.response?.data?.error || 'Failed', false) }
+}
+window.deleteFinType = async (id) => {
+  if (!confirm('Remove this financing type? Products using it must be reassigned first.')) return
+  try { await api.delete('/financing-types/' + id); toast('Removed'); renderFinancingTypes(); renderAgreementTemplates() }
+  catch (err) { toast(err.response?.data?.error || 'Failed', false) }
+}
+// ---- Agreement templates (WYSIWYG) ----------------------------------------
+let _agreements = []
+let _agreementsCanManage = false
+async function renderAgreementTemplates() {
+  const list = $('agreementList'); if (!list) return
+  try {
+    const { data } = await api.get('/agreement-templates')
+    _agreements = data.agreement_templates || []
+    _agreementsCanManage = !!data.can_manage
+  } catch (_) { _agreements = [] }
+  list.innerHTML = _agreements.length ? _agreements.map(t => `
+    <div class="flex items-center justify-between border rounded-lg px-3 py-2 text-sm">
+      <div>
+        <div class="font-medium text-slate-700">${esc(t.title)}</div>
+        <div class="text-[11px] text-slate-400">path: ${esc(t.path_key)}</div>
+      </div>
+      ${_agreementsCanManage ? `<button onclick="editAgreement('${esc(t.path_key)}')" class="btn px-3 py-1 bg-slate-100 rounded text-xs"><i class="fas fa-pen mr-1"></i>Edit</button>` : ''}
+    </div>`).join('') : '<div class="text-xs text-slate-400">No agreement templates found.</div>'
+}
+window.editAgreement = (pathKey) => {
+  const t = _agreements.find(x => x.path_key === pathKey)
+  if (!t) return
+  const st = t.style || { font_family: 'Calibri', font_size_pt: 12, line_height: 1.5, text_align: 'justify' }
+  showModal(`<h3 class="font-bold mb-1">Edit agreement — ${esc(t.path_key)}</h3>
+    <p class="text-[11px] text-slate-400 mb-3">The transaction details table is auto-populated at generation time; edit the header, terms body and default styling here.</p>
+    <div class="space-y-3 text-sm max-h-[65vh] overflow-auto pr-1">
+      <div><label class="field-label">Title</label><input id="ag_title" value="${esc(t.title)}" class="w-full px-3 py-2 border rounded-lg"></div>
+      <div>
+        <label class="field-label">Overview header (rich text)</label>
+        ${rteToolbar('ag_overview')}
+        <div id="ag_overview" contenteditable="true" class="border rounded-b-lg px-3 py-2 min-h-20 bg-white focus:outline-none">${t.overview_html || ''}</div>
+      </div>
+      <div>
+        <label class="field-label">Terms &amp; body (rich text)</label>
+        ${rteToolbar('ag_body')}
+        <div id="ag_body" contenteditable="true" class="border rounded-b-lg px-3 py-2 min-h-32 bg-white focus:outline-none" style="text-align:${st.text_align};">${t.body_html || ''}</div>
+      </div>
+      <div class="grid grid-cols-2 gap-3">
+        <div><label class="field-label">Font family</label><input id="ag_font" value="${esc(st.font_family)}" class="w-full px-3 py-2 border rounded-lg"></div>
+        <div><label class="field-label">Font size (pt)</label><input id="ag_size" type="number" value="${Number(st.font_size_pt)}" class="w-full px-3 py-2 border rounded-lg"></div>
+        <div><label class="field-label">Line spacing</label><input id="ag_lh" type="number" step="0.1" value="${Number(st.line_height)}" class="w-full px-3 py-2 border rounded-lg"></div>
+        <div><label class="field-label">Text align</label><select id="ag_align" class="w-full px-3 py-2 border rounded-lg">
+          ${['justify','left','center','right'].map(v => `<option value="${v}" ${st.text_align === v ? 'selected' : ''}>${v}</option>`).join('')}
+        </select></div>
+      </div>
+    </div>
+    <div class="flex gap-2 mt-4">
+      <button onclick="saveAgreement('${esc(pathKey)}')" class="btn flex-1 brand-bg text-white py-2 rounded-lg text-sm">Save Template</button>
+      <button onclick="closeModal()" class="btn px-4 bg-slate-100 rounded-lg text-sm">Cancel</button>
+    </div>`)
+}
+// Minimal WYSIWYG toolbar operating on a contenteditable region via execCommand.
+function rteToolbar(targetId) {
+  const btn = (cmd, icon, arg) => `<button type="button" onmousedown="event.preventDefault()" onclick="rteCmd('${targetId}','${cmd}'${arg ? `,'${arg}'` : ''})" class="btn px-2 py-1 text-xs border-r hover:bg-slate-100"><i class="fas fa-${icon}"></i></button>`
+  return `<div class="flex flex-wrap border border-b-0 rounded-t-lg bg-slate-50 text-slate-600">
+    ${btn('bold','bold')}${btn('italic','italic')}${btn('underline','underline')}
+    ${btn('insertUnorderedList','list-ul')}${btn('insertOrderedList','list-ol')}
+    ${btn('justifyLeft','align-left')}${btn('justifyCenter','align-center')}${btn('justifyFull','align-justify')}
+    ${btn('formatBlock','heading','h3')}
+  </div>`
+}
+window.rteCmd = (targetId, cmd, arg) => {
+  const el = $(targetId); if (el) el.focus()
+  try { document.execCommand(cmd, false, arg || null) } catch (_) {}
+}
+window.saveAgreement = async (pathKey) => {
+  const payload = {
+    title: ($('ag_title') || {}).value || '',
+    overview_html: ($('ag_overview') || {}).innerHTML || '',
+    body_html: ($('ag_body') || {}).innerHTML || '',
+    style: {
+      font_family: ($('ag_font') || {}).value || 'Calibri',
+      font_size_pt: Number(($('ag_size') || {}).value || 12),
+      line_height: Number(($('ag_lh') || {}).value || 1.5),
+      text_align: ($('ag_align') || {}).value || 'justify'
+    }
+  }
+  try { await api.put('/agreement-templates/' + encodeURIComponent(pathKey), payload); closeModal(); toast('Agreement template saved'); renderAgreementTemplates() }
+  catch (err) { toast(err.response?.data?.error || 'Failed to save', false) }
 }
 window.saveWithdrawalCharge = async () => {
   const payload = {
