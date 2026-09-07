@@ -3502,6 +3502,7 @@ async function viewCustomers() {
   // available to anyone who can add farmers (agents included).
   const canAddCustomer = canDo('add_customer')
   const canOnboardFarmer = canDo('add_farmer')
+  const canReassign = canDo('manage_customer_reassignment')
   const bar = []
   if (canAddCustomer) bar.push(`<button onclick="addCustomerModal()" class="btn brand-bg text-white px-4 py-2 rounded-lg text-sm"><i class="fas fa-user-plus mr-1"></i>Add Customer</button>`)
   if (canOnboardFarmer) bar.push(`<button onclick="viewOnboard()" class="btn bg-slate-100 text-slate-700 px-4 py-2 rounded-lg text-sm${canAddCustomer ? ' ml-2' : ''}"><i class="fas fa-leaf mr-1"></i>Onboard a Farmer</button>`)
@@ -3526,6 +3527,7 @@ async function viewCustomers() {
       <td class="px-4 py-3 whitespace-nowrap text-right">
         <button onclick="custDetail(${c.id})" class="text-slate-500 hover:underline text-xs mr-2">View</button>
         ${canEditFarmers ? `<button onclick="editCustomerModal(${c.id})" class="text-teal-600 hover:underline text-xs mr-2">Edit</button>` : ''}
+        ${canReassign ? `<button onclick="reassignCustomerModal(${c.id},'${esc(c.full_name)}')" class="text-indigo-600 hover:underline text-xs mr-2"><i class="fas fa-people-arrows mr-1"></i>Reassign</button>` : ''}
         ${c.kyc_status !== 'verified' ? `<button onclick="completeRegistration(${c.id})" class="text-blue-600 hover:underline text-xs mr-2"><i class="fas fa-id-card mr-1"></i>Complete Registration</button>` : ''}
         ${isAdmin ? `${(c.status || 'active') === 'active' ? `<button onclick="setCustomerStatus(${c.id},'suspended','${esc(c.full_name)}')" class="text-amber-600 hover:underline text-xs mr-2">Suspend</button>` : `<button onclick="setCustomerStatus(${c.id},'active','${esc(c.full_name)}')" class="text-emerald-600 hover:underline text-xs mr-2">Activate</button>`}<button onclick="deleteCustomer(${c.id},'${esc(c.full_name)}')" class="text-red-600 hover:underline text-xs">Delete</button>` : ''}
       </td></tr>`).join('') || '<tr><td colspan="8" class="text-center py-8 text-slate-400">No matching customers</td></tr>'
@@ -3573,6 +3575,7 @@ window.custDetail = async (id) => {
     <div class="action-bar mt-4">
       ${c.kyc_status !== 'verified' ? `<button onclick="completeRegistration(${c.id})" class="btn brand-bg text-white px-4 py-2 rounded-lg text-sm"><i class="fas fa-shield-halved mr-1"></i>Complete Registration</button>` : ''}
       ${canEditFarmers ? `<button onclick="closeModal();editCustomerModal(${c.id})" class="btn bg-slate-100 px-4 py-2 rounded-lg text-sm">Edit Profile</button>` : ''}
+      ${canDo('manage_customer_reassignment') ? `<button onclick="closeModal();reassignCustomerModal(${c.id},'${esc(c.full_name)}')" class="btn bg-indigo-100 text-indigo-700 px-4 py-2 rounded-lg text-sm"><i class="fas fa-people-arrows mr-1"></i>Reassign Agent</button>` : ''}
       ${isAdmin ? `${(c.status || 'active') === 'active' ? `<button onclick="closeModal();setCustomerStatus(${c.id},'suspended','${esc(c.full_name)}')" class="btn bg-amber-100 text-amber-800 px-4 py-2 rounded-lg text-sm">Suspend Farmer</button>` : `<button onclick="closeModal();setCustomerStatus(${c.id},'active','${esc(c.full_name)}')" class="btn bg-emerald-100 text-emerald-800 px-4 py-2 rounded-lg text-sm">Activate Farmer</button>`}<button onclick="closeModal();deleteCustomer(${c.id},'${esc(c.full_name)}')" class="btn bg-red-100 text-red-700 px-4 py-2 rounded-lg text-sm">Delete Farmer</button>` : ''}
       <button onclick="closeModal()" class="btn bg-slate-100 px-4 py-2 rounded-lg text-sm">Close</button>
     </div>`)
@@ -3619,6 +3622,48 @@ window.deleteCustomer = async (id, name) => {
   if (!confirmDelete(`Delete farmer profile for "${name}"? This also removes the linked farmer account.`)) return
   try { await api.delete('/customers/' + id); toast('Farmer deleted'); viewCustomers() }
   catch (err) { toast(err.response?.data?.error || 'Failed', false) }
+}
+// ---------------------------------------------------------------------------
+// REASSIGN CUSTOMER BETWEEN AGENTS (RBAC: manage_customer_reassignment)
+// Transfers a farmer from their current agent to a target agent. The new agent
+// immediately gains view + transact access; the former agent is fully revoked.
+// ---------------------------------------------------------------------------
+window.reassignCustomerModal = async (id, name) => {
+  let agents = [], history = [], cust = null
+  try { const { data } = await api.get('/customers/' + id); cust = data.customer || {} } catch (_) {}
+  try { const { data } = await api.get('/agents'); agents = data.agents || [] } catch (_) { toast('Could not load agents', false) }
+  try { const { data } = await api.get(`/customers/${id}/reassignments`); history = data.reassignments || [] } catch (_) {}
+  const currentAgentId = cust && cust.agent_id != null ? String(cust.agent_id) : ''
+  const currentAgent = agents.find(a => String(a.id) === currentAgentId)
+  const options = agents
+    .filter(a => String(a.status || 'active') !== 'suspended')
+    .map(a => `<option value="${a.id}" ${String(a.id) === currentAgentId ? 'disabled' : ''}>${esc(a.full_name)}${a.region ? ' · ' + esc(a.region) : ''}${String(a.id) === currentAgentId ? ' (current)' : ''}</option>`).join('')
+  showModal(`<h3 class="font-bold mb-1"><i class="fas fa-people-arrows text-indigo-600 mr-1"></i>Reassign ${esc(name)}</h3>
+    <p class="text-xs text-slate-500 mb-3">Transfer this farmer to another agent. The new agent immediately gains access to the profile, history and active accounts; the current agent's access is revoked.</p>
+    <div class="space-y-3 text-sm">
+      <div class="bg-slate-50 border rounded-lg px-3 py-2 text-xs">Current agent: <b>${esc(currentAgent ? currentAgent.full_name : (currentAgentId || 'Unassigned'))}</b></div>
+      <div><label class="field-label">Reassign to agent</label>
+        <select id="ra_agent" class="w-full px-3 py-2 border rounded-lg"><option value="">Select a target agent…</option>${options}</select></div>
+      <div><label class="field-label">Reason (optional, logged)</label>
+        <input id="ra_reason" class="w-full px-3 py-2 border rounded-lg" placeholder="e.g. territory change, agent offboarding"></div>
+      ${history.length ? `<div class="border-t pt-2">
+        <div class="text-[11px] font-semibold text-slate-500 uppercase mb-1">Reassignment history</div>
+        <div class="space-y-1 max-h-32 overflow-auto">${history.map(h => `<div class="text-[11px] text-slate-500">${new Date(h.created_at).toLocaleString()} — ${esc(h.from_agent_name || h.from_agent_id || '—')} → <b>${esc(h.to_agent_name || h.to_agent_id)}</b> by ${esc(h.performed_by_name || h.performed_by)}${h.reason ? ' · ' + esc(h.reason) : ''}</div>`).join('')}</div>
+      </div>` : ''}
+    </div>
+    <div class="flex gap-2 mt-4">
+      <button onclick="doReassignCustomer(${id})" class="btn flex-1 bg-indigo-600 text-white py-2 rounded-lg text-sm">Confirm Reassignment</button>
+      <button onclick="closeModal()" class="btn px-4 bg-slate-100 rounded-lg text-sm">Cancel</button>
+    </div>`)
+}
+window.doReassignCustomer = async (id) => {
+  const toAgent = ($('ra_agent') || {}).value || ''
+  if (!toAgent) return toast('Please select a target agent', false)
+  if (!confirmEdit('Confirm reassignment? The current agent will immediately lose access to this farmer.')) return
+  try {
+    await api.post(`/customers/${id}/reassign`, { to_agent_id: toAgent, reason: ($('ra_reason') || {}).value || '' })
+    closeModal(); toast('Customer reassigned'); viewCustomers()
+  } catch (err) { toast(err.response?.data?.error || 'Failed to reassign', false) }
 }
 window.stopLive = () => {}
 window.completeRegistration = async (id, returnToShop) => {

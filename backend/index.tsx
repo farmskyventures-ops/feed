@@ -1676,8 +1676,14 @@ app.get('/api/customers', requireAuth, async (c) => {
 })
 app.get('/api/customers/:id', requireAuth, async (c) => {
   const user = c.get('user') as SessionUser
-  const cust = await c.env.DB.prepare(`SELECT * FROM customers WHERE id=?`).bind(c.req.param('id')).first()
+  const cust = await c.env.DB.prepare(`SELECT * FROM customers WHERE id=?`).bind(c.req.param('id')).first<any>()
   if (!cust) return c.json({ error: 'Not found' }, 404)
+  // STRICT PER-ACCOUNT SCOPING (defence-in-depth beyond RLS, which a superuser
+  // DB connection would bypass): an agent may only view a farmer they currently
+  // own (agent_id / onboarded_by); a customer may view only their own record.
+  // Staff/admins and authorized reassigners may view any. This makes agent
+  // access flip correctly the instant a customer is reassigned.
+  if (!isCustomerAccessible(user, cust)) return c.json({ error: 'Not found' }, 404)
   const tu = await c.env.DB.prepare(`SELECT * FROM transunion_checks WHERE customer_id=? ORDER BY id DESC LIMIT 1`).bind(c.req.param('id')).first()
   const idv = await c.env.DB.prepare(`SELECT * FROM id_verifications WHERE customer_id=? ORDER BY id DESC LIMIT 1`).bind(c.req.param('id')).first()
   const showFinancial = hasVisibility(user, 'view_financial_data')
@@ -1805,6 +1811,80 @@ app.put('/api/customers/:id/status', requireAuth, requireRole('admin', 'super_ad
   }
   await audit(c, c.get('user').id, status === 'active' ? 'activate' : 'deactivate', 'customer', String(id))
   return c.json({ ok: true })
+})
+// ============================================================================
+// REASSIGN CUSTOMER/USER BETWEEN AGENTS
+//
+// Super-Admins and any user granted `manage_customer_reassignment` may transfer
+// a customer from their current agent (Agent A) to a target agent (Agent B).
+//
+// On transfer we re-point EVERY ownership reference so access flips atomically
+// and completely:
+//   • customers.agent_id       — list scope + RLS
+//   • customers.onboarded_by    — RLS (also grants access)
+//   • murabaha_contracts.agent_id / created_by — history + transactions + RLS
+// Result: Agent B immediately sees the profile/history/active accounts and may
+// transact for the customer; Agent A is immediately and fully revoked.
+//
+// Every transfer is written to customer_reassignments (timestamp, performer,
+// former agent, new agent, customer) AND the generic audit_logs.
+// ============================================================================
+app.post('/api/customers/:id/reassign', requireAuth, async (c) => {
+  const user = c.get('user') as SessionUser
+  if (!canReassignCustomers(user)) return c.json({ error: 'Forbidden — you are not authorized to reassign customers.' }, 403)
+  const id = c.req.param('id')
+  const { to_agent_id, reason } = await c.req.json()
+  if (!to_agent_id) return c.json({ error: 'A target agent is required.' }, 400)
+
+  const cust = await withAdminContext(c, async () => await c.env.DB.prepare(
+    `SELECT id, full_name, agent_id, onboarded_by FROM customers WHERE id=?`
+  ).bind(id).first<any>())
+  if (!cust) return c.json({ error: 'Customer not found' }, 404)
+
+  // Target must be a real, active agent.
+  const target = await c.env.DB.prepare(`SELECT id, full_name, role, status FROM users WHERE id=? AND role='agent'`).bind(String(to_agent_id)).first<any>()
+  if (!target) return c.json({ error: 'Target agent not found or is not an agent.' }, 404)
+  if (String(target.status) === 'suspended') return c.json({ error: 'Cannot reassign to a suspended agent.' }, 400)
+
+  const fromAgentId = cust.agent_id != null ? String(cust.agent_id) : null
+  const toAgentId = String(target.id)
+  if (fromAgentId === toAgentId) return c.json({ error: 'Customer is already assigned to this agent.' }, 400)
+
+  // Re-point every ownership reference under admin context (RLS bypass) so the
+  // transfer is atomic regardless of who the caller currently "owns".
+  await withAdminContext(c, async () => {
+    await c.env.DB.prepare(`UPDATE customers SET agent_id=?, onboarded_by=? WHERE id=?`).bind(toAgentId, toAgentId, id).run()
+    // Move the customer's contract history + active accounts so Agent B can
+    // view + service them and Agent A can no longer reach them.
+    await c.env.DB.prepare(`UPDATE murabaha_contracts SET agent_id=? WHERE customer_id=?`).bind(toAgentId, id).run()
+    await c.env.DB.prepare(`UPDATE murabaha_contracts SET created_by=? WHERE customer_id=? AND created_by=?`).bind(toAgentId, id, fromAgentId).run()
+  })
+
+  // Compliance log (dedicated table) + generic audit trail.
+  try {
+    await c.env.DB.prepare(
+      `INSERT INTO customer_reassignments (customer_id, from_agent_id, to_agent_id, performed_by, reason) VALUES (?,?,?,?,?)`
+    ).bind(id, fromAgentId, toAgentId, String(user.id), reason ? String(reason).slice(0, 500) : null).run()
+  } catch (_) {}
+  await audit(c, user.id, 'reassign', 'customer', `customer #${id} (${cust.full_name || ''}) from agent ${fromAgentId || '—'} to agent ${toAgentId}`)
+
+  return c.json({ ok: true, customer_id: Number(id), from_agent_id: fromAgentId, to_agent_id: toAgentId })
+})
+// List the reassignment history for a customer (audit/compliance view). Visible
+// to authorized reassigners only.
+app.get('/api/customers/:id/reassignments', requireAuth, async (c) => {
+  const user = c.get('user') as SessionUser
+  if (!canReassignCustomers(user)) return c.json({ error: 'Forbidden' }, 403)
+  const id = c.req.param('id')
+  const { results } = await withAdminContext(c, async () => await c.env.DB.prepare(
+    `SELECT r.*, uf.full_name AS from_agent_name, ut.full_name AS to_agent_name, up.full_name AS performed_by_name
+       FROM customer_reassignments r
+       LEFT JOIN users uf ON CAST(uf.id AS TEXT)=r.from_agent_id
+       LEFT JOIN users ut ON CAST(ut.id AS TEXT)=r.to_agent_id
+       LEFT JOIN users up ON CAST(up.id AS TEXT)=r.performed_by
+      WHERE r.customer_id=? ORDER BY r.created_at DESC, r.id DESC`
+  ).bind(id).all())
+  return c.json({ reassignments: results })
 })
 // Admin can delete farmer profiles (and the linked customer-role user)
 app.delete('/api/customers/:id', requireAuth, requireRole('admin', 'super_admin'), async (c) => {
@@ -4279,6 +4359,27 @@ app.put('/api/settings/markup', requireAuth, requirePermission('manage_markup_pc
 function canManageFinanceConfig(user: SessionUser) {
   return user.role === 'admin' || user.role === 'super_admin' ||
     hasPermission(user, 'can_manage_finance_settings') || hasPermission(user, 'manage_markup_pct')
+}
+// Super-Admins and any user granted the delegated permission may reassign a
+// customer/user from one agent to another.
+function canReassignCustomers(user: SessionUser) {
+  return user.role === 'admin' || user.role === 'super_admin' ||
+    hasPermission(user, 'manage_customer_reassignment')
+}
+// Whether `user` may access an individual customer record. Data + functionality
+// are strictly scoped to the account: an agent may only reach a farmer they
+// currently own; a customer only their own record. Staff / admins / authorized
+// finance & reassignment users may reach any. Access flips atomically when a
+// customer's agent_id/onboarded_by are re-pointed by a reassignment.
+function isCustomerAccessible(user: SessionUser, cust: any): boolean {
+  if (!cust) return false
+  const uid = String(user.id)
+  if (['admin', 'super_admin', 'operations_finance', 'support'].includes(user.role)) return true
+  if (canReassignCustomers(user)) return true
+  if (hasVisibility(user, 'view_farmer_profile_data') && (user.role !== 'agent' && user.role !== 'customer')) return true
+  if (user.role === 'agent') return String(cust.agent_id) === uid || String(cust.onboarded_by) === uid
+  if (user.role === 'customer') return String(cust.user_id) === uid
+  return false
 }
 function slugifyKey(s: string): string {
   return String(s || '').toLowerCase().trim().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '').slice(0, 60)
