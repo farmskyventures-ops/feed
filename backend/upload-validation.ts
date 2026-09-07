@@ -100,8 +100,10 @@ export function validateImageDataUrl(value: unknown, opts: { allowEmpty?: boolea
 }
 
 // Allowed document MIME types for financing / cash agreement uploads: the
-// allowed raster images PLUS PDF. Docs may also be an https:// link.
-const ALLOWED_DOC_MIME = [...ALLOWED_IMAGE_MIME, 'application/pdf']
+// allowed raster images PLUS PDF and Word (.doc / .docx). Docs may also be an
+// https:// link.
+const WORD_DOC_MIME = ['application/msword', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document']
+const ALLOWED_DOC_MIME = [...ALLOWED_IMAGE_MIME, 'application/pdf', ...WORD_DOC_MIME]
 // Max decoded document size (8 MB).
 const MAX_DOC_BYTES = 8 * 1024 * 1024
 const MAX_DOC_URL_CHARS = Math.ceil((MAX_DOC_BYTES * 4) / 3) + 128
@@ -127,7 +129,7 @@ export function validateDocDataUrl(value: unknown, opts: { allowEmpty?: boolean 
 
   const mime = m[1].toLowerCase()
   if (!ALLOWED_DOC_MIME.includes(mime)) {
-    return { ok: false, error: 'Agreement document must be a PDF or image (PNG, JPEG, WEBP, GIF) under 8 MB.' }
+    return { ok: false, error: 'Agreement document must be a PDF, Word (.doc/.docx) or image (PNG, JPEG, WEBP, GIF) under 8 MB.' }
   }
   if (v.length > MAX_DOC_URL_CHARS) {
     return { ok: false, error: 'Document is too large (max 8 MB).' }
@@ -138,8 +140,14 @@ export function validateDocDataUrl(value: unknown, opts: { allowEmpty?: boolean 
   const bytes = decodePrefix(b64, 12)
   if (bytes.length < 4) return { ok: false, error: 'That file is not a valid document.' }
   const isPdf = bytes[0] === 0x25 && bytes[1] === 0x50 && bytes[2] === 0x44 && bytes[3] === 0x46 // %PDF
+  // .docx (OOXML) is a ZIP container → "PK\x03\x04"; legacy .doc is an OLE2
+  // compound file → D0 CF 11 E0.
+  const isZip = bytes[0] === 0x50 && bytes[1] === 0x4b && bytes[2] === 0x03 && bytes[3] === 0x04
+  const isOle2 = bytes[0] === 0xd0 && bytes[1] === 0xcf && bytes[2] === 0x11 && bytes[3] === 0xe0
   if (mime === 'application/pdf') {
     if (!isPdf) return { ok: false, error: 'That file is not a valid PDF.' }
+  } else if (WORD_DOC_MIME.includes(mime)) {
+    if (!isZip && !isOle2) return { ok: false, error: 'That file is not a valid Word document.' }
   } else if (!magicMatches(mime, bytes)) {
     return { ok: false, error: 'That file is not a valid image.' }
   }

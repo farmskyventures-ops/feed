@@ -1966,11 +1966,16 @@ async function loadPayTerms(id, isCash) {
     : 'This is a Sharia-compliant Murabaha transaction. By proceeding you agree to the disclosed murabaha price, deposit and installment repayment schedule until the balance is fully settled.'
   try {
     const { data } = await api.get('/murabaha/' + id + '/agreement')
-    // Strip tags for the compact preview; the full styled doc is one tap away.
-    const plain = String(data.body_html || data.overview_html || '').replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim()
     const lbl = $('payTermsBlock')?.querySelector('.uppercase')
     if (lbl && data.title) lbl.textContent = data.title
-    el.textContent = plain || fallback
+    if (data.body_source === 'upload' && data.terms_document_url) {
+      // An uploaded PDF/Word document backs this agreement.
+      el.textContent = 'A signed agreement document is attached. Tap "View full agreement" to read, accept, or download it for offline signing.'
+    } else {
+      // Strip tags for the compact preview; the full styled doc is one tap away.
+      const plain = String(data.body_html || data.overview_html || '').replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim()
+      el.textContent = plain || fallback
+    }
   } catch (_) { el.textContent = fallback }
 }
 
@@ -2372,6 +2377,31 @@ function agreementDetailsTable(details) {
   </table>`
 }
 // Assemble the full agreement HTML (three sections: overview, details, body).
+// Render the "Terms & Conditions" body — either the uploaded PDF/Word/image
+// document (source='upload') or the typed rich-text (source='editor').
+function agreementTermsBody(ag) {
+  const url = ag.terms_document_url
+  const isUpload = (ag.body_source === 'upload') || (!!url && !ag.body_html)
+  if (isUpload && url) {
+    const isPdf = /^data:application\/pdf/i.test(url) || /\.pdf($|\?)/i.test(url)
+    const isImg = /^data:image\//i.test(url) || /\.(png|jpe?g|gif|webp)($|\?)/i.test(url)
+    if (isPdf) {
+      return `<embed src="${url}" type="application/pdf" style="width:100%; height:60vh; border:1px solid #cbd5e1; border-radius:8px;"/>
+        <p style="margin-top:8px;"><a href="${url}" download="agreement.pdf">Download the agreement document (PDF)</a> to review, print and sign offline.</p>`
+    }
+    if (isImg) {
+      return `<img src="${url}" style="max-width:100%; border:1px solid #cbd5e1; border-radius:8px;"/>
+        <p style="margin-top:8px;"><a href="${url}" download="agreement">Download the agreement document</a> to review, print and sign offline.</p>`
+    }
+    // Word / other: browsers can't render inline — offer download for offline
+    // acceptance and signing.
+    return `<div style="border:1px dashed #94a3b8; border-radius:8px; padding:16px; text-align:center;">
+      <p><i class="fas fa-file-word" style="color:#2563eb;"></i> This agreement is provided as an uploaded document.</p>
+      <p style="margin-top:6px;"><a href="${url}" download="agreement.docx">Download the agreement document</a> to review, print and sign offline.</p>
+    </div>`
+  }
+  return `<section>${ag.body_html || ''}</section>`
+}
 function agreementDocumentHtml(ag) {
   const css = agreementStyleCss(ag.style)
   return `<div style="${css}">
@@ -2381,7 +2411,7 @@ function agreementDocumentHtml(ag) {
     <h2 style="font-size:13pt; margin:12px 0 4px;">Transaction Details</h2>
     ${agreementDetailsTable(ag.details)}
     <h2 style="font-size:13pt; margin:12px 0 4px;">Terms &amp; Conditions</h2>
-    <section>${ag.body_html || ''}</section>
+    ${agreementTermsBody(ag)}
   </div>`
 }
 window.viewDoc = async (id) => {
@@ -2497,15 +2527,7 @@ function productForm(prefix, p = {}) {
         <option value="financing" ${paymentMode === 'financing' ? 'selected' : ''}>Financing only</option>
       </select></div>
       <div><label class="field-label">Cash deposit %</label><input id="${prefix}_cash_dep" type="number" value="${Number(p.cash_deposit_pct ?? 100)}" placeholder="Cash deposit % (0/10/100)" class="px-3 py-2 border rounded-lg"></div>
-      <div style="grid-column:1 / -1"><label class="field-label">Cash terms summary</label><textarea id="${prefix}_cash_terms" placeholder="Cash terms summary" class="px-3 py-2 border rounded-lg min-h-24">${esc(p.cash_terms_text || '')}</textarea></div>
-      <div style="grid-column:1 / -1" class="border rounded-xl p-3 bg-slate-50">
-        <div class="font-medium text-slate-700 mb-2">Cash agreement</div>
-        <input id="${prefix}_cash_doc" value="${esc(p.cash_terms_doc_url || '')}" placeholder="Cash agreement URL / uploaded file data" class="w-full px-3 py-2 border rounded-lg text-xs">
-        <div class="flex items-center justify-between gap-2 mt-2">
-          <label class="btn bg-white px-3 py-2 rounded-lg text-xs cursor-pointer border"><i class="fas fa-file-upload mr-1"></i>Upload<input type="file" accept="image/*,application/pdf" class="hidden" onchange="pickFileDataUrl(this,'${prefix}_cash_doc','${prefix}_cash_doc_name')"></label>
-          <span id="${prefix}_cash_doc_name" class="text-[11px] text-slate-400 truncate">${p.cash_terms_doc_url ? 'existing document attached' : 'no file selected'}</span>
-        </div>
-      </div>
+      ${agreementSourceBlock(prefix, 'cash', 'Cash agreement', p, '')}
       <div style="grid-column:1 / -1" class="mt-2 mb-1 flex items-center gap-2 text-sm font-semibold text-slate-700 border-t pt-3">
         <i class="fas fa-hand-holding-dollar text-teal-600"></i>Financial components ${canFin ? '' : '<span class="badge bg-amber-100 text-amber-700 ml-1">finance-authorized only</span>'}
       </div>
@@ -2547,16 +2569,60 @@ function productForm(prefix, p = {}) {
       </select></div>
       <div><label class="field-label">Minimum term (months)</label><input id="${prefix}_tmin" ${finDis} type="number" value="${Number(p.financing_term_min_months || 3)}" placeholder="Minimum term (months)" class="px-3 py-2 border rounded-lg ${finDis ? 'bg-slate-100 text-slate-400' : ''}"></div>
       <div><label class="field-label">Maximum term (months)</label><input id="${prefix}_tmax" ${finDis} type="number" value="${Number(p.financing_term_max_months || 12)}" placeholder="Maximum term (months)" class="px-3 py-2 border rounded-lg ${finDis ? 'bg-slate-100 text-slate-400' : ''}"></div>
-      <div style="grid-column:1 / -1"><label class="field-label">Financing terms summary</label><textarea id="${prefix}_fin_terms" ${finDis} placeholder="Financing terms summary" class="px-3 py-2 border rounded-lg min-h-24 ${finDis ? 'bg-slate-100 text-slate-400' : ''}">${esc(p.financing_terms_text || '')}</textarea></div>
-      <div style="grid-column:1 / -1" class="border rounded-xl p-3 bg-slate-50">
-        <div class="font-medium text-slate-700 mb-2">Financing agreement</div>
-        <input id="${prefix}_fin_doc" ${finDis} value="${esc(p.financing_terms_doc_url || '')}" placeholder="Financing agreement URL / uploaded file data" class="w-full px-3 py-2 border rounded-lg text-xs ${finDis ? 'bg-slate-100 text-slate-400' : ''}">
+      ${agreementSourceBlock(prefix, 'fin', 'Financing agreement', p, finDis)}
+    </div>`
+}
+// Accept PDF + Word (.doc/.docx) + images for uploaded agreement documents.
+const AGREEMENT_UPLOAD_ACCEPT = 'application/pdf,application/msword,application/vnd.openxmlformats-officedocument.wordprocessingml.document,image/*'
+// ---- Agreement source block (Document Upload  |  Built-in Text Editor) -----
+// A single dropdown lets the person listing inventory CHOOSE how each payment
+// path's agreement is supplied:
+//   • upload — a PDF/Word document, stored on the product and rendered at
+//     checkout for digital acceptance or offline download & signing.
+//   • editor — rich-text typed directly with formatting tools, saved and shown
+//     at checkout for digital acceptance or offline download & signing.
+// `key` is 'cash' or 'fin' (matching the existing _cash_*/_fin_* field IDs);
+// `dis` is '' or 'disabled' (finance-authorized gating on the financing block).
+function agreementSourceBlock(prefix, key, title, p, dis) {
+  const src = key === 'cash'
+    ? (p.cash_agreement_source || (p.cash_terms_doc_url ? 'upload' : 'editor'))
+    : (p.financing_agreement_source || (p.financing_terms_doc_url ? 'upload' : 'editor'))
+  const termsText = key === 'cash' ? (p.cash_terms_text || '') : (p.financing_terms_text || '')
+  const docUrl = key === 'cash' ? (p.cash_terms_doc_url || '') : (p.financing_terms_doc_url || '')
+  const roCls = dis ? 'bg-slate-100 text-slate-400' : ''
+  return `
+    <div style="grid-column:1 / -1" class="border rounded-xl p-3 bg-white">
+      <div class="flex items-center justify-between mb-2">
+        <div class="font-medium text-slate-700 text-sm"><i class="fas fa-file-signature text-teal-600 mr-1"></i>${title}</div>
+        <select id="${prefix}_${key}_ag_src" ${dis} onchange="onAgreementSourceChange('${prefix}','${key}')" class="px-2 py-1.5 border rounded-lg text-xs ${roCls}">
+          <option value="upload" ${src === 'upload' ? 'selected' : ''}>Upload document</option>
+          <option value="editor" ${src === 'editor' ? 'selected' : ''}>Type agreement</option>
+        </select>
+      </div>
+      <p class="text-[11px] text-slate-400 mb-2">Choose <b>Upload document</b> for a PDF/Word file, or <b>Type agreement</b> to write it with the editor. Either way it is shown at checkout for digital acceptance or offline download &amp; signing.</p>
+      <!-- Built-in Text Editor -->
+      <div id="${prefix}_${key}_editor_wrap">
+        ${rteToolbar(`${prefix}_${key}_terms_rte`)}
+        <div id="${prefix}_${key}_terms_rte" contenteditable="${dis ? 'false' : 'true'}" class="border rounded-b-lg px-3 py-2 min-h-24 bg-white focus:outline-none text-sm ${roCls}" style="text-align:justify;">${termsText}</div>
+        <textarea id="${prefix}_${key}_terms" class="hidden">${esc(termsText)}</textarea>
+      </div>
+      <!-- Document Upload -->
+      <div id="${prefix}_${key}_upload_wrap">
+        <input id="${prefix}_${key}_doc" value="${esc(docUrl)}" placeholder="Agreement URL / uploaded file data" class="w-full px-3 py-2 border rounded-lg text-xs ${roCls}">
         <div class="flex items-center justify-between gap-2 mt-2">
-          <label class="btn ${finDis ? 'bg-slate-200 text-slate-400 cursor-not-allowed' : 'bg-white cursor-pointer'} px-3 py-2 rounded-lg text-xs border"><i class="fas fa-file-upload mr-1"></i>Upload<input type="file" ${finDis} accept="image/*,application/pdf" class="hidden" onchange="pickFileDataUrl(this,'${prefix}_fin_doc','${prefix}_fin_doc_name')"></label>
-          <span id="${prefix}_fin_doc_name" class="text-[11px] text-slate-400 truncate">${p.financing_terms_doc_url ? 'existing document attached' : 'no file selected'}</span>
+          <label class="btn ${dis ? 'bg-slate-200 text-slate-400 cursor-not-allowed' : 'bg-white cursor-pointer'} px-3 py-2 rounded-lg text-xs border"><i class="fas fa-file-upload mr-1"></i>Upload PDF / Word<input type="file" ${dis} accept="${AGREEMENT_UPLOAD_ACCEPT}" class="hidden" onchange="pickFileDataUrl(this,'${prefix}_${key}_doc','${prefix}_${key}_doc_name')"></label>
+          <span id="${prefix}_${key}_doc_name" class="text-[11px] text-slate-400 truncate">${docUrl ? 'existing document attached' : 'no file selected'}</span>
         </div>
       </div>
     </div>`
+}
+// Toggle the visible representation to match the chosen source mode.
+window.onAgreementSourceChange = (prefix, key) => {
+  const src = $(`${prefix}_${key}_ag_src`)?.value || 'editor'
+  const ed = $(`${prefix}_${key}_editor_wrap`)
+  const up = $(`${prefix}_${key}_upload_wrap`)
+  if (ed) ed.style.display = src === 'editor' ? '' : 'none'
+  if (up) up.style.display = src === 'upload' ? '' : 'none'
 }
 // ---- Dynamic pricing / tenure form helpers --------------------------------
 const PRICE_MODE_LABELS = { percentage: 'Percentage markup', fixed: 'Fixed amount markup', manual: 'Manual selling price' }
@@ -2599,6 +2665,14 @@ async function initProductForm(prefix) {
   onPriceModeChange(prefix, 'cash')
   onPriceModeChange(prefix, 'credit')
   onTenureUnitChange(prefix)
+  // Apply agreement source-mode visibility + keep the hidden textarea in sync
+  // with the rich-text editor so productPayload() always reads current content.
+  for (const key of ['cash', 'fin']) {
+    onAgreementSourceChange(prefix, key)
+    const rte = $(`${prefix}_${key}_terms_rte`)
+    const ta = $(`${prefix}_${key}_terms`)
+    if (rte && ta) rte.addEventListener('input', () => { ta.value = rte.innerHTML })
+  }
   const sel = $(`${prefix}_fin_type`)
   if (sel) {
     const types = await loadFinancingTypes()
@@ -2647,10 +2721,14 @@ function productPayload(prefix) {
     financing_cycle_length_days: Number(($(prefix + '_cycle_len') || {}).value || 30),
     cash_deposit_pct: Number($(prefix + '_cash_dep').value || 100),
     financing_deposit_pct: Number($(prefix + '_fin_dep').value || 10),
-    cash_terms_text: $(prefix + '_cash_terms').value || null,
-    financing_terms_text: $(prefix + '_fin_terms').value || null,
-    cash_terms_doc_url: $(prefix + '_cash_doc').value || null,
-    financing_terms_doc_url: $(prefix + '_fin_doc').value || null
+    // Agreement source mode + the matching representation (rich-text from the
+    // editor, or the uploaded PDF/Word doc data URL).
+    cash_agreement_source: ($(prefix + '_cash_ag_src') || {}).value || 'editor',
+    financing_agreement_source: ($(prefix + '_fin_ag_src') || {}).value || 'editor',
+    cash_terms_text: (($(prefix + '_cash_terms_rte') || {}).innerHTML || ($(prefix + '_cash_terms') || {}).value || '') || null,
+    financing_terms_text: (($(prefix + '_fin_terms_rte') || {}).innerHTML || ($(prefix + '_fin_terms') || {}).value || '') || null,
+    cash_terms_doc_url: ($(prefix + '_cash_doc') || {}).value || null,
+    financing_terms_doc_url: ($(prefix + '_fin_doc') || {}).value || null
   }
 }
 function financeStatusBadge(s) {

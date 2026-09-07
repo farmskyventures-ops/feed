@@ -446,6 +446,9 @@ function normalizeProductPayload(b: any) {
   const cycleLengthDays = Math.max(1, Math.round(numberVal(b.financing_cycle_length_days, 30)))
   // FEED only offers Murabaha financing; default the type accordingly.
   const financingTypeKey = cleanText(b.financing_type_key, 60) || 'murabaha'
+  // Agreement source mode per payment path — 'upload' or 'editor' (default).
+  const cashAgreementSource = String(b.cash_agreement_source) === 'upload' ? 'upload' : 'editor'
+  const financingAgreementSource = String(b.financing_agreement_source) === 'upload' ? 'upload' : 'editor'
   const paymentMode = b.payment_option_mode || (boolInt(b.cash_enabled, true) && boolInt(b.financing_enabled, true) ? 'both' : boolInt(b.cash_enabled, true) ? 'cash' : 'financing')
   return {
     sku: String(b.sku || '').trim(),
@@ -477,10 +480,14 @@ function normalizeProductPayload(b: any) {
     financing_term_max_months: numberVal(b.financing_term_max_months, 12),
     cash_deposit_pct: numberVal(b.cash_deposit_pct, 100),
     financing_deposit_pct: numberVal(b.financing_deposit_pct, 10),
-    cash_terms_text: b.cash_terms_text || null,
-    financing_terms_text: b.financing_terms_text || null,
-    cash_terms_doc_url: b.cash_terms_doc_url || null,
-    financing_terms_doc_url: b.financing_terms_doc_url || null,
+    // Agreement source mode per payment path: 'upload' (a stored PDF/Word doc)
+    // or 'editor' (typed rich-text). Keep only the matching representation.
+    cash_agreement_source: cashAgreementSource,
+    financing_agreement_source: financingAgreementSource,
+    cash_terms_text: cashAgreementSource === 'upload' ? null : (b.cash_terms_text || null),
+    financing_terms_text: financingAgreementSource === 'upload' ? null : (b.financing_terms_text || null),
+    cash_terms_doc_url: cashAgreementSource === 'editor' ? null : (b.cash_terms_doc_url || null),
+    financing_terms_doc_url: financingAgreementSource === 'editor' ? null : (b.financing_terms_doc_url || null),
     financing_tenure_unit: tenureUnit,
     financing_rate_per_cycle: ratePerCycle,
     financing_amount_per_cycle: amountPerCycle,
@@ -1476,14 +1483,14 @@ app.post('/api/products', requireAuth, requirePermission('can_manage_inventory')
   const financeSetBy = canFinance ? user.id : null
   try {
     const r = await c.env.DB.prepare(
-      `INSERT INTO products (sku,name,category,description,product_type,supplier_id,buying_price,cash_markup_pct,credit_markup_pct,cash_price,credit_price,cash_price_mode,cash_markup_amount,credit_price_mode,credit_markup_amount,quantity,unit,reorder_threshold,image,cash_enabled,financing_enabled,payment_option_mode,financing_model,financing_type_key,financing_interest_pct,financing_frequency,financing_term_min_months,financing_term_max_months,financing_tenure_unit,financing_rate_per_cycle,financing_amount_per_cycle,financing_cycle_count,financing_cycle_length_days,cash_deposit_pct,financing_deposit_pct,cash_terms_text,financing_terms_text,cash_terms_doc_url,financing_terms_doc_url,created_by,finance_status,finance_set_by)
-       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
+      `INSERT INTO products (sku,name,category,description,product_type,supplier_id,buying_price,cash_markup_pct,credit_markup_pct,cash_price,credit_price,cash_price_mode,cash_markup_amount,credit_price_mode,credit_markup_amount,quantity,unit,reorder_threshold,image,cash_enabled,financing_enabled,payment_option_mode,financing_model,financing_type_key,financing_interest_pct,financing_frequency,financing_term_min_months,financing_term_max_months,financing_tenure_unit,financing_rate_per_cycle,financing_amount_per_cycle,financing_cycle_count,financing_cycle_length_days,cash_deposit_pct,financing_deposit_pct,cash_terms_text,financing_terms_text,cash_terms_doc_url,financing_terms_doc_url,cash_agreement_source,financing_agreement_source,created_by,finance_status,finance_set_by)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
     ).bind(
       p.sku, p.name, p.category, p.description, p.product_type, p.supplier_id, p.buying_price, p.cash_markup_pct, p.credit_markup_pct,
       p.cash_price, p.credit_price, p.cash_price_mode, p.cash_markup_amount, p.credit_price_mode, p.credit_markup_amount, p.quantity, p.unit, p.reorder_threshold, p.image, p.cash_enabled, p.financing_enabled,
       p.payment_option_mode, p.financing_model, p.financing_type_key, p.financing_interest_pct, p.financing_frequency, p.financing_term_min_months,
       p.financing_term_max_months, p.financing_tenure_unit, p.financing_rate_per_cycle, p.financing_amount_per_cycle, p.financing_cycle_count, p.financing_cycle_length_days, p.cash_deposit_pct, p.financing_deposit_pct, p.cash_terms_text, p.financing_terms_text,
-      p.cash_terms_doc_url, p.financing_terms_doc_url, user.id, financeStatus, financeSetBy
+      p.cash_terms_doc_url, p.financing_terms_doc_url, p.cash_agreement_source, p.financing_agreement_source, user.id, financeStatus, financeSetBy
     ).run()
     await audit(c, user.id, 'create', 'product', `${p.name} (${financeStatus})`)
     return c.json({ id: r.meta.last_row_id, finance_status: financeStatus })
@@ -1530,12 +1537,12 @@ app.put('/api/products/:id', requireAuth, requirePermission('can_manage_inventor
     sku: p.sku, name: p.name, category: p.category, description: p.description, product_type: p.product_type,
     buying_price: p.buying_price, cash_markup_pct: p.cash_markup_pct, cash_price: p.cash_price, cash_price_mode: p.cash_price_mode, cash_markup_amount: p.cash_markup_amount,
     quantity: p.quantity, unit: p.unit, reorder_threshold: p.reorder_threshold, image: p.image || existing.image,
-    cash_enabled: p.cash_enabled, cash_deposit_pct: p.cash_deposit_pct, cash_terms_text: p.cash_terms_text, cash_terms_doc_url: p.cash_terms_doc_url
+    cash_enabled: p.cash_enabled, cash_deposit_pct: p.cash_deposit_pct, cash_terms_text: p.cash_terms_text, cash_terms_doc_url: p.cash_terms_doc_url, cash_agreement_source: p.cash_agreement_source
   } : {
     sku: existing.sku, name: existing.name, category: existing.category, description: existing.description, product_type: existing.product_type,
     buying_price: existing.buying_price, cash_markup_pct: existing.cash_markup_pct, cash_price: existing.cash_price, cash_price_mode: existing.cash_price_mode, cash_markup_amount: existing.cash_markup_amount,
     quantity: existing.quantity, unit: existing.unit, reorder_threshold: existing.reorder_threshold, image: existing.image,
-    cash_enabled: existing.cash_enabled, cash_deposit_pct: existing.cash_deposit_pct, cash_terms_text: existing.cash_terms_text, cash_terms_doc_url: existing.cash_terms_doc_url
+    cash_enabled: existing.cash_enabled, cash_deposit_pct: existing.cash_deposit_pct, cash_terms_text: existing.cash_terms_text, cash_terms_doc_url: existing.cash_terms_doc_url, cash_agreement_source: existing.cash_agreement_source
   }
   const finCols = canFinance ? {
     credit_markup_pct: p.credit_markup_pct, credit_price: p.credit_price, credit_price_mode: p.credit_price_mode, credit_markup_amount: p.credit_markup_amount, financing_enabled: p.financing_enabled,
@@ -1543,7 +1550,7 @@ app.put('/api/products/:id', requireAuth, requirePermission('can_manage_inventor
     financing_term_min_months: p.financing_term_min_months, financing_term_max_months: p.financing_term_max_months,
     financing_tenure_unit: p.financing_tenure_unit, financing_rate_per_cycle: p.financing_rate_per_cycle, financing_amount_per_cycle: p.financing_amount_per_cycle,
     financing_cycle_count: p.financing_cycle_count, financing_cycle_length_days: p.financing_cycle_length_days,
-    financing_deposit_pct: p.financing_deposit_pct, financing_terms_text: p.financing_terms_text, financing_terms_doc_url: p.financing_terms_doc_url,
+    financing_deposit_pct: p.financing_deposit_pct, financing_terms_text: p.financing_terms_text, financing_terms_doc_url: p.financing_terms_doc_url, financing_agreement_source: p.financing_agreement_source,
     payment_option_mode: p.payment_option_mode, finance_status: 'published', finance_set_by: user.id
   } : {
     credit_markup_pct: existing.credit_markup_pct, credit_price: existing.credit_price, credit_price_mode: existing.credit_price_mode, credit_markup_amount: existing.credit_markup_amount, financing_enabled: existing.financing_enabled,
@@ -1551,18 +1558,18 @@ app.put('/api/products/:id', requireAuth, requirePermission('can_manage_inventor
     financing_term_min_months: existing.financing_term_min_months, financing_term_max_months: existing.financing_term_max_months,
     financing_tenure_unit: existing.financing_tenure_unit, financing_rate_per_cycle: existing.financing_rate_per_cycle, financing_amount_per_cycle: existing.financing_amount_per_cycle,
     financing_cycle_count: existing.financing_cycle_count, financing_cycle_length_days: existing.financing_cycle_length_days,
-    financing_deposit_pct: existing.financing_deposit_pct, financing_terms_text: existing.financing_terms_text, financing_terms_doc_url: existing.financing_terms_doc_url,
+    financing_deposit_pct: existing.financing_deposit_pct, financing_terms_text: existing.financing_terms_text, financing_terms_doc_url: existing.financing_terms_doc_url, financing_agreement_source: existing.financing_agreement_source,
     payment_option_mode: existing.payment_option_mode, finance_status: existing.finance_status, finance_set_by: existing.finance_set_by
   }
   try {
     await c.env.DB.prepare(
-      `UPDATE products SET sku=?, name=?, category=?, description=?, product_type=?, buying_price=?, cash_markup_pct=?, credit_markup_pct=?, cash_price=?, credit_price=?, cash_price_mode=?, cash_markup_amount=?, credit_price_mode=?, credit_markup_amount=?, quantity=?, unit=?, reorder_threshold=?, image=COALESCE(?, image), cash_enabled=?, financing_enabled=?, payment_option_mode=?, financing_model=?, financing_type_key=?, financing_interest_pct=?, financing_frequency=?, financing_term_min_months=?, financing_term_max_months=?, financing_tenure_unit=?, financing_rate_per_cycle=?, financing_amount_per_cycle=?, financing_cycle_count=?, financing_cycle_length_days=?, cash_deposit_pct=?, financing_deposit_pct=?, cash_terms_text=?, financing_terms_text=?, cash_terms_doc_url=?, financing_terms_doc_url=?, finance_status=?, finance_set_by=?, finance_set_at=CASE WHEN ?='published' THEN CURRENT_TIMESTAMP ELSE finance_set_at END WHERE id=?`
+      `UPDATE products SET sku=?, name=?, category=?, description=?, product_type=?, buying_price=?, cash_markup_pct=?, credit_markup_pct=?, cash_price=?, credit_price=?, cash_price_mode=?, cash_markup_amount=?, credit_price_mode=?, credit_markup_amount=?, quantity=?, unit=?, reorder_threshold=?, image=COALESCE(?, image), cash_enabled=?, financing_enabled=?, payment_option_mode=?, financing_model=?, financing_type_key=?, financing_interest_pct=?, financing_frequency=?, financing_term_min_months=?, financing_term_max_months=?, financing_tenure_unit=?, financing_rate_per_cycle=?, financing_amount_per_cycle=?, financing_cycle_count=?, financing_cycle_length_days=?, cash_deposit_pct=?, financing_deposit_pct=?, cash_terms_text=?, financing_terms_text=?, cash_terms_doc_url=?, financing_terms_doc_url=?, cash_agreement_source=?, financing_agreement_source=?, finance_status=?, finance_set_by=?, finance_set_at=CASE WHEN ?='published' THEN CURRENT_TIMESTAMP ELSE finance_set_at END WHERE id=?`
     ).bind(
       coreCols.sku, coreCols.name, coreCols.category, coreCols.description, coreCols.product_type, coreCols.buying_price, coreCols.cash_markup_pct, finCols.credit_markup_pct,
       coreCols.cash_price, finCols.credit_price, coreCols.cash_price_mode, coreCols.cash_markup_amount, finCols.credit_price_mode, finCols.credit_markup_amount, coreCols.quantity, coreCols.unit, coreCols.reorder_threshold, coreCols.image || null, coreCols.cash_enabled, finCols.financing_enabled,
       finCols.payment_option_mode, finCols.financing_model, finCols.financing_type_key, finCols.financing_interest_pct, finCols.financing_frequency, finCols.financing_term_min_months,
       finCols.financing_term_max_months, finCols.financing_tenure_unit, finCols.financing_rate_per_cycle, finCols.financing_amount_per_cycle, finCols.financing_cycle_count, finCols.financing_cycle_length_days, coreCols.cash_deposit_pct, finCols.financing_deposit_pct, coreCols.cash_terms_text, finCols.financing_terms_text,
-      coreCols.cash_terms_doc_url, finCols.financing_terms_doc_url, finCols.finance_status, finCols.finance_set_by, finCols.finance_status, id
+      coreCols.cash_terms_doc_url, finCols.financing_terms_doc_url, coreCols.cash_agreement_source, finCols.financing_agreement_source, finCols.finance_status, finCols.finance_set_by, finCols.finance_status, id
     ).run()
     await audit(c, user.id, 'update', 'product', `${coreCols.name}${canFinance ? '' : ' (core only)'}`)
     return c.json({ ok: true })
@@ -2291,6 +2298,9 @@ app.get('/api/murabaha/:id/agreement', requireAuth, async (c) => {
     overview_html: template?.overview_html || '',
     body_html: template?.body_html || contract.terms_text || '',
     terms_document_url: contract.terms_document_url || null,
+    // 'upload' when an uploaded PDF/Word doc backs this agreement, else 'editor'
+    // (typed rich-text). Lets checkout render the correct representation.
+    body_source: contract.terms_document_url ? 'upload' : 'editor',
     details,
     style
   })
@@ -4555,14 +4565,14 @@ app.post('/api/settings/quick-product', requireAuth, async (c) => {
   if (!p.sku || !p.name) return c.json({ error: 'SKU and name are required' }, 400)
   try {
     const r = await c.env.DB.prepare(
-      `INSERT INTO products (sku,name,category,description,product_type,supplier_id,buying_price,cash_markup_pct,credit_markup_pct,cash_price,credit_price,cash_price_mode,cash_markup_amount,credit_price_mode,credit_markup_amount,quantity,unit,reorder_threshold,image,cash_enabled,financing_enabled,payment_option_mode,financing_model,financing_type_key,financing_interest_pct,financing_frequency,financing_term_min_months,financing_term_max_months,financing_tenure_unit,financing_rate_per_cycle,financing_amount_per_cycle,financing_cycle_count,financing_cycle_length_days,cash_deposit_pct,financing_deposit_pct,cash_terms_text,financing_terms_text,cash_terms_doc_url,financing_terms_doc_url)
-       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
+      `INSERT INTO products (sku,name,category,description,product_type,supplier_id,buying_price,cash_markup_pct,credit_markup_pct,cash_price,credit_price,cash_price_mode,cash_markup_amount,credit_price_mode,credit_markup_amount,quantity,unit,reorder_threshold,image,cash_enabled,financing_enabled,payment_option_mode,financing_model,financing_type_key,financing_interest_pct,financing_frequency,financing_term_min_months,financing_term_max_months,financing_tenure_unit,financing_rate_per_cycle,financing_amount_per_cycle,financing_cycle_count,financing_cycle_length_days,cash_deposit_pct,financing_deposit_pct,cash_terms_text,financing_terms_text,cash_terms_doc_url,financing_terms_doc_url,cash_agreement_source,financing_agreement_source)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
     ).bind(
       p.sku, p.name, p.category, p.description, p.product_type, p.supplier_id, p.buying_price, p.cash_markup_pct, p.credit_markup_pct,
       p.cash_price, p.credit_price, p.cash_price_mode, p.cash_markup_amount, p.credit_price_mode, p.credit_markup_amount, p.quantity, p.unit, p.reorder_threshold, p.image, p.cash_enabled, p.financing_enabled,
       p.payment_option_mode, p.financing_model, p.financing_type_key, p.financing_interest_pct, p.financing_frequency, p.financing_term_min_months,
       p.financing_term_max_months, p.financing_tenure_unit, p.financing_rate_per_cycle, p.financing_amount_per_cycle, p.financing_cycle_count, p.financing_cycle_length_days, p.cash_deposit_pct, p.financing_deposit_pct, p.cash_terms_text, p.financing_terms_text,
-      p.cash_terms_doc_url, p.financing_terms_doc_url
+      p.cash_terms_doc_url, p.financing_terms_doc_url, p.cash_agreement_source, p.financing_agreement_source
     ).run()
     await audit(c, user.id, 'create', 'product', `${p.name} (via settings builder)`)
     return c.json({ id: r.meta.last_row_id, product: { id: r.meta.last_row_id, sku: p.sku, name: p.name, category: p.category, quantity: p.quantity } })
