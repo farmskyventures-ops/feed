@@ -3976,7 +3976,7 @@ app.get('/api/dashboard', requireAuth, async (c) => {
 // ----------------------------------------------------------------------------
 app.get('/api/agents', requireAuth, requireRole('admin', 'super_admin'), async (c) => {
   const { results } = await c.env.DB.prepare(
-    `SELECT u.id, u.full_name, u.phone, u.email, u.region, u.label, u.permissions, u.status,
+    `SELECT u.id, u.full_name, u.phone, u.whatsapp, u.email, u.region, u.label, u.permissions, u.status,
      (SELECT COUNT(*) FROM customers WHERE agent_id=CAST(u.id AS TEXT)) customers,
      (SELECT COUNT(*) FROM murabaha_contracts WHERE agent_id=CAST(u.id AS TEXT) AND status='active') active
      FROM users u WHERE u.role='agent'`
@@ -4099,7 +4099,7 @@ app.put('/api/agents/:id', requireAuth, requireRole('admin', 'super_admin'), asy
 app.get('/api/users', requireAuth, requireRole('admin', 'super_admin'), async (c) => {
   const caller = c.get('user') as SessionUser
   const callerIsSuper = isSuperAdmin(caller)
-  const { results } = await c.env.DB.prepare(`SELECT id, full_name, phone, email, role, label, permissions, status, region, schedule_enabled, access_days, access_start, access_end, created_at FROM users ORDER BY id`).all()
+  const { results } = await c.env.DB.prepare(`SELECT id, full_name, phone, whatsapp, email, role, label, permissions, status, region, schedule_enabled, access_days, access_start, access_end, created_at FROM users ORDER BY id`).all()
   const usersWithPerms = [] as any[]
   for (const u of results as any[]) {
     // Super-Admin credential/profile data is visible ONLY to Super-Admins.
@@ -4157,6 +4157,8 @@ app.post('/api/users', requireAuth, requireRole('admin', 'super_admin'), async (
     ? await c.env.DB.prepare(`INSERT INTO users (full_name, phone, email, password, role, label, permissions, status, region, password_set, schedule_enabled, access_days, access_start, access_end, created_by, org_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).bind(b.full_name, p, email, await hashPassword(pwd), b.role, label, JSON.stringify(perms), b.status || 'active', b.region || null, provided, schedEnabled, schedDays, b.access_start || null, b.access_end || null, creatorId, usrOrgId).run()
     : await c.env.DB.prepare(`INSERT INTO users (full_name, phone, email, password, role, label, permissions, status, region, password_set, schedule_enabled, access_days, access_start, access_end, created_by) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).bind(b.full_name, p, email, await hashPassword(pwd), b.role, label, JSON.stringify(perms), b.status || 'active', b.region || null, provided, schedEnabled, schedDays, b.access_start || null, b.access_end || null, creatorId).run()
   if (b.role === 'agent') await c.env.DB.prepare(`INSERT INTO agents (user_id,region,permissions) VALUES (?,?,?)`).bind(r.meta.last_row_id, b.region || null, JSON.stringify(perms)).run()
+  // Optional WhatsApp number for the quick-communication buttons (defaults to phone).
+  await c.env.DB.prepare(`UPDATE users SET whatsapp=? WHERE id=?`).bind(cleanText(b.whatsapp, 40) || p, r.meta.last_row_id).run()
   await audit(c, creatorId, 'create', 'user', `${b.full_name} (${b.role})`)
   if (provided) return c.json({ id: r.meta.last_row_id, password: pwd, password_was_set_by_admin: true })
   const t = await issueTempPassword(c, { userId: r.meta.last_row_id as number, phone: p, fullName: b.full_name })
@@ -4184,6 +4186,7 @@ app.put('/api/users/:id', requireAuth, requireRole('admin', 'super_admin'), asyn
   } else {
     await c.env.DB.prepare(`UPDATE users SET full_name=?, phone=?, email=?, role=?, label=?, permissions=?, region=?, schedule_enabled=?, access_days=?, access_start=?, access_end=? WHERE id=?`).bind(b.full_name, b.phone, usrUpdEmail, b.role, b.label || null, JSON.stringify(perms), b.region, schedEnabled, schedDays, b.access_start || null, b.access_end || null, id).run()
   }
+  if (b.whatsapp !== undefined) await c.env.DB.prepare(`UPDATE users SET whatsapp=? WHERE id=?`).bind(cleanText(b.whatsapp, 40) || b.phone || null, id).run()
   if (b.role === 'agent') {
     const exists = await c.env.DB.prepare(`SELECT user_id FROM agents WHERE user_id=?`).bind(id).first<any>()
     if (exists) await c.env.DB.prepare(`UPDATE agents SET region=?, permissions=? WHERE user_id=?`).bind(b.region || null, JSON.stringify(perms), id).run()
@@ -4394,6 +4397,367 @@ function isCustomerAccessible(user: SessionUser, cust: any): boolean {
 function slugifyKey(s: string): string {
   return String(s || '').toLowerCase().trim().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '').slice(0, 60)
 }
+
+
+// ============================================================================
+// QUICK COMMUNICATION CONTACTS
+//   Return ONLY the contact attributes needed for the quick-action buttons
+//   (phone, whatsapp, email) — never internal metadata (data masking).
+//   For a CUSTOMER the smart-routing rule loads the ASSIGNED AGENT's contact;
+//   if the customer has no assigned agent we fall back to the general support
+//   pool / Super-Admin queue so buttons never crash.
+// ============================================================================
+async function resolveSupportFallbackContact(c: any): Promise<any> {
+  // General support pool first, else any active Super-Admin.
+  const support = await c.env.DB.prepare(
+    `SELECT full_name, phone, whatsapp, email FROM users WHERE role='support' AND status='active' ORDER BY id LIMIT 1`
+  ).first<any>()
+  if (support) return { ...maskContact(support), source: 'support_pool' }
+  const admin = await c.env.DB.prepare(
+    `SELECT full_name, phone, whatsapp, email FROM users WHERE role='super_admin' AND status='active' ORDER BY id LIMIT 1`
+  ).first<any>()
+  if (admin) return { ...maskContact(admin), source: 'super_admin_queue' }
+  return { full_name: 'Farmsky Support', phone: null, whatsapp: null, email: null, source: 'none' }
+}
+// Expose only the whitelisted contact fields.
+function maskContact(row: any) {
+  if (!row) return { full_name: null, phone: null, whatsapp: null, email: null }
+  return {
+    full_name: row.full_name || null,
+    phone: row.phone || row.mobile || null,
+    whatsapp: row.whatsapp || row.phone || row.mobile || null,
+    email: isPlaceholderEmail(row.email) ? null : (row.email || null)
+  }
+}
+// Quick-action contact for a user or customer.
+//   GET /api/contacts/:kind/:id   kind = 'user' | 'customer'
+app.get('/api/contacts/:kind/:id', requireAuth, async (c) => {
+  const user = c.get('user') as SessionUser
+  const kind = c.req.param('kind')
+  const id = c.req.param('id')
+  if (kind === 'user') {
+    // Any authenticated staff member may look up another staff user's contact
+    // (needed to call/email colleagues); customers cannot enumerate users.
+    if (user.role === 'customer') return c.json({ error: 'Forbidden' }, 403)
+    const row = await c.env.DB.prepare(`SELECT full_name, phone, whatsapp, email, role FROM users WHERE id=?`).bind(id).first<any>()
+    if (!row) return c.json({ error: 'Not found' }, 404)
+    return c.json({ contact: maskContact(row), routed_to: 'self' })
+  }
+  if (kind === 'customer') {
+    const cust = await withAdminContext(c, async () => await c.env.DB.prepare(
+      `SELECT id, full_name, mobile, alt_mobile, whatsapp, agent_id, onboarded_by, user_id FROM customers WHERE id=?`
+    ).bind(id).first<any>())
+    if (!cust) return c.json({ error: 'Not found' }, 404)
+    // Strict per-account scoping: only those who may access this customer.
+    if (!isCustomerAccessible(user, cust)) return c.json({ error: 'Not found' }, 404)
+    // SMART ROUTING: for a customer account, quick actions target the ASSIGNED
+    // AGENT currently managing them (so anyone contacting the customer reaches
+    // the right agent). If no agent is assigned, fall back to support pool.
+    const agentId = cust.agent_id || cust.onboarded_by
+    if (agentId) {
+      const agent = await c.env.DB.prepare(`SELECT full_name, phone, whatsapp, email FROM users WHERE id=? AND role='agent'`).bind(String(agentId)).first<any>()
+      if (agent) return c.json({ contact: maskContact(agent), routed_to: 'assigned_agent', customer: { full_name: cust.full_name } })
+    }
+    // Fallback pool.
+    const fb = await resolveSupportFallbackContact(c)
+    return c.json({ contact: { full_name: fb.full_name, phone: fb.phone, whatsapp: fb.whatsapp, email: fb.email }, routed_to: fb.source })
+  }
+  return c.json({ error: 'Invalid contact kind' }, 400)
+})
+
+// ============================================================================
+// CRM TICKETING SYSTEM
+//   RBAC:
+//     • manage_ticket_categories → Super-Admin: configure categories + assignees
+//     • manage_crm               → create / update / resolve / escalate
+//     • view_crm                 → read tickets within assigned categories
+//   Category scoping: a non-admin user only sees tickets whose category they
+//   are assigned to (or that are assigned directly to them / created by them).
+// ============================================================================
+function canViewCrm(user: SessionUser) {
+  return ['admin', 'super_admin'].includes(user.role) || hasPermission(user, 'view_crm') || hasPermission(user, 'manage_crm')
+}
+function canManageCrm(user: SessionUser) {
+  return ['admin', 'super_admin'].includes(user.role) || hasPermission(user, 'manage_crm')
+}
+function canManageTicketCategories(user: SessionUser) {
+  return user.role === 'super_admin' || user.role === 'admin' || hasPermission(user, 'manage_ticket_categories')
+}
+const TICKET_STATUSES = ['open', 'in_progress', 'escalated', 'resolved', 'closed']
+const TICKET_PRIORITIES = ['low', 'medium', 'high', 'urgent']
+// Category ids the user is assigned to handle (admins handle all).
+async function userCategoryIds(c: any, user: SessionUser): Promise<number[] | 'all'> {
+  if (['admin', 'super_admin'].includes(user.role)) return 'all'
+  const { results } = await c.env.DB.prepare(`SELECT category_id FROM crm_category_assignees WHERE user_id=?`).bind(String(user.id)).all()
+  return (results as any[]).map((r) => Number(r.category_id))
+}
+
+// ---- Categories -----------------------------------------------------------
+app.get('/api/crm/categories', requireAuth, async (c) => {
+  const user = c.get('user') as SessionUser
+  if (!canViewCrm(user)) return c.json({ error: 'Forbidden' }, 403)
+  const includeInactive = c.req.query('all') === '1' && canManageTicketCategories(user)
+  const { results } = await c.env.DB.prepare(
+    `SELECT * FROM crm_ticket_categories ${includeInactive ? '' : 'WHERE active=1'} ORDER BY sort_order, name`
+  ).all()
+  // Attach assignees (only for configurers).
+  let assignees: any[] = []
+  if (canManageTicketCategories(user)) {
+    const r = await c.env.DB.prepare(
+      `SELECT a.category_id, a.user_id, u.full_name, u.role FROM crm_category_assignees a LEFT JOIN users u ON CAST(u.id AS TEXT)=a.user_id`
+    ).all()
+    assignees = r.results as any[]
+  }
+  const cats = (results as any[]).map((cat) => ({
+    ...cat,
+    assignees: assignees.filter((a) => Number(a.category_id) === Number(cat.id)).map((a) => ({ user_id: a.user_id, full_name: a.full_name, role: a.role }))
+  }))
+  return c.json({ categories: cats, can_manage: canManageTicketCategories(user) })
+})
+app.post('/api/crm/categories', requireAuth, async (c) => {
+  const user = c.get('user') as SessionUser
+  if (!canManageTicketCategories(user)) return c.json({ error: 'Forbidden' }, 403)
+  const b = await c.req.json()
+  const name = cleanText(b.name, 80)
+  if (!name) return c.json({ error: 'A category name is required.' }, 400)
+  const key = slugifyKey(b.category_key || name) || ('cat_' + Date.now())
+  await c.env.DB.prepare(
+    `INSERT INTO crm_ticket_categories (category_key, name, description, active, sort_order) VALUES (?,?,?,?,?)
+     ON CONFLICT (category_key) DO UPDATE SET name=EXCLUDED.name, description=EXCLUDED.description, active=EXCLUDED.active`
+  ).bind(key, name, cleanText(b.description, 300) || null, b.active === false ? 0 : 1, Number(b.sort_order) || 100).run()
+  await audit(c, user.id, 'create', 'crm_category', name)
+  return c.json({ ok: true, category_key: key })
+})
+app.put('/api/crm/categories/:id', requireAuth, async (c) => {
+  const user = c.get('user') as SessionUser
+  if (!canManageTicketCategories(user)) return c.json({ error: 'Forbidden' }, 403)
+  const id = c.req.param('id')
+  const b = await c.req.json()
+  const existing = await c.env.DB.prepare(`SELECT * FROM crm_ticket_categories WHERE id=?`).bind(id).first<any>()
+  if (!existing) return c.json({ error: 'Not found' }, 404)
+  await c.env.DB.prepare(
+    `UPDATE crm_ticket_categories SET name=?, description=?, active=?, sort_order=? WHERE id=?`
+  ).bind(
+    b.name != null ? cleanText(b.name, 80) : existing.name,
+    b.description != null ? (cleanText(b.description, 300) || null) : existing.description,
+    b.active != null ? (b.active ? 1 : 0) : existing.active,
+    b.sort_order != null ? Number(b.sort_order) : existing.sort_order,
+    id
+  ).run()
+  await audit(c, user.id, 'update', 'crm_category', existing.name)
+  return c.json({ ok: true })
+})
+app.delete('/api/crm/categories/:id', requireAuth, async (c) => {
+  const user = c.get('user') as SessionUser
+  if (!canManageTicketCategories(user)) return c.json({ error: 'Forbidden' }, 403)
+  const id = c.req.param('id')
+  const inUse = await c.env.DB.prepare(`SELECT COUNT(*)::int n FROM crm_tickets WHERE category_id=?`).bind(id).first<any>()
+  if (Number(inUse?.n || 0) > 0) return c.json({ error: 'This category has tickets. Deactivate it instead of deleting.' }, 400)
+  await c.env.DB.prepare(`DELETE FROM crm_category_assignees WHERE category_id=?`).bind(id).run()
+  await c.env.DB.prepare(`DELETE FROM crm_ticket_categories WHERE id=?`).bind(id).run()
+  await audit(c, user.id, 'delete', 'crm_category', String(id))
+  return c.json({ ok: true })
+})
+// Assign / unassign the users/teams that handle a category.
+app.put('/api/crm/categories/:id/assignees', requireAuth, async (c) => {
+  const user = c.get('user') as SessionUser
+  if (!canManageTicketCategories(user)) return c.json({ error: 'Forbidden' }, 403)
+  const id = c.req.param('id')
+  const b = await c.req.json()
+  const userIds: string[] = Array.isArray(b.user_ids) ? b.user_ids.map((x: any) => String(x)) : []
+  await c.env.DB.prepare(`DELETE FROM crm_category_assignees WHERE category_id=?`).bind(id).run()
+  for (const uid of userIds) {
+    await c.env.DB.prepare(`INSERT INTO crm_category_assignees (category_id, user_id) VALUES (?,?)`).bind(id, uid).run()
+  }
+  await audit(c, user.id, 'update', 'crm_category_assignees', `category ${id} → ${userIds.length} handler(s)`)
+  return c.json({ ok: true })
+})
+
+// ---- Tickets --------------------------------------------------------------
+// Global search + dynamic filtering. All inputs are parameterized.
+app.get('/api/crm/tickets', requireAuth, async (c) => {
+  const user = c.get('user') as SessionUser
+  if (!canViewCrm(user)) return c.json({ error: 'Forbidden' }, 403)
+  const q = (c.req.query('q') || '').trim()
+  const status = (c.req.query('status') || '').trim()
+  const categoryId = (c.req.query('category_id') || '').trim()
+  const assignedTo = (c.req.query('assigned_to') || '').trim()
+  const priority = (c.req.query('priority') || '').trim()
+  const where: string[] = []
+  const binds: any[] = []
+  // Category scoping for non-admins: only tickets in categories they handle, or
+  // assigned to / created by them.
+  const cats = await userCategoryIds(c, user)
+  if (cats !== 'all') {
+    const catList = (cats as number[])
+    const parts: string[] = ['t.assigned_to = ?', 't.created_by = ?']
+    binds.push(String(user.id), String(user.id))
+    if (catList.length) {
+      parts.push(`t.category_id IN (${catList.map(() => '?').join(',')})`)
+      binds.push(...catList)
+    }
+    where.push('(' + parts.join(' OR ') + ')')
+  }
+  if (status && TICKET_STATUSES.includes(status)) { where.push('t.status = ?'); binds.push(status) }
+  if (priority && TICKET_PRIORITIES.includes(priority)) { where.push('t.priority = ?'); binds.push(priority) }
+  if (categoryId) { where.push('t.category_id = ?'); binds.push(Number(categoryId)) }
+  if (assignedTo) { where.push('t.assigned_to = ?'); binds.push(String(assignedTo)) }
+  if (q) {
+    // Parameterized LIKE across the searchable identifiers.
+    const like = '%' + q.replace(/[%_]/g, (m) => '\\' + m) + '%'
+    where.push(`(t.ticket_ref ILIKE ? OR t.subject ILIKE ? OR t.description ILIKE ? OR t.contact_name ILIKE ? OR t.contact_phone ILIKE ? OR t.contact_email ILIKE ? OR COALESCE(cu.full_name,'') ILIKE ?)`)
+    binds.push(like, like, like, like, like, like, like)
+  }
+  const sql = `SELECT t.*, cat.name AS category_name, cat.category_key,
+      cu.full_name AS customer_name, cu.mobile AS customer_mobile,
+      ua.full_name AS assigned_name
+    FROM crm_tickets t
+    LEFT JOIN crm_ticket_categories cat ON cat.id = t.category_id
+    LEFT JOIN customers cu ON cu.id = t.customer_id
+    LEFT JOIN users ua ON CAST(ua.id AS TEXT) = t.assigned_to
+    ${where.length ? 'WHERE ' + where.join(' AND ') : ''}
+    ORDER BY CASE t.priority WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 ELSE 3 END, t.updated_at DESC
+    LIMIT 500`
+  const { results } = await withAdminContext(c, async () => await c.env.DB.prepare(sql).bind(...binds).all())
+  return c.json({ tickets: results, can_manage: canManageCrm(user) })
+})
+// A single ticket + its full note timeline.
+app.get('/api/crm/tickets/:id', requireAuth, async (c) => {
+  const user = c.get('user') as SessionUser
+  if (!canViewCrm(user)) return c.json({ error: 'Forbidden' }, 403)
+  const id = c.req.param('id')
+  const t = await withAdminContext(c, async () => await c.env.DB.prepare(
+    `SELECT t.*, cat.name AS category_name, cu.full_name AS customer_name, cu.mobile AS customer_mobile,
+            ua.full_name AS assigned_name, ucr.full_name AS created_by_name
+       FROM crm_tickets t
+       LEFT JOIN crm_ticket_categories cat ON cat.id=t.category_id
+       LEFT JOIN customers cu ON cu.id=t.customer_id
+       LEFT JOIN users ua ON CAST(ua.id AS TEXT)=t.assigned_to
+       LEFT JOIN users ucr ON CAST(ucr.id AS TEXT)=t.created_by
+      WHERE t.id=?`
+  ).bind(id).first<any>())
+  if (!t) return c.json({ error: 'Not found' }, 404)
+  if (!(await ticketVisibleTo(c, user, t))) return c.json({ error: 'Not found' }, 404)
+  const { results: notes } = await withAdminContext(c, async () => await c.env.DB.prepare(
+    `SELECT n.*, u.full_name AS author_name FROM crm_ticket_notes n LEFT JOIN users u ON CAST(u.id AS TEXT)=n.author_id WHERE n.ticket_id=? ORDER BY n.created_at, n.id`
+  ).bind(id).all())
+  return c.json({ ticket: t, notes, can_manage: canManageCrm(user) })
+})
+// Whether a specific ticket is visible to the user (category scoping).
+async function ticketVisibleTo(c: any, user: SessionUser, t: any): Promise<boolean> {
+  if (['admin', 'super_admin'].includes(user.role)) return true
+  const uid = String(user.id)
+  if (String(t.assigned_to) === uid || String(t.created_by) === uid) return true
+  const cats = await userCategoryIds(c, user)
+  if (cats === 'all') return true
+  return t.category_id != null && (cats as number[]).includes(Number(t.category_id))
+}
+// Create a ticket (on behalf of a user/customer).
+app.post('/api/crm/tickets', requireAuth, async (c) => {
+  const user = c.get('user') as SessionUser
+  if (!canManageCrm(user)) return c.json({ error: 'Forbidden' }, 403)
+  const b = await c.req.json()
+  const subject = cleanText(b.subject, 160)
+  if (!subject) return c.json({ error: 'A ticket subject is required.' }, 400)
+  const status = TICKET_STATUSES.includes(String(b.status)) ? String(b.status) : 'open'
+  const priority = TICKET_PRIORITIES.includes(String(b.priority)) ? String(b.priority) : 'medium'
+  const categoryId = b.category_id ? Number(b.category_id) : null
+  let contactName = cleanText(b.contact_name, 120) || null
+  let contactPhone = cleanText(b.contact_phone, 40) || null
+  let contactEmail = cleanText(b.contact_email, 160) || null
+  let customerId: number | null = b.customer_id ? Number(b.customer_id) : null
+  // If linked to a customer, pull their contact + default-assign the ticket to
+  // their agent (smart routing); else leave for category/pool routing.
+  let assignedTo: string | null = b.assigned_to ? String(b.assigned_to) : null
+  if (customerId) {
+    const cust = await withAdminContext(c, async () => await c.env.DB.prepare(
+      `SELECT id, full_name, mobile, whatsapp, agent_id, onboarded_by FROM customers WHERE id=?`
+    ).bind(customerId).first<any>())
+    if (cust) {
+      contactName = contactName || cust.full_name
+      contactPhone = contactPhone || cust.mobile
+      if (!assignedTo) assignedTo = cust.agent_id ? String(cust.agent_id) : (cust.onboarded_by ? String(cust.onboarded_by) : null)
+    }
+  }
+  // Fallback: no assignee yet → first assignee of the category, else support pool.
+  if (!assignedTo && categoryId) {
+    const a = await c.env.DB.prepare(`SELECT user_id FROM crm_category_assignees WHERE category_id=? ORDER BY id LIMIT 1`).bind(categoryId).first<any>()
+    if (a) assignedTo = String(a.user_id)
+  }
+  if (!assignedTo) {
+    const fb = await c.env.DB.prepare(`SELECT id FROM users WHERE role IN ('support','super_admin') AND status='active' ORDER BY CASE role WHEN 'support' THEN 0 ELSE 1 END, id LIMIT 1`).first<any>()
+    if (fb) assignedTo = String(fb.id)
+  }
+  const ticketRef = ref('TKT')
+  const r = await c.env.DB.prepare(
+    `INSERT INTO crm_tickets (ticket_ref, subject, description, category_id, status, priority, customer_id, subject_user_id, contact_name, contact_phone, contact_email, assigned_to, created_by)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`
+  ).bind(
+    ticketRef, subject, cleanText(b.description, 4000) || null, categoryId, status, priority,
+    customerId, b.subject_user_id ? String(b.subject_user_id) : null, contactName, contactPhone, contactEmail, assignedTo, String(user.id)
+  ).run()
+  // last_row_id is unreliable on the Postgres D1 shim → resolve by the unique ref.
+  let newId = r.meta.last_row_id
+  if (!newId) {
+    const row = await c.env.DB.prepare(`SELECT id FROM crm_tickets WHERE ticket_ref=?`).bind(ticketRef).first<any>()
+    newId = row?.id
+  }
+  await c.env.DB.prepare(`INSERT INTO crm_ticket_notes (ticket_id, author_id, note, action) VALUES (?,?,?,?)`)
+    .bind(newId, String(user.id), `Ticket created${assignedTo ? ' and assigned' : ''}.`, 'create').run()
+  await audit(c, user.id, 'create', 'crm_ticket', ticketRef)
+  return c.json({ ok: true, id: newId, ticket_ref: ticketRef })
+})
+// Add a note / comment to the timeline.
+app.post('/api/crm/tickets/:id/notes', requireAuth, async (c) => {
+  const user = c.get('user') as SessionUser
+  if (!canManageCrm(user)) return c.json({ error: 'Forbidden' }, 403)
+  const id = c.req.param('id')
+  const t = await c.env.DB.prepare(`SELECT * FROM crm_tickets WHERE id=?`).bind(id).first<any>()
+  if (!t) return c.json({ error: 'Not found' }, 404)
+  if (!(await ticketVisibleTo(c, user, t))) return c.json({ error: 'Not found' }, 404)
+  const b = await c.req.json()
+  const note = cleanText(b.note, 4000)
+  if (!note) return c.json({ error: 'A note is required.' }, 400)
+  await c.env.DB.prepare(`INSERT INTO crm_ticket_notes (ticket_id, author_id, note, action, is_internal) VALUES (?,?,?,?,?)`)
+    .bind(id, String(user.id), note, 'comment', b.is_internal === false ? 0 : 1).run()
+  await c.env.DB.prepare(`UPDATE crm_tickets SET updated_at=CURRENT_TIMESTAMP WHERE id=?`).bind(id).run()
+  return c.json({ ok: true })
+})
+// Update status / priority / assignment (Quick Resolve + Escalate live here).
+app.put('/api/crm/tickets/:id', requireAuth, async (c) => {
+  const user = c.get('user') as SessionUser
+  if (!canManageCrm(user)) return c.json({ error: 'Forbidden' }, 403)
+  const id = c.req.param('id')
+  const t = await c.env.DB.prepare(`SELECT * FROM crm_tickets WHERE id=?`).bind(id).first<any>()
+  if (!t) return c.json({ error: 'Not found' }, 404)
+  if (!(await ticketVisibleTo(c, user, t))) return c.json({ error: 'Not found' }, 404)
+  const b = await c.req.json()
+  const status = b.status != null && TICKET_STATUSES.includes(String(b.status)) ? String(b.status) : t.status
+  const priority = b.priority != null && TICKET_PRIORITIES.includes(String(b.priority)) ? String(b.priority) : t.priority
+  const categoryId = b.category_id != null ? Number(b.category_id) : t.category_id
+  const assignedTo = b.assigned_to != null ? (b.assigned_to ? String(b.assigned_to) : null) : t.assigned_to
+  const isResolve = status === 'resolved' && t.status !== 'resolved'
+  const resolution = b.resolution != null ? (cleanText(b.resolution, 4000) || null) : t.resolution
+  await c.env.DB.prepare(
+    `UPDATE crm_tickets SET status=?, priority=?, category_id=?, assigned_to=?, resolution=?,
+       resolved_at=CASE WHEN ?='resolved' AND resolved_at IS NULL THEN CURRENT_TIMESTAMP ELSE resolved_at END,
+       resolved_by=CASE WHEN ?='resolved' AND resolved_by IS NULL THEN ? ELSE resolved_by END,
+       updated_at=CURRENT_TIMESTAMP WHERE id=?`
+  ).bind(status, priority, categoryId, assignedTo, resolution, status, status, String(user.id), id).run()
+  // Timeline entry describing the change.
+  const bits: string[] = []
+  if (status !== t.status) bits.push(`status → ${status}`)
+  if (priority !== t.priority) bits.push(`priority → ${priority}`)
+  if (String(assignedTo) !== String(t.assigned_to)) bits.push('reassigned')
+  if (Number(categoryId) !== Number(t.category_id)) bits.push('re-categorized')
+  const action = isResolve ? 'resolve' : (status === 'escalated' && t.status !== 'escalated' ? 'escalate' : (String(assignedTo) !== String(t.assigned_to) ? 'assign' : 'status'))
+  const noteText = cleanText(b.note, 4000) || (isResolve && resolution ? `Resolved: ${resolution}` : (bits.join(', ') || 'Updated'))
+  await c.env.DB.prepare(`INSERT INTO crm_ticket_notes (ticket_id, author_id, note, action) VALUES (?,?,?,?)`)
+    .bind(id, String(user.id), noteText, action).run()
+  await audit(c, user.id, action, 'crm_ticket', t.ticket_ref)
+  return c.json({ ok: true })
+})
+
 app.get('/api/financing-types', requireAuth, async (c) => {
   const includeAll = c.req.query('all') === '1'
   const { results } = await c.env.DB.prepare(

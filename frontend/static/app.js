@@ -219,6 +219,64 @@ function canDo(perm) {
   return !!state.user.permissions?.[perm]
 }
 function boolBadge(v, yes='Yes', no='No') { return v ? `<span class="text-emerald-600">${yes}</span>` : `<span class="text-slate-400">${no}</span>` }
+
+// ---------------------------------------------------------------------------
+// QUICK COMMUNICATION ACTION BUTTONS
+// A compact group of Call / Email / SMS / WhatsApp buttons for a user or
+// customer row. Clicking fetches the correct contact from the backend (which
+// applies SMART ROUTING for customers → their assigned agent, with a safe
+// fallback to the support pool) and then opens the device's dialer / mail /
+// SMS / WhatsApp with the number or address pre-filled.
+// ---------------------------------------------------------------------------
+function digitsOnly(s) { return String(s || '').replace(/[^0-9+]/g, '') }
+function waNumber(s) { return String(s || '').replace(/[^0-9]/g, '') } // WhatsApp wants no '+'
+function commButtons(kind, id, size = 'sm') {
+  const cls = size === 'sm' ? 'w-7 h-7 text-xs' : 'w-9 h-9 text-sm'
+  const btn = (icon, color, ch, title) =>
+    `<button title="${title}" onclick="quickComm('${kind}','${esc(String(id))}','${ch}',event)" class="btn ${cls} inline-flex items-center justify-center rounded-full ${color}"><i class="fas ${icon}"></i></button>`
+  return `<span class="inline-flex items-center gap-1 comm-actions" data-kind="${kind}" data-id="${esc(String(id))}">
+    ${btn('fa-phone', 'bg-emerald-100 text-emerald-700 hover:bg-emerald-200', 'call', 'Call')}
+    ${btn('fa-envelope', 'bg-blue-100 text-blue-700 hover:bg-blue-200', 'email', 'Email')}
+    ${btn('fa-comment-sms', 'bg-slate-100 text-slate-700 hover:bg-slate-200', 'sms', 'Text (SMS)')}
+    ${btn('fa-whatsapp', 'bg-green-100 text-green-700 hover:bg-green-200', 'whatsapp', 'WhatsApp')}
+  </span>`
+}
+// Cache resolved contacts briefly so repeated clicks don't re-fetch.
+const _contactCache = {}
+async function resolveContact(kind, id) {
+  const key = kind + ':' + id
+  if (_contactCache[key]) return _contactCache[key]
+  const { data } = await api.get(`/contacts/${kind}/${id}`)
+  _contactCache[key] = data
+  return data
+}
+window.quickComm = async (kind, id, channel, ev) => {
+  if (ev) { ev.preventDefault(); ev.stopPropagation() }
+  let data
+  try { data = await resolveContact(kind, id) }
+  catch (err) { toast(err.response?.data?.error || 'Could not load contact details', false); return }
+  const contact = data.contact || {}
+  const routed = data.routed_to
+  if (channel === 'call') {
+    const n = digitsOnly(contact.phone)
+    if (!n) return toast('No phone number on file', false)
+    window.location.href = `tel:${n}`
+  } else if (channel === 'email') {
+    if (!contact.email) return toast('No email address on file', false)
+    window.location.href = `mailto:${contact.email}`
+  } else if (channel === 'sms') {
+    const n = digitsOnly(contact.phone)
+    if (!n) return toast('No phone number on file', false)
+    window.location.href = `sms:${n}`
+  } else if (channel === 'whatsapp') {
+    const n = waNumber(contact.whatsapp || contact.phone)
+    if (!n) return toast('No WhatsApp number on file', false)
+    window.open(`https://wa.me/${n}`, '_blank')
+  }
+  if (routed === 'assigned_agent') toast(`Contacting the assigned agent (${contact.full_name || 'agent'})`)
+  else if (routed === 'support_pool' || routed === 'super_admin_queue') toast('No assigned agent — routed to support')
+}
+
 function toggleSidebar(force) {
   const sidebar = $('appSidebar')
   const overlay = $('appOverlay')
@@ -1086,11 +1144,13 @@ function navItems() {
   const financeQueue = { k: 'finance_queue', i: 'fa-hand-holding-dollar', t: 'Finance Queue' }
   const wallets = { k: 'wallets', i: 'fa-wallet', t: 'Wallets & Payouts' }
   const myWallet = { k: 'wallet', i: 'fa-wallet', t: 'My Wallet' }
+  const crm = { k: 'crm', i: 'fa-headset', t: 'Sales & Support CRM' }
   if (r === 'super_admin' || r === 'admin') return withAccount([...common,
     { k: 'approvals', i: 'fa-clipboard-check', t: 'Approvals' },
     { k: 'inventory', i: 'fa-boxes-stacked', t: 'Inventory' },
     financeQueue,
     { k: 'customers', i: 'fa-users', t: 'Customers' },
+    crm,
     { k: 'contracts', i: 'fa-file-signature', t: 'Purchases' },
     { k: 'agents', i: 'fa-user-tie', t: 'Agents' },
     { k: 'users', i: 'fa-user-gear', t: 'User Accounts' },
@@ -1108,11 +1168,13 @@ function navItems() {
     { k: 'approvals', i: 'fa-clipboard-check', t: 'Approvals' },
     financeQueue,
     { k: 'customers', i: 'fa-users', t: 'Customers' },
+    ...(canDo('view_crm') ? [crm] : []),
     { k: 'contracts', i: 'fa-file-signature', t: 'Purchases' },
     { k: 'repayments', i: 'fa-money-bill-wave', t: 'Repayments' }])
   if (r === 'agent') return withAccount([...common,
     { k: 'onboard', i: 'fa-user-plus', t: 'Add Farmer' },
     { k: 'customers', i: 'fa-users', t: 'My Farmers' },
+    ...(canDo('view_crm') ? [crm] : []),
     ...(canDo('can_manage_inventory') ? [{ k: 'inventory', i: 'fa-boxes-stacked', t: 'My Inventory' }] : []),
     { k: 'contracts', i: 'fa-file-signature', t: 'Credit Purchases' },
     { k: 'shop', i: 'fa-store', t: 'Shop' },
@@ -1122,6 +1184,7 @@ function navItems() {
     { k: 'contracts', i: 'fa-file-signature', t: 'My Purchases' }])
   if (r === 'support') return withAccount([...common,
     { k: 'customers', i: 'fa-users', t: 'Customers' },
+    ...(canDo('view_crm') ? [crm] : []),
     { k: 'repayments', i: 'fa-money-bill-wave', t: 'Repayments' }])
   // Lender / Investor / M&E / Partner: read-only dashboard + relevant views.
   if (['lender', 'investor', 'mne', 'partner'].includes(r)) return withAccount([...common,
@@ -1172,9 +1235,9 @@ function renderApp() {
 }
 window.go = (r) => { state.route = r; toggleSidebar(false); renderApp() }
 function route() {
-  const titles = { dashboard: 'Dashboard', approvals: 'Financing Approvals', inventory: 'Inventory', finance_queue: 'Finance Approval Queue', customers: 'Customers', contracts: 'Purchases & Contracts', agents: 'Agent Management', users: 'User Accounts & Access', amendments: 'Pending Profile Amendments', ledger: 'Unified Payment Ledger', repayments: 'Repayment Performance', onboard: 'Farmer Onboarding', shop: 'Shop', marketplace: 'Equipment Marketplace', exports: 'Data Export & Reports', imports: 'Bulk User Data Upload', backups: 'Automated System Backups', settings: 'Financing & Markup Settings', profile: 'My Account', wallet: 'My Wallet', wallets: 'Wallets & Payouts', api_access: 'API Access', api_management: 'API Management', tenants: 'Payment Tenants' }
+  const titles = { dashboard: 'Dashboard', approvals: 'Financing Approvals', inventory: 'Inventory', finance_queue: 'Finance Approval Queue', customers: 'Customers', crm: 'Sales & Support CRM', contracts: 'Purchases & Contracts', agents: 'Agent Management', users: 'User Accounts & Access', amendments: 'Pending Profile Amendments', ledger: 'Unified Payment Ledger', repayments: 'Repayment Performance', onboard: 'Farmer Onboarding', shop: 'Shop', marketplace: 'Equipment Marketplace', exports: 'Data Export & Reports', imports: 'Bulk User Data Upload', backups: 'Automated System Backups', settings: 'Financing & Markup Settings', profile: 'My Account', wallet: 'My Wallet', wallets: 'Wallets & Payouts', api_access: 'API Access', api_management: 'API Management', tenants: 'Payment Tenants' }
   $('pageTitle').textContent = titles[state.route] || 'Dashboard'
-  const map = { dashboard: viewDashboard, approvals: viewApprovals, inventory: viewInventory, finance_queue: viewFinanceQueue, customers: viewCustomers, contracts: viewContracts, agents: viewAgents, users: viewUsers, amendments: viewAmendments, ledger: viewLedger, repayments: viewRepayments, onboard: viewOnboard, shop: viewShop, marketplace: viewMarketplace, exports: viewExports, imports: viewImports, backups: viewBackups, settings: viewSettings, profile: viewProfile, wallet: viewMyWallet, wallets: viewWallets, api_access: viewApiAccess, api_management: viewApiManagement, tenants: viewTenants }
+  const map = { dashboard: viewDashboard, approvals: viewApprovals, inventory: viewInventory, finance_queue: viewFinanceQueue, customers: viewCustomers, crm: viewCrm, contracts: viewContracts, agents: viewAgents, users: viewUsers, amendments: viewAmendments, ledger: viewLedger, repayments: viewRepayments, onboard: viewOnboard, shop: viewShop, marketplace: viewMarketplace, exports: viewExports, imports: viewImports, backups: viewBackups, settings: viewSettings, profile: viewProfile, wallet: viewMyWallet, wallets: viewWallets, api_access: viewApiAccess, api_management: viewApiManagement, tenants: viewTenants }
   ;(map[state.route] || viewDashboard)()
 }
 
@@ -3596,6 +3659,7 @@ async function viewCustomers() {
     }))
     $('customersBody').innerHTML = rows.map(c => `<tr class="border-t border-slate-100">
       <td class="px-4 py-3"><div class="font-medium">${esc(c.full_name)}</div><div class="text-xs text-slate-400">ID ${esc(c.national_id || '—')}</div></td>
+      <td class="px-4 py-3">${commButtons('customer', c.id)}</td>
       <td class="px-4 py-3">${esc(c.mobile || '—')}</td>
       <td class="px-4 py-3">${esc(c.county || '—')}</td>
       <td class="px-4 py-3">${esc(c.value_chain || '—')}</td>
@@ -3620,7 +3684,7 @@ async function viewCustomers() {
     { key: 'status', label: 'Status', options: [{ v: 'active', t: 'Active' }, { v: 'suspended', t: 'Suspended' }] }
   ] })}
   <div class="card table-card"><table class="w-full text-sm">
-    <thead class="bg-slate-50 text-slate-500 text-xs uppercase"><tr><th class="text-left px-4 py-3">Farmer</th><th class="text-left px-4 py-3">Mobile</th><th class="text-left px-4 py-3">County</th><th class="text-left px-4 py-3">Value Chain</th><th class="text-left px-4 py-3">KYC</th><th class="text-left px-4 py-3">Profile Status</th><th class="text-left px-4 py-3">Risk</th><th></th></tr></thead>
+    <thead class="bg-slate-50 text-slate-500 text-xs uppercase"><tr><th class="text-left px-4 py-3">Farmer</th><th class="text-left px-4 py-3">Contact</th><th class="text-left px-4 py-3">Mobile</th><th class="text-left px-4 py-3">County</th><th class="text-left px-4 py-3">Value Chain</th><th class="text-left px-4 py-3">KYC</th><th class="text-left px-4 py-3">Profile Status</th><th class="text-left px-4 py-3">Risk</th><th></th></tr></thead>
     <tbody id="customersBody"></tbody>
   </table></div>`
   window._rerender_customers()
@@ -3975,6 +4039,264 @@ function userRoleOptions(selected) {
     : ['super_admin', 'admin', 'operations_finance', 'agent', 'lender', 'investor', 'mne', 'partner', 'customer', 'support'].map((r) => ({ key: r, label: roleLabel(r) }))
   return roles.map((r) => `<option value="${r.key}" ${selected === r.key ? 'selected' : ''}>${esc(r.label)}</option>`).join('')
 }
+const TICKET_STATUS_BADGE = { open: 'bg-sky-100 text-sky-700', in_progress: 'bg-amber-100 text-amber-700', escalated: 'bg-red-100 text-red-700', resolved: 'bg-emerald-100 text-emerald-700', closed: 'bg-slate-100 text-slate-500' }
+const TICKET_PRIORITY_BADGE = { low: 'bg-slate-100 text-slate-500', medium: 'bg-sky-100 text-sky-700', high: 'bg-amber-100 text-amber-700', urgent: 'bg-red-100 text-red-700' }
+const TICKET_STATUS_LABEL = { open: 'Open', in_progress: 'In Progress', escalated: 'Escalated', resolved: 'Resolved', closed: 'Closed' }
+let _crmCats = []
+let _crmCanManage = false
+let _crmFilters = { q: '', status: '', category_id: '', assigned_to: '', priority: '' }
+async function viewCrm() {
+  await ensurePermissionMeta()
+  // Load categories (for filters + new ticket) and the assignable staff list.
+  try { const { data } = await api.get('/crm/categories'); _crmCats = data.categories || []; _crmCanManage = !!data.can_manage } catch (_) { _crmCats = [] }
+  const canConfig = canDo('manage_ticket_categories')
+  const canManage = canDo('manage_crm')
+  const catOpts = _crmCats.map(c => `<option value="${c.id}">${esc(c.name)}</option>`).join('')
+  const statusOpts = Object.keys(TICKET_STATUS_LABEL).map(s => `<option value="${s}">${TICKET_STATUS_LABEL[s]}</option>`).join('')
+  const prioOpts = ['low','medium','high','urgent'].map(p => `<option value="${p}">${p[0].toUpperCase()+p.slice(1)}</option>`).join('')
+  $('content').innerHTML = `
+    <div class="action-bar">
+      ${canManage ? `<button onclick="newTicketModal()" class="btn brand-bg text-white px-4 py-2 rounded-lg text-sm"><i class="fas fa-plus mr-1"></i>New Ticket</button>` : ''}
+      ${canConfig ? `<button onclick="crmCategoryConfig()" class="btn bg-slate-100 px-4 py-2 rounded-lg text-sm"><i class="fas fa-sliders mr-1"></i>Configure Categories</button>` : ''}
+    </div>
+    <div class="card p-4 mb-4">
+      <div class="flex flex-wrap gap-2 items-end">
+        <div class="flex-1 min-w-[220px]">
+          <label class="field-label">Search</label>
+          <input id="crm_q" value="${esc(_crmFilters.q)}" placeholder="Customer name, phone, email, ticket ID or keyword…" class="w-full px-3 py-2 border rounded-lg" onkeydown="if(event.key==='Enter')crmApplyFilters()">
+        </div>
+        <div><label class="field-label">Status</label><select id="crm_status" class="px-3 py-2 border rounded-lg"><option value="">All</option>${statusOpts}</select></div>
+        <div><label class="field-label">Category</label><select id="crm_cat" class="px-3 py-2 border rounded-lg"><option value="">All</option>${catOpts}</select></div>
+        <div><label class="field-label">Priority</label><select id="crm_prio" class="px-3 py-2 border rounded-lg"><option value="">All</option>${prioOpts}</select></div>
+        <div><label class="field-label">Assigned to</label><input id="crm_assignee" placeholder="User ID" class="w-28 px-3 py-2 border rounded-lg" value="${esc(_crmFilters.assigned_to)}"></div>
+        <button onclick="crmApplyFilters()" class="btn brand-bg text-white px-4 py-2 rounded-lg text-sm"><i class="fas fa-magnifying-glass mr-1"></i>Search</button>
+        <button onclick="crmClearFilters()" class="btn bg-slate-100 px-3 py-2 rounded-lg text-sm">Clear</button>
+      </div>
+    </div>
+    <div id="crmList" class="card table-card"><div class="p-6 text-center text-slate-400">Loading tickets…</div></div>`
+  // Restore selected filter values.
+  if ($('crm_status')) $('crm_status').value = _crmFilters.status
+  if ($('crm_cat')) $('crm_cat').value = _crmFilters.category_id
+  if ($('crm_prio')) $('crm_prio').value = _crmFilters.priority
+  loadCrmTickets()
+}
+window.crmApplyFilters = () => {
+  _crmFilters = {
+    q: ($('crm_q') || {}).value || '',
+    status: ($('crm_status') || {}).value || '',
+    category_id: ($('crm_cat') || {}).value || '',
+    priority: ($('crm_prio') || {}).value || '',
+    assigned_to: ($('crm_assignee') || {}).value || ''
+  }
+  loadCrmTickets()
+}
+window.crmClearFilters = () => { _crmFilters = { q: '', status: '', category_id: '', assigned_to: '', priority: '' }; viewCrm() }
+async function loadCrmTickets() {
+  const el = $('crmList'); if (!el) return
+  const p = new URLSearchParams()
+  Object.entries(_crmFilters).forEach(([k, v]) => { if (v) p.set(k, v) })
+  let tickets = []
+  try { const { data } = await api.get('/crm/tickets?' + p.toString()); tickets = data.tickets || [] }
+  catch (err) { el.innerHTML = `<div class="p-6 text-center text-red-500">${esc(err.response?.data?.error || 'Failed to load tickets')}</div>`; return }
+  el.innerHTML = `<table class="w-full text-sm">
+    <thead class="bg-slate-50 text-slate-500 text-xs uppercase"><tr>
+      <th class="text-left px-4 py-3">Ticket</th><th class="text-left px-4 py-3">Subject</th><th class="text-left px-4 py-3">Customer/Contact</th><th class="text-left px-4 py-3">Category</th><th class="text-left px-4 py-3">Priority</th><th class="text-left px-4 py-3">Status</th><th class="text-left px-4 py-3">Owner</th><th></th></tr></thead>
+    <tbody>${tickets.map(t => `<tr class="border-t border-slate-100">
+      <td class="px-4 py-3 font-mono text-xs">${esc(t.ticket_ref)}</td>
+      <td class="px-4 py-3">${esc(t.subject)}</td>
+      <td class="px-4 py-3">${esc(t.customer_name || t.contact_name || '—')}<div class="text-xs text-slate-400">${esc(t.contact_phone || t.customer_mobile || '')}</div></td>
+      <td class="px-4 py-3">${esc(t.category_name || '—')}</td>
+      <td class="px-4 py-3"><span class="badge ${TICKET_PRIORITY_BADGE[t.priority] || ''}">${esc(t.priority)}</span></td>
+      <td class="px-4 py-3"><span class="badge ${TICKET_STATUS_BADGE[t.status] || ''}">${esc(TICKET_STATUS_LABEL[t.status] || t.status)}</span></td>
+      <td class="px-4 py-3 text-xs">${esc(t.assigned_name || '—')}</td>
+      <td class="px-4 py-3 text-right"><button onclick="openTicket(${t.id})" class="text-teal-600 hover:underline text-xs">Open</button></td>
+    </tr>`).join('') || '<tr><td colspan="8" class="text-center py-8 text-slate-400">No tickets match your filters</td></tr>'}</tbody>
+  </table>`
+}
+window.openTicket = async (id) => {
+  let data
+  try { data = (await api.get('/crm/tickets/' + id)).data } catch (err) { toast(err.response?.data?.error || 'Could not open ticket', false); return }
+  const t = data.ticket, notes = data.notes || [], canManage = data.can_manage
+  const catOpts = _crmCats.map(c => `<option value="${c.id}" ${Number(c.id) === Number(t.category_id) ? 'selected' : ''}>${esc(c.name)}</option>`).join('')
+  const timeline = notes.map(n => `<div class="border-l-2 border-slate-200 pl-3 py-1">
+      <div class="text-[11px] text-slate-400">${new Date(n.created_at).toLocaleString()} · ${esc(n.author_name || 'system')} ${n.action ? `· <span class="uppercase">${esc(n.action)}</span>` : ''}</div>
+      <div class="text-sm text-slate-700">${esc(n.note)}</div>
+    </div>`).join('') || '<div class="text-xs text-slate-400">No notes yet.</div>'
+  showModal(`<div>
+    <div class="flex items-center justify-between mb-1">
+      <h3 class="font-bold text-lg">${esc(t.subject)}</h3>
+      <span class="badge ${TICKET_STATUS_BADGE[t.status] || ''}">${esc(TICKET_STATUS_LABEL[t.status] || t.status)}</span>
+    </div>
+    <p class="text-xs text-slate-500 mb-3">${esc(t.ticket_ref)} · ${esc(t.category_name || 'Uncategorized')} · Priority <b>${esc(t.priority)}</b> · Owner ${esc(t.assigned_name || '—')} · Created by ${esc(t.created_by_name || '—')}</p>
+    <div class="bg-slate-50 rounded-lg p-3 text-sm mb-3">
+      <div><b>Customer/Contact:</b> ${esc(t.customer_name || t.contact_name || '—')} ${t.contact_phone || t.customer_mobile ? '· ' + esc(t.contact_phone || t.customer_mobile) : ''} ${t.contact_email ? '· ' + esc(t.contact_email) : ''}</div>
+      ${t.description ? `<div class="mt-2 whitespace-pre-wrap">${esc(t.description)}</div>` : ''}
+      ${t.resolution ? `<div class="mt-2 p-2 bg-emerald-50 border border-emerald-200 rounded text-emerald-800"><b>Resolution:</b> ${esc(t.resolution)}</div>` : ''}
+    </div>
+    <div class="mb-3">
+      <div class="text-[11px] font-semibold text-slate-500 uppercase mb-1">Timeline</div>
+      <div class="space-y-1 max-h-40 overflow-auto">${timeline}</div>
+    </div>
+    ${canManage ? `
+    <div class="border-t pt-3 space-y-3">
+      <div>
+        <label class="field-label">Add note</label>
+        <textarea id="tk_note" class="w-full px-3 py-2 border rounded-lg text-sm min-h-16" placeholder="Internal note / update…"></textarea>
+        <button onclick="ticketAddNote(${t.id})" class="btn bg-slate-100 px-3 py-1.5 rounded-lg text-xs mt-1"><i class="fas fa-comment mr-1"></i>Add note</button>
+      </div>
+      <div class="grid grid-cols-2 gap-3">
+        <div><label class="field-label">Priority</label><select id="tk_prio" class="w-full px-3 py-2 border rounded-lg">${['low','medium','high','urgent'].map(p => `<option value="${p}" ${t.priority === p ? 'selected' : ''}>${p}</option>`).join('')}</select></div>
+        <div><label class="field-label">Category</label><select id="tk_cat" class="w-full px-3 py-2 border rounded-lg">${catOpts}</select></div>
+        <div><label class="field-label">Reassign to (User ID)</label><input id="tk_assignee" class="w-full px-3 py-2 border rounded-lg" value="${esc(t.assigned_to || '')}"></div>
+        <div><label class="field-label">Status</label><select id="tk_status" class="w-full px-3 py-2 border rounded-lg">${Object.keys(TICKET_STATUS_LABEL).map(s => `<option value="${s}" ${t.status === s ? 'selected' : ''}>${TICKET_STATUS_LABEL[s]}</option>`).join('')}</select></div>
+      </div>
+      <div><label class="field-label">Resolution / escalation note</label><textarea id="tk_resolution" class="w-full px-3 py-2 border rounded-lg text-sm min-h-16" placeholder="Final resolution notes, or why you are escalating…">${esc(t.resolution || '')}</textarea></div>
+      <div class="flex flex-wrap gap-2">
+        <button onclick="ticketResolve(${t.id})" class="btn bg-emerald-600 text-white px-4 py-2 rounded-lg text-sm"><i class="fas fa-check mr-1"></i>Mark as Resolved</button>
+        <button onclick="ticketEscalate(${t.id})" class="btn bg-red-600 text-white px-4 py-2 rounded-lg text-sm"><i class="fas fa-arrow-up-right-dots mr-1"></i>Escalate</button>
+        <button onclick="ticketSave(${t.id})" class="btn brand-bg text-white px-4 py-2 rounded-lg text-sm"><i class="fas fa-save mr-1"></i>Save Changes</button>
+        <button onclick="closeModal()" class="btn bg-slate-100 px-4 py-2 rounded-lg text-sm">Close</button>
+      </div>
+    </div>` : `<div class="flex justify-end"><button onclick="closeModal()" class="btn bg-slate-100 px-4 py-2 rounded-lg text-sm">Close</button></div>`}
+  </div>`)
+}
+window.ticketAddNote = async (id) => {
+  const note = ($('tk_note') || {}).value || ''
+  if (!note.trim()) return toast('Enter a note first', false)
+  try { await api.post(`/crm/tickets/${id}/notes`, { note }); toast('Note added'); openTicket(id) }
+  catch (err) { toast(err.response?.data?.error || 'Failed', false) }
+}
+window.ticketSave = async (id) => {
+  const payload = {
+    status: ($('tk_status') || {}).value, priority: ($('tk_prio') || {}).value,
+    category_id: ($('tk_cat') || {}).value || null, assigned_to: ($('tk_assignee') || {}).value || null,
+    resolution: ($('tk_resolution') || {}).value || null
+  }
+  try { await api.put(`/crm/tickets/${id}`, payload); closeModal(); toast('Ticket updated'); loadCrmTickets() }
+  catch (err) { toast(err.response?.data?.error || 'Failed', false) }
+}
+window.ticketResolve = async (id) => {
+  const resolution = ($('tk_resolution') || {}).value || ''
+  if (!resolution.trim()) return toast('Add a resolution note before resolving', false)
+  try { await api.put(`/crm/tickets/${id}`, { status: 'resolved', resolution }); closeModal(); toast('Ticket resolved'); loadCrmTickets() }
+  catch (err) { toast(err.response?.data?.error || 'Failed', false) }
+}
+window.ticketEscalate = async (id) => {
+  const note = ($('tk_resolution') || {}).value || ''
+  if (!note.trim()) return toast('Add an internal note explaining the escalation', false)
+  const payload = { status: 'escalated', priority: ($('tk_prio') || {}).value, category_id: ($('tk_cat') || {}).value || null, assigned_to: ($('tk_assignee') || {}).value || null, note }
+  try { await api.put(`/crm/tickets/${id}`, payload); closeModal(); toast('Ticket escalated'); loadCrmTickets() }
+  catch (err) { toast(err.response?.data?.error || 'Failed', false) }
+}
+window.newTicketModal = async () => {
+  if (!_crmCats.length) { try { const { data } = await api.get('/crm/categories'); _crmCats = data.categories || [] } catch (_) {} }
+  const catOpts = _crmCats.map(c => `<option value="${c.id}">${esc(c.name)}</option>`).join('')
+  showModal(`<h3 class="font-bold mb-1"><i class="fas fa-ticket text-teal-600 mr-1"></i>New Ticket</h3>
+    <p class="text-xs text-slate-500 mb-3">Log an issue on behalf of a user or customer. Link a customer to auto-route the ticket to their assigned agent.</p>
+    <div class="space-y-3 text-sm">
+      <div><label class="field-label">Subject</label><input id="nt_subject" class="w-full px-3 py-2 border rounded-lg" placeholder="Short summary of the issue"></div>
+      <div><label class="field-label">Description</label><textarea id="nt_desc" class="w-full px-3 py-2 border rounded-lg min-h-20" placeholder="Detailed issue description"></textarea></div>
+      <div class="grid grid-cols-2 gap-3">
+        <div><label class="field-label">Category</label><select id="nt_cat" class="w-full px-3 py-2 border rounded-lg"><option value="">Uncategorized</option>${catOpts}</select></div>
+        <div><label class="field-label">Priority</label><select id="nt_prio" class="w-full px-3 py-2 border rounded-lg">${['low','medium','high','urgent'].map(p => `<option value="${p}" ${p==='medium'?'selected':''}>${p}</option>`).join('')}</select></div>
+        <div><label class="field-label">Link customer (ID, optional)</label><input id="nt_customer" class="w-full px-3 py-2 border rounded-lg" placeholder="Customer ID"></div>
+        <div><label class="field-label">Contact name</label><input id="nt_cname" class="w-full px-3 py-2 border rounded-lg"></div>
+        <div><label class="field-label">Contact phone</label><input id="nt_cphone" class="w-full px-3 py-2 border rounded-lg"></div>
+        <div><label class="field-label">Contact email</label><input id="nt_cemail" class="w-full px-3 py-2 border rounded-lg"></div>
+      </div>
+    </div>
+    <div class="flex gap-2 mt-4">
+      <button onclick="createTicket()" class="btn flex-1 brand-bg text-white py-2 rounded-lg text-sm">Create Ticket</button>
+      <button onclick="closeModal()" class="btn px-4 bg-slate-100 rounded-lg text-sm">Cancel</button>
+    </div>`)
+}
+window.createTicket = async () => {
+  const payload = {
+    subject: ($('nt_subject') || {}).value || '',
+    description: ($('nt_desc') || {}).value || '',
+    category_id: ($('nt_cat') || {}).value || null,
+    priority: ($('nt_prio') || {}).value || 'medium',
+    customer_id: ($('nt_customer') || {}).value || null,
+    contact_name: ($('nt_cname') || {}).value || null,
+    contact_phone: ($('nt_cphone') || {}).value || null,
+    contact_email: ($('nt_cemail') || {}).value || null
+  }
+  if (!payload.subject.trim()) return toast('A subject is required', false)
+  try { const { data } = await api.post('/crm/tickets', payload); closeModal(); toast('Ticket ' + data.ticket_ref + ' created'); loadCrmTickets() }
+  catch (err) { toast(err.response?.data?.error || 'Failed to create ticket', false) }
+}
+// ---- Category configuration dashboard (Super-Admin) -----------------------
+window.crmCategoryConfig = async () => {
+  let cats = [], staff = []
+  try { const { data } = await api.get('/crm/categories?all=1'); cats = data.categories || [] } catch (_) {}
+  try { const { data } = await api.get('/users'); staff = (data.users || []).filter(u => u.role !== 'customer') } catch (_) {}
+  window._crmStaff = staff
+  const staffName = (uid) => { const u = staff.find(x => String(x.id) === String(uid)); return u ? u.full_name : uid }
+  const rows = cats.map(cat => `<div class="border rounded-lg p-3 mb-2">
+      <div class="flex items-center justify-between">
+        <div><b>${esc(cat.name)}</b> <span class="text-[10px] text-slate-400">(${esc(cat.category_key)})</span> ${Number(cat.active) ? '' : '<span class="badge bg-amber-100 text-amber-700 ml-1">inactive</span>'}</div>
+        <div class="flex gap-1">
+          <button onclick="editCategoryModal(${cat.id})" class="btn px-2 py-1 bg-slate-100 rounded text-xs"><i class="fas fa-pen"></i></button>
+          <button onclick="assignCategoryModal(${cat.id})" class="btn px-2 py-1 bg-slate-100 rounded text-xs"><i class="fas fa-user-plus mr-1"></i>Handlers</button>
+          <button onclick="deleteCategory(${cat.id})" class="btn px-2 py-1 bg-red-50 text-red-600 rounded text-xs"><i class="fas fa-trash"></i></button>
+        </div>
+      </div>
+      <div class="text-xs text-slate-500 mt-1">${esc(cat.description || '')}</div>
+      <div class="text-[11px] text-slate-500 mt-1">Handlers: ${(cat.assignees || []).map(a => esc(a.full_name || a.user_id)).join(', ') || '<span class="text-slate-400">general support pool</span>'}</div>
+    </div>`).join('')
+  showModal(`<h3 class="font-bold mb-1"><i class="fas fa-sliders text-teal-600 mr-1"></i>Ticket Categories</h3>
+    <p class="text-xs text-slate-500 mb-3">Configure categories/headers and assign the users/teams that handle each. Tickets a user handles are the only ones they can see (unless assigned/creator).</p>
+    <div class="max-h-[55vh] overflow-auto">${rows || '<div class="text-xs text-slate-400">No categories yet.</div>'}</div>
+    <div class="flex gap-2 mt-4">
+      <button onclick="editCategoryModal(null)" class="btn flex-1 brand-bg text-white py-2 rounded-lg text-sm"><i class="fas fa-plus mr-1"></i>Add Category</button>
+      <button onclick="closeModal()" class="btn px-4 bg-slate-100 rounded-lg text-sm">Close</button>
+    </div>`)
+}
+window.editCategoryModal = (id) => {
+  const cat = id ? (window._crmStaff, null) : null // fetched fresh below when editing
+  const doShow = (c) => {
+    showModal(`<h3 class="font-bold mb-3">${c ? 'Edit' : 'Add'} category</h3>
+      <div class="space-y-3 text-sm">
+        <div><label class="field-label">Name</label><input id="cc_name" value="${esc(c?.name || '')}" class="w-full px-3 py-2 border rounded-lg"></div>
+        <div><label class="field-label">Description</label><textarea id="cc_desc" class="w-full px-3 py-2 border rounded-lg min-h-16">${esc(c?.description || '')}</textarea></div>
+        <label class="flex items-center gap-2"><input type="checkbox" id="cc_active" ${!c || Number(c.active) ? 'checked' : ''}> Active</label>
+      </div>
+      <div class="flex gap-2 mt-4"><button onclick="saveCategory(${c ? c.id : 'null'})" class="btn flex-1 brand-bg text-white py-2 rounded-lg text-sm">Save</button><button onclick="crmCategoryConfig()" class="btn px-4 bg-slate-100 rounded-lg text-sm">Back</button></div>`)
+  }
+  if (!id) return doShow(null)
+  api.get('/crm/categories?all=1').then(({ data }) => doShow((data.categories || []).find(x => x.id === id))).catch(() => doShow(null))
+}
+window.saveCategory = async (id) => {
+  const payload = { name: ($('cc_name') || {}).value || '', description: ($('cc_desc') || {}).value || '', active: !!($('cc_active') || {}).checked }
+  if (!payload.name.trim()) return toast('Name is required', false)
+  try {
+    if (id) await api.put('/crm/categories/' + id, payload); else await api.post('/crm/categories', payload)
+    toast('Category saved'); crmCategoryConfig()
+  } catch (err) { toast(err.response?.data?.error || 'Failed', false) }
+}
+window.deleteCategory = async (id) => {
+  if (!confirm('Delete this category? (Only allowed if it has no tickets.)')) return
+  try { await api.delete('/crm/categories/' + id); toast('Deleted'); crmCategoryConfig() }
+  catch (err) { toast(err.response?.data?.error || 'Failed', false) }
+}
+window.assignCategoryModal = async (id) => {
+  let cat = null, staff = window._crmStaff || []
+  try { const { data } = await api.get('/crm/categories?all=1'); cat = (data.categories || []).find(x => x.id === id) } catch (_) {}
+  if (!staff.length) { try { const { data } = await api.get('/users'); staff = (data.users || []).filter(u => u.role !== 'customer'); window._crmStaff = staff } catch (_) {} }
+  const assigned = new Set((cat?.assignees || []).map(a => String(a.user_id)))
+  const list = staff.map(u => `<label class="flex items-center gap-2 py-1 text-sm"><input type="checkbox" class="cc_assignee" value="${esc(String(u.id))}" ${assigned.has(String(u.id)) ? 'checked' : ''}> ${esc(u.full_name)} <span class="text-[10px] text-slate-400">${esc(roleLabel(u.role))}</span></label>`).join('')
+  showModal(`<h3 class="font-bold mb-1">Handlers for "${esc(cat?.name || '')}"</h3>
+    <p class="text-xs text-slate-500 mb-3">Select the users/teams who handle this category. They will see and own its tickets.</p>
+    <div class="max-h-[50vh] overflow-auto border rounded-lg p-3">${list || '<div class="text-xs text-slate-400">No staff users.</div>'}</div>
+    <div class="flex gap-2 mt-4"><button onclick="saveCategoryAssignees(${id})" class="btn flex-1 brand-bg text-white py-2 rounded-lg text-sm">Save Handlers</button><button onclick="crmCategoryConfig()" class="btn px-4 bg-slate-100 rounded-lg text-sm">Back</button></div>`)
+}
+window.saveCategoryAssignees = async (id) => {
+  const ids = Array.from(document.querySelectorAll('.cc_assignee:checked')).map(el => el.value)
+  try { await api.put(`/crm/categories/${id}/assignees`, { user_ids: ids }); toast('Handlers updated'); crmCategoryConfig() }
+  catch (err) { toast(err.response?.data?.error || 'Failed', false) }
+}
+
+
 async function viewUsers() {
   await ensurePermissionMeta()
   const { data } = await api.get('/users')
@@ -3990,6 +4312,7 @@ async function viewUsers() {
     }))
     $('usersBody').innerHTML = rows.map(u => `<tr class="border-t border-slate-100">
         <td class="px-4 py-3 font-medium">${esc(u.full_name)}</td>
+        <td class="px-4 py-3">${commButtons('user', u.id)}</td>
         <td class="px-4 py-3">${esc(u.label || '—')}</td>
         <td class="px-4 py-3">${esc(roleLabel(u.role))}</td>
         <td class="px-4 py-3">${esc(u.phone)}</td>
@@ -4011,7 +4334,7 @@ async function viewUsers() {
       { key: 'status', label: 'Status', options: [{ v: 'active', t: 'Active' }, { v: 'suspended', t: 'Suspended' }] }
     ] })}
     <div class="card table-card"><table class="w-full text-sm">
-      <thead class="bg-slate-50 text-slate-500 text-xs uppercase"><tr><th class="text-left px-4 py-3">Name</th><th class="text-left px-4 py-3">Label</th><th class="text-left px-4 py-3">Role</th><th class="text-left px-4 py-3">Phone</th><th class="text-left px-4 py-3">Permissions</th><th class="text-left px-4 py-3">Status</th><th></th></tr></thead>
+      <thead class="bg-slate-50 text-slate-500 text-xs uppercase"><tr><th class="text-left px-4 py-3">Name</th><th class="text-left px-4 py-3">Contact</th><th class="text-left px-4 py-3">Label</th><th class="text-left px-4 py-3">Role</th><th class="text-left px-4 py-3">Phone</th><th class="text-left px-4 py-3">Permissions</th><th class="text-left px-4 py-3">Status</th><th></th></tr></thead>
       <tbody id="usersBody"></tbody>
     </table></div>`
   window._rerender_users()

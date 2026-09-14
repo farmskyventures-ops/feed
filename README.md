@@ -44,6 +44,31 @@ executes payments and dispatches SMS, OTP and email on its behalf.
 - **Admin tooling** — financing approvals, finance settings (markup / processing
   fees), wallet assignment & earning rules, payout batches, pending-payment
   retrieval, data export (CSV / Excel), audit logs.
+- **Dynamic pricing & agreements per inventory item** — cash & financed prices
+  each support Percentage / Fixed-amount markup or a Manual price, plus flexible
+  tenure (Monthly / Yearly / Custom cycle). Agreements are supplied per payment
+  path via a dropdown — **Upload document** (PDF or Word `.doc/.docx`) or **Type
+  agreement** (built-in rich-text editor) — rendered at checkout for digital
+  acceptance or offline download & signing. (Murabaha stays interest-free.)
+- **Reassign customer/user between agents** (`manage_customer_reassignment`) —
+  transfer a farmer between agents; new agent gains full access, former agent is
+  revoked, and the transfer is logged to `customer_reassignments` + audit trail.
+- **Quick Communication Action Buttons** — per user/customer row **Call / Email /
+  Text (SMS) / WhatsApp** buttons that open the device dialer, mail, SMS app or
+  WhatsApp with the number/address pre-filled. **Smart routing** loads a
+  customer's **assigned agent** contact, falling back to the general support pool
+  / Super-Admin queue when unassigned. Only whitelisted fields (`phone`,
+  `whatsapp`, `email`) are exposed (data masking).
+- **Sales & Support CRM (Ticketing)** — multi-role (Super-Admin, Admin, Agent,
+  Support, Operations & any role granted `view_crm` / `manage_crm`). Create
+  tickets on behalf of users/customers; **configurable categories/headers**
+  (Sales, Technical, Payments, Agronomy + custom) with a Super-Admin dashboard to
+  assign the users/teams handling each (`manage_ticket_categories`). **Global
+  search** (name, phone, email, ticket ID, keyword) + **dynamic filters** (Status,
+  Category, Assignee, Priority). Actionable ticket view with a notes timeline,
+  **Quick Resolve** and **Escalate**. RBAC scopes tickets to assigned categories
+  and every request validates the caller's role; all search inputs use
+  parameterized queries.
 
 ---
 
@@ -101,6 +126,14 @@ KCB Buni, TalkSASA SMS/OTP, Resend email). Feed does **not** set them directly.
 
 > **Local dev fallback:** if the gateway variables are absent, payments fall back
 > to direct M-Pesa Daraja simulation so checkout stays testable offline.
+
+### Environment variables for the CRM & Quick-Communication features
+**None are required.** The **Quick Communication buttons** use the device's
+native URI schemes on the client (`tel:`, `mailto:`, `sms:`, `https://wa.me/`),
+so no gateway/key is needed. The **Sales & Support CRM** is fully database-backed
+(tables added by the auto-applied migration) and reuses the existing auth/RBAC.
+A per-user WhatsApp number is stored on `users`/`customers` and defaults to the
+phone number when unset.
 
 ---
 
