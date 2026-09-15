@@ -1728,8 +1728,44 @@ app.post('/api/customers', requireAuth, requireRole('agent', 'admin', 'super_adm
     saccoMember ? 'yes' : 'no',
     b.id_front_url || null, b.id_back_url || null
   ).run()
+  let customerId: any = r.meta.last_row_id
+  if (!customerId && b.national_id) {
+    const row = await c.env.DB.prepare(`SELECT id FROM customers WHERE national_id=?`).bind(b.national_id).first<any>()
+    customerId = row?.id
+  }
   await audit(c, user.id, 'onboard', 'customer', b.full_name)
-  return c.json({ id: r.meta.last_row_id })
+  // OPTIONAL LOGIN PROVISIONING (Field Visit conversion / onboarding):
+  // When create_login is set, provision a linked customer `users` account and
+  // SMS the login credentials (Phone Number + first-time OTP password). The
+  // customer can then access their own dashboard. Non-fatal: a failure here
+  // still returns the created customer so onboarding never crashes.
+  let credentials: any = null
+  if (b.create_login) {
+    try {
+      const phone = normalizePhone(String(b.mobile || ''))
+      if (phone) {
+        const existing = await c.env.DB.prepare(`SELECT id FROM users WHERE phone=?`).bind(phone).first<any>()
+        let userId: any = existing?.id
+        if (!userId) {
+          const email = `customer_${phone}@${PLACEHOLDER_EMAIL_DOMAIN}`
+          const orgId = (await resolveCreatorOrgId(c, user)) ?? (await resolveDefaultOrgId(c))
+          const withOrg = (await usersHasOrgId(c)) && orgId != null
+          const tmpHash = await hashPassword(genTempPassword())
+          const ins = withOrg
+            ? await c.env.DB.prepare(`INSERT INTO users (full_name, phone, email, password, role, status, region, password_set, label, org_id) VALUES (?,?,?,?, 'customer', 'active', ?, 0, 'Farmer', ?)`).bind(b.full_name, phone, email, tmpHash, b.county || null, orgId).run()
+            : await c.env.DB.prepare(`INSERT INTO users (full_name, phone, email, password, role, status, region, password_set, label) VALUES (?,?,?,?, 'customer', 'active', ?, 0, 'Farmer')`).bind(b.full_name, phone, email, tmpHash, b.county || null).run()
+          userId = ins.meta.last_row_id
+          if (!userId) { const u = await c.env.DB.prepare(`SELECT id FROM users WHERE phone=?`).bind(phone).first<any>(); userId = u?.id }
+        }
+        if (userId) {
+          await c.env.DB.prepare(`UPDATE customers SET user_id=? WHERE id=?`).bind(String(userId), customerId).run()
+          const t = await issueTempPassword(c, { userId, phone, fullName: b.full_name })
+          credentials = { phone, temporary_password: t.tempPassword, sms_simulated: !!t.sms.simulated, sms_success: t.sms.success !== false }
+        }
+      }
+    } catch (_) { /* non-fatal */ }
+  }
+  return c.json({ id: customerId, credentials })
 })
 // Update farmer profile (admin + agent for their own customer)
 app.put('/api/customers/:id', requireAuth, async (c) => {
@@ -4379,6 +4415,20 @@ function canReassignCustomers(user: SessionUser) {
   return user.role === 'admin' || user.role === 'super_admin' ||
     hasPermission(user, 'manage_customer_reassignment')
 }
+// Field Visit & Conversion: Super-Admins/admins always, plus any user granted
+// the delegated `manage_field_visits` permission (agents get it by default).
+function canManageFieldVisits(user: SessionUser) {
+  return user.role === 'admin' || user.role === 'super_admin' ||
+    hasPermission(user, 'manage_field_visits')
+}
+// Whether `user` may see/act on an individual field-visit row. Agents are
+// strictly scoped to visits they logged; admins/super-admins have global
+// visibility (matches the RBAC visibility rules of the rest of the app).
+function isFieldVisitAccessible(user: SessionUser, fv: any): boolean {
+  if (!fv) return false
+  if (['admin', 'super_admin'].includes(user.role)) return true
+  return String(fv.agent_id) === String(user.id)
+}
 // Whether `user` may access an individual customer record. Data + functionality
 // are strictly scoped to the account: an agent may only reach a farmer they
 // currently own; a customer only their own record. Staff / admins / authorized
@@ -4755,6 +4805,88 @@ app.put('/api/crm/tickets/:id', requireAuth, async (c) => {
   await c.env.DB.prepare(`INSERT INTO crm_ticket_notes (ticket_id, author_id, note, action) VALUES (?,?,?,?)`)
     .bind(id, String(user.id), noteText, action).run()
   await audit(c, user.id, action, 'crm_ticket', t.ticket_ref)
+  return c.json({ ok: true })
+})
+
+// ============================================================================
+// FIELD VISIT & CONVERSION WORKFLOW
+//   RBAC: manage_field_visits (agents by default; delegable by Super-Admin).
+//   Field agents log prospect interactions, then CONVERT a prospect into an
+//   onboarded user via the existing /api/customers path (with create_login),
+//   which provisions login credentials + SMS (Phone + first-time OTP).
+//   Scoping: agents see only their own visits; admins/super-admins see all.
+// ============================================================================
+
+// List field visits (agent-scoped; ?status=prospect|converted optional filter).
+app.get('/api/field-visits', requireAuth, async (c) => {
+  const user = c.get('user') as SessionUser
+  if (!canManageFieldVisits(user)) return c.json({ error: 'Forbidden' }, 403)
+  const status = c.req.query('status')
+  const isAdmin = ['admin', 'super_admin'].includes(user.role)
+  const clauses: string[] = []
+  const params: any[] = []
+  if (!isAdmin) { clauses.push('agent_id = ?'); params.push(String(user.id)) }
+  if (status === 'prospect' || status === 'converted') { clauses.push('status = ?'); params.push(status) }
+  const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : ''
+  const { results } = await c.env.DB.prepare(
+    `SELECT fv.*, u.full_name AS agent_name
+       FROM field_visits fv
+       LEFT JOIN users u ON CAST(u.id AS TEXT) = fv.agent_id
+       ${where}
+      ORDER BY fv.created_at DESC, fv.id DESC`
+  ).bind(...params).all()
+  return c.json({ visits: (results || []).map((v: any) => ({ ...v, profile: safeJson(v.profile_json, {}) })) })
+})
+
+// Create a field visit (log a prospect interaction).
+app.post('/api/field-visits', requireAuth, async (c) => {
+  const user = c.get('user') as SessionUser
+  if (!canManageFieldVisits(user)) return c.json({ error: 'Forbidden' }, 403)
+  const b = await c.req.json()
+  const prospect = String(b.prospect_name || '').trim()
+  if (!prospect) return c.json({ error: 'Prospect name is required.' }, 400)
+  const profileType = ['farming', 'agsme'].includes(String(b.profile_type)) ? String(b.profile_type) : null
+  const farmingType = profileType === 'farming' && ['livestock', 'crop'].includes(String(b.farming_type)) ? String(b.farming_type) : null
+  const phone = b.contact_phone ? normalizePhone(String(b.contact_phone)) : null
+  const visitRef = ref('FV')
+  const profileJson = JSON.stringify(b.profile || {})
+  await c.env.DB.prepare(
+    `INSERT INTO field_visits (visit_ref, agent_id, visit_date, location, notes, prospect_name, contact_phone, profile_type, farming_type, profile_json, status)
+     VALUES (?,?,?,?,?,?,?,?,?,?, 'prospect')`
+  ).bind(
+    visitRef, String(user.id), b.visit_date || null, b.location || null, b.notes || null,
+    prospect, phone, profileType, farmingType, profileJson
+  ).run()
+  const row = await c.env.DB.prepare(`SELECT id FROM field_visits WHERE visit_ref=?`).bind(visitRef).first<any>()
+  await audit(c, user.id, 'create', 'field_visit', visitRef)
+  return c.json({ id: row?.id, visit_ref: visitRef })
+})
+
+// Get a single field visit (scoped).
+app.get('/api/field-visits/:id', requireAuth, async (c) => {
+  const user = c.get('user') as SessionUser
+  if (!canManageFieldVisits(user)) return c.json({ error: 'Forbidden' }, 403)
+  const id = c.req.param('id')
+  const fv = await c.env.DB.prepare(`SELECT * FROM field_visits WHERE id=?`).bind(id).first<any>()
+  if (!fv || !isFieldVisitAccessible(user, fv)) return c.json({ error: 'Not found' }, 404)
+  return c.json({ visit: { ...fv, profile: safeJson(fv.profile_json, {}) } })
+})
+
+// Mark a field visit as converted + link the created customer. This is called
+// by the client AFTER a successful onboarding (POST /api/customers) so the two
+// records are joined and the prospect drops out of the "to convert" list.
+app.post('/api/field-visits/:id/convert', requireAuth, async (c) => {
+  const user = c.get('user') as SessionUser
+  if (!canManageFieldVisits(user)) return c.json({ error: 'Forbidden' }, 403)
+  const id = c.req.param('id')
+  const b = await c.req.json().catch(() => ({}))
+  const fv = await c.env.DB.prepare(`SELECT * FROM field_visits WHERE id=?`).bind(id).first<any>()
+  if (!fv || !isFieldVisitAccessible(user, fv)) return c.json({ error: 'Not found' }, 404)
+  if (fv.status === 'converted') return c.json({ error: 'This prospect has already been converted.' }, 409)
+  await c.env.DB.prepare(
+    `UPDATE field_visits SET status='converted', converted_customer_id=?, converted_at=CURRENT_TIMESTAMP, converted_by=?, updated_at=CURRENT_TIMESTAMP WHERE id=?`
+  ).bind(b.customer_id || null, String(user.id), id).run()
+  await audit(c, user.id, 'convert', 'field_visit', fv.visit_ref)
   return c.json({ ok: true })
 })
 

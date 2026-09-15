@@ -69,6 +69,26 @@ executes payments and dispatches SMS, OTP and email on its behalf.
   **Quick Resolve** and **Escalate**. RBAC scopes tickets to assigned categories
   and every request validates the caller's role; all search inputs use
   parameterized queries.
+- **Field Visit & Conversion Workflow** (`manage_field_visits`) — field agents
+  capture interactions with prospective clients during field operations, then
+  convert prospects into onboarded users triggering automated onboarding.
+  **Log a Field Visit** with Visit Details (Date, Location/Market/Town, Notes),
+  Contact Info (Prospect Name, Phone) and a **Farm/Business Profile** dropdown —
+  **Farming** or **AgSME (Business)**. When *Farming*, a *Type of farming*
+  dropdown reveals a **Livestock** profile (Type = Dairy/Poultry/Pig/Beef/Fish,
+  current number, stage of production cycle, maximum capacity, feed brand, buying
+  price, distributor, bags per week) **or** a **Crop** profile (type, acreage,
+  stage, buying price, distributor, volumes per cycle, plus a multi-row
+  **"Add Input"** capture of Category → Name, e.g. Fertilizer → DAP); the rich
+  conditional profile is stored as JSON. A **list view** of every prospect
+  spoken to (filterable Prospect / Converted) exposes a **Convert** button that
+  opens the standard onboarding form **prefilled** from the captured data. On
+  submit the prospect becomes a customer **with a login account**, the visit is
+  marked *converted* and linked, and the user receives their **Phone Number + a
+  first-time OTP password by SMS** (via the existing OTP/temp-password
+  lifecycle). RBAC: available under the Super-Admin permission panel and
+  assignable to any user; **agents see only visits they logged**, Super-Admins/
+  Admins have global visibility. Granted to agents by default.
 
 ---
 
@@ -133,7 +153,11 @@ native URI schemes on the client (`tel:`, `mailto:`, `sms:`, `https://wa.me/`),
 so no gateway/key is needed. The **Sales & Support CRM** is fully database-backed
 (tables added by the auto-applied migration) and reuses the existing auth/RBAC.
 A per-user WhatsApp number is stored on `users`/`customers` and defaults to the
-phone number when unset.
+phone number when unset. The **Field Visit & Conversion Workflow** is likewise
+fully database-backed (the `field_visits` table + `manage_field_visits`
+permission are added by the auto-applied migration `0035_field_visits.sql`);
+conversion SMS credentials reuse the existing central-gateway SMS/OTP channel —
+**no new environment variables are required.**
 
 ---
 

@@ -1145,11 +1145,13 @@ function navItems() {
   const wallets = { k: 'wallets', i: 'fa-wallet', t: 'Wallets & Payouts' }
   const myWallet = { k: 'wallet', i: 'fa-wallet', t: 'My Wallet' }
   const crm = { k: 'crm', i: 'fa-headset', t: 'Sales & Support CRM' }
+  const fieldVisits = { k: 'field_visits', i: 'fa-clipboard-user', t: 'Field Visits' }
   if (r === 'super_admin' || r === 'admin') return withAccount([...common,
     { k: 'approvals', i: 'fa-clipboard-check', t: 'Approvals' },
     { k: 'inventory', i: 'fa-boxes-stacked', t: 'Inventory' },
     financeQueue,
     { k: 'customers', i: 'fa-users', t: 'Customers' },
+    fieldVisits,
     crm,
     { k: 'contracts', i: 'fa-file-signature', t: 'Purchases' },
     { k: 'agents', i: 'fa-user-tie', t: 'Agents' },
@@ -1174,6 +1176,7 @@ function navItems() {
   if (r === 'agent') return withAccount([...common,
     { k: 'onboard', i: 'fa-user-plus', t: 'Add Farmer' },
     { k: 'customers', i: 'fa-users', t: 'My Farmers' },
+    ...(canDo('manage_field_visits') ? [fieldVisits] : []),
     ...(canDo('view_crm') ? [crm] : []),
     ...(canDo('can_manage_inventory') ? [{ k: 'inventory', i: 'fa-boxes-stacked', t: 'My Inventory' }] : []),
     { k: 'contracts', i: 'fa-file-signature', t: 'Credit Purchases' },
@@ -1235,9 +1238,9 @@ function renderApp() {
 }
 window.go = (r) => { state.route = r; toggleSidebar(false); renderApp() }
 function route() {
-  const titles = { dashboard: 'Dashboard', approvals: 'Financing Approvals', inventory: 'Inventory', finance_queue: 'Finance Approval Queue', customers: 'Customers', crm: 'Sales & Support CRM', contracts: 'Purchases & Contracts', agents: 'Agent Management', users: 'User Accounts & Access', amendments: 'Pending Profile Amendments', ledger: 'Unified Payment Ledger', repayments: 'Repayment Performance', onboard: 'Farmer Onboarding', shop: 'Shop', marketplace: 'Equipment Marketplace', exports: 'Data Export & Reports', imports: 'Bulk User Data Upload', backups: 'Automated System Backups', settings: 'Financing & Markup Settings', profile: 'My Account', wallet: 'My Wallet', wallets: 'Wallets & Payouts', api_access: 'API Access', api_management: 'API Management', tenants: 'Payment Tenants' }
+  const titles = { dashboard: 'Dashboard', approvals: 'Financing Approvals', inventory: 'Inventory', finance_queue: 'Finance Approval Queue', customers: 'Customers', field_visits: 'Field Visits & Conversion', crm: 'Sales & Support CRM', contracts: 'Purchases & Contracts', agents: 'Agent Management', users: 'User Accounts & Access', amendments: 'Pending Profile Amendments', ledger: 'Unified Payment Ledger', repayments: 'Repayment Performance', onboard: 'Farmer Onboarding', shop: 'Shop', marketplace: 'Equipment Marketplace', exports: 'Data Export & Reports', imports: 'Bulk User Data Upload', backups: 'Automated System Backups', settings: 'Financing & Markup Settings', profile: 'My Account', wallet: 'My Wallet', wallets: 'Wallets & Payouts', api_access: 'API Access', api_management: 'API Management', tenants: 'Payment Tenants' }
   $('pageTitle').textContent = titles[state.route] || 'Dashboard'
-  const map = { dashboard: viewDashboard, approvals: viewApprovals, inventory: viewInventory, finance_queue: viewFinanceQueue, customers: viewCustomers, crm: viewCrm, contracts: viewContracts, agents: viewAgents, users: viewUsers, amendments: viewAmendments, ledger: viewLedger, repayments: viewRepayments, onboard: viewOnboard, shop: viewShop, marketplace: viewMarketplace, exports: viewExports, imports: viewImports, backups: viewBackups, settings: viewSettings, profile: viewProfile, wallet: viewMyWallet, wallets: viewWallets, api_access: viewApiAccess, api_management: viewApiManagement, tenants: viewTenants }
+  const map = { dashboard: viewDashboard, approvals: viewApprovals, inventory: viewInventory, finance_queue: viewFinanceQueue, customers: viewCustomers, field_visits: viewFieldVisits, crm: viewCrm, contracts: viewContracts, agents: viewAgents, users: viewUsers, amendments: viewAmendments, ledger: viewLedger, repayments: viewRepayments, onboard: viewOnboard, shop: viewShop, marketplace: viewMarketplace, exports: viewExports, imports: viewImports, backups: viewBackups, settings: viewSettings, profile: viewProfile, wallet: viewMyWallet, wallets: viewWallets, api_access: viewApiAccess, api_management: viewApiManagement, tenants: viewTenants }
   ;(map[state.route] || viewDashboard)()
 }
 
@@ -3929,6 +3932,320 @@ window.updateChain = (typeId = 'vct', chainId = 'vc') => {
   if (!typeEl || !chainEl) return
   const list = typeEl.value === 'crop' ? crops : typeEl.value === 'livestock' ? ls : []
   chainEl.innerHTML = list.length ? list.map(x => `<option>${x}</option>`).join('') : '<option value="">Select type first</option>'
+}
+
+// ===========================================================================
+// FIELD VISIT & CONVERSION WORKFLOW
+//   Field agents log prospect interactions during field operations, then
+//   convert prospects into onboarded users (which provisions login + SMS OTP
+//   credentials via the existing onboarding form). RBAC: manage_field_visits.
+// ===========================================================================
+window._fvStatusFilter = 'all'
+async function viewFieldVisits() {
+  $('content').innerHTML = '<div class="text-slate-400">Loading...</div>'
+  const q = window._fvStatusFilter && window._fvStatusFilter !== 'all' ? `?status=${window._fvStatusFilter}` : ''
+  let visits = []
+  try { const { data } = await api.get('/field-visits' + q); visits = data.visits || [] }
+  catch (err) { $('content').innerHTML = `<div class="card p-6 text-red-600">${esc(err.response?.data?.error || 'Failed to load field visits')}</div>`; return }
+  const filterBtn = (val, label) => `<button onclick="fvSetFilter('${val}')" class="btn px-3 py-1.5 rounded-lg text-xs ${window._fvStatusFilter === val ? 'brand-bg text-white' : 'bg-slate-100 text-slate-600'}">${label}</button>`
+  $('content').innerHTML = `
+    <div class="flex flex-wrap items-center justify-between gap-3 mb-4">
+      <div class="flex items-center gap-2">${filterBtn('all', 'All')}${filterBtn('prospect', 'Prospects')}${filterBtn('converted', 'Converted')}</div>
+      <button onclick="fvNewVisit()" class="btn brand-bg text-white px-4 py-2 rounded-lg text-sm"><i class="fas fa-clipboard-user mr-1"></i>Log Field Visit</button>
+    </div>
+    <div class="card table-card"><table class="w-full text-sm">
+      <thead class="bg-slate-50 text-slate-500 text-xs uppercase"><tr>
+        <th class="text-left px-4 py-3">Ref</th>
+        <th class="text-left px-4 py-3">Prospect</th>
+        <th class="text-left px-4 py-3">Contact</th>
+        <th class="text-left px-4 py-3">Location</th>
+        <th class="text-left px-4 py-3">Profile</th>
+        <th class="text-left px-4 py-3">Date</th>
+        <th class="text-left px-4 py-3">Status</th>
+        <th class="text-right px-4 py-3">Action</th>
+      </tr></thead>
+      <tbody>${visits.map(v => fvRow(v)).join('') || '<tr><td colspan="8" class="text-center py-8 text-slate-400">No field visits logged yet</td></tr>'}</tbody>
+    </table></div>`
+}
+window.fvSetFilter = (val) => { window._fvStatusFilter = val; viewFieldVisits() }
+function fvProfileLabel(v) {
+  if (v.profile_type === 'agsme') return 'AgSME (Business)'
+  if (v.profile_type === 'farming') return 'Farming · ' + (v.farming_type === 'crop' ? 'Crop' : v.farming_type === 'livestock' ? 'Livestock' : '—')
+  return '—'
+}
+function fvRow(v) {
+  const converted = v.status === 'converted'
+  const statusBadge = converted
+    ? '<span class="text-xs px-2 py-0.5 rounded-full bg-emerald-100 text-emerald-700">Converted</span>'
+    : '<span class="text-xs px-2 py-0.5 rounded-full bg-amber-100 text-amber-700">Prospect</span>'
+  const action = converted
+    ? '<span class="text-xs text-slate-400"><i class="fas fa-check mr-1"></i>Onboarded</span>'
+    : `<button onclick="fvConvert(${v.id})" class="btn brand-bg text-white px-3 py-1.5 rounded-lg text-xs"><i class="fas fa-user-check mr-1"></i>Convert</button>`
+  return `<tr class="border-t border-slate-100">
+    <td class="px-4 py-3 font-mono text-xs">${esc(v.visit_ref)}</td>
+    <td class="px-4 py-3 font-medium">${esc(v.prospect_name)}</td>
+    <td class="px-4 py-3">${esc(v.contact_phone || '—')}</td>
+    <td class="px-4 py-3">${esc(v.location || '—')}</td>
+    <td class="px-4 py-3">${esc(fvProfileLabel(v))}</td>
+    <td class="px-4 py-3">${esc(v.visit_date || '—')}</td>
+    <td class="px-4 py-3">${statusBadge}</td>
+    <td class="px-4 py-3 text-right">
+      <button onclick="fvView(${v.id})" class="text-teal-600 hover:underline text-xs mr-3">View</button>
+      ${action}
+    </td></tr>`
+}
+
+// Full Field Visit form (dynamic conditional profile sections).
+window.fvNewVisit = () => {
+  $('content').innerHTML = `<div class="card p-6 max-w-3xl w-full"><form id="fvForm" class="space-y-6">
+    <div><h3 class="section-title"><i class="fas fa-clipboard-list"></i>Visit Details</h3>
+      <div class="form-grid">
+        <div class="form-field"><label class="field-label">Visit Date</label><input name="visit_date" type="date" value="${new Date().toISOString().slice(0,10)}"></div>
+        <div class="form-field"><label class="field-label">Location / Market / Town</label><input name="location" placeholder="e.g. Wakulima Market, Nairobi"></div>
+        <div class="form-field span-all"><label class="field-label">Notes / Comments</label><textarea name="notes" rows="2" placeholder="Key observations from the interaction"></textarea></div>
+      </div></div>
+    <div><h3 class="section-title"><i class="fas fa-address-card"></i>Contact Information</h3>
+      <div class="form-grid">
+        <div class="form-field"><label class="field-label">Prospect Name <span class="req">*</span></label><input name="prospect_name" required></div>
+        <div class="form-field"><label class="field-label">Contact (Phone Number)</label><input name="contact_phone" type="tel" inputmode="tel" placeholder="07XX XXX XXX"></div>
+      </div></div>
+    <div><h3 class="section-title"><i class="fas fa-briefcase"></i>Farm / Business Profile</h3>
+      <div class="form-grid">
+        <div class="form-field span-all"><label class="field-label">Profile Type</label>
+          <select id="fv_profile_type" onchange="fvToggleProfile()"><option value="">Select profile type</option><option value="farming">Farming</option><option value="agsme">AgSME (Business)</option></select></div>
+      </div>
+      <div id="fv_farming_block" class="hidden mt-3">
+        <div class="form-grid">
+          <div class="form-field"><label class="field-label">Years in Farming</label><input id="fv_years" type="number" min="0" inputmode="numeric"></div>
+          <div class="form-field"><label class="field-label">Type of Farming</label>
+            <select id="fv_farming_type" onchange="fvToggleFarming()"><option value="">Select</option><option value="livestock">Livestock</option><option value="crop">Crop</option></select></div>
+        </div>
+        <div id="fv_livestock_block" class="hidden mt-3">
+          <div class="form-grid">
+            <div class="form-field"><label class="field-label">Type</label><select id="fv_ls_type"><option value="">Select</option><option>Dairy</option><option>Poultry</option><option>Pig</option><option>Beef</option><option>Fish</option></select></div>
+            <div class="form-field"><label class="field-label">Current Number of Livestock</label><input id="fv_ls_count" type="number" min="0" inputmode="numeric"></div>
+            <div class="form-field"><label class="field-label">Stage of Production Cycle</label><input id="fv_ls_stage" placeholder="e.g. laying, growing"></div>
+            <div class="form-field"><label class="field-label">Maximum Capacity</label><input id="fv_ls_capacity" type="number" min="0" inputmode="numeric"></div>
+            <div class="form-field"><label class="field-label">Brand of Feeds Used</label><input id="fv_ls_brand"></div>
+            <div class="form-field"><label class="field-label">Current Buying Price</label><input id="fv_ls_price" inputmode="numeric" placeholder="per bag"></div>
+            <div class="form-field"><label class="field-label">Current Distributor</label><input id="fv_ls_distributor"></div>
+            <div class="form-field"><label class="field-label">Number of Bags / Week</label><input id="fv_ls_bags" type="number" min="0" inputmode="numeric"></div>
+          </div>
+        </div>
+        <div id="fv_crop_block" class="hidden mt-3">
+          <div class="form-grid">
+            <div class="form-field"><label class="field-label">Type</label><input id="fv_crop_type" placeholder="e.g. Irish potatoes, Beans, Maize"></div>
+            <div class="form-field"><label class="field-label">Current Acreage</label><input id="fv_crop_acreage" type="number" step="0.01" min="0" inputmode="decimal"></div>
+            <div class="form-field"><label class="field-label">Stage of Production Cycle</label><input id="fv_crop_stage" placeholder="e.g. planting, harvesting"></div>
+            <div class="form-field"><label class="field-label">Current Buying Price</label><input id="fv_crop_price" inputmode="numeric"></div>
+            <div class="form-field"><label class="field-label">Current Distributor</label><input id="fv_crop_distributor"></div>
+            <div class="form-field"><label class="field-label">Volumes Used / Cycle / Input</label><input id="fv_crop_volumes" placeholder="e.g. 5 bags DAP"></div>
+          </div>
+          <div class="mt-3">
+            <div class="flex items-center justify-between mb-2">
+              <label class="field-label mb-0">Inputs Used</label>
+              <button type="button" onclick="fvAddInput()" class="btn bg-slate-100 px-3 py-1.5 rounded-lg text-xs"><i class="fas fa-plus mr-1"></i>Add Input</button>
+            </div>
+            <div id="fv_inputs"></div>
+          </div>
+        </div>
+      </div>
+      <div id="fv_agsme_block" class="hidden mt-3">
+        <div class="form-grid">
+          <div class="form-field"><label class="field-label">Business Name</label><input id="fv_biz_name"></div>
+          <div class="form-field"><label class="field-label">Business Type / Sector</label><input id="fv_biz_type" placeholder="e.g. agrovet, aggregator"></div>
+          <div class="form-field"><label class="field-label">Years in Business</label><input id="fv_biz_years" type="number" min="0" inputmode="numeric"></div>
+          <div class="form-field span-all"><label class="field-label">Notes</label><textarea id="fv_biz_notes" rows="2"></textarea></div>
+        </div>
+      </div>
+    </div>
+    <div class="flex gap-3">
+      <button class="btn brand-bg text-white px-6 py-2.5 rounded-lg text-sm"><i class="fas fa-paper-plane mr-1"></i>Save Field Visit</button>
+      <button type="button" onclick="go('field_visits')" class="btn bg-slate-100 px-6 py-2.5 rounded-lg text-sm">Cancel</button>
+    </div>
+  </form></div>`
+  $('fvForm').onsubmit = fvSubmit
+}
+window.fvToggleProfile = () => {
+  const t = $('fv_profile_type').value
+  $('fv_farming_block').classList.toggle('hidden', t !== 'farming')
+  $('fv_agsme_block').classList.toggle('hidden', t !== 'agsme')
+}
+window.fvToggleFarming = () => {
+  const t = $('fv_farming_type').value
+  $('fv_livestock_block').classList.toggle('hidden', t !== 'livestock')
+  $('fv_crop_block').classList.toggle('hidden', t !== 'crop')
+  if (t === 'crop' && !$('fv_inputs').children.length) fvAddInput()
+}
+window.fvAddInput = () => {
+  const row = document.createElement('div')
+  row.className = 'flex items-center gap-2 mb-2 fv-input-row'
+  row.innerHTML = `
+    <input class="fv-in-cat flex-1" placeholder="Category (e.g. Fertilizer)">
+    <input class="fv-in-name flex-1" placeholder="Name (e.g. DAP)">
+    <button type="button" onclick="this.closest('.fv-input-row').remove()" class="btn w-8 h-8 inline-flex items-center justify-center rounded-lg bg-red-50 text-red-500"><i class="fas fa-times"></i></button>`
+  $('fv_inputs').appendChild(row)
+}
+function fvCollectProfile() {
+  const t = $('fv_profile_type').value
+  if (t === 'agsme') {
+    return { business_name: $('fv_biz_name').value, business_type: $('fv_biz_type').value, years_in_business: $('fv_biz_years').value, notes: $('fv_biz_notes').value }
+  }
+  if (t === 'farming') {
+    const ft = $('fv_farming_type').value
+    const base = { years_in_farming: $('fv_years').value }
+    if (ft === 'livestock') {
+      return { ...base, livestock: { type: $('fv_ls_type').value, count: $('fv_ls_count').value, stage: $('fv_ls_stage').value, max_capacity: $('fv_ls_capacity').value, feed_brand: $('fv_ls_brand').value, buying_price: $('fv_ls_price').value, distributor: $('fv_ls_distributor').value, bags_per_week: $('fv_ls_bags').value } }
+    }
+    if (ft === 'crop') {
+      const inputs = Array.from(document.querySelectorAll('.fv-input-row')).map(r => ({
+        category: r.querySelector('.fv-in-cat').value.trim(),
+        name: r.querySelector('.fv-in-name').value.trim()
+      })).filter(x => x.category || x.name)
+      return { ...base, crop: { type: $('fv_crop_type').value, acreage: $('fv_crop_acreage').value, stage: $('fv_crop_stage').value, buying_price: $('fv_crop_price').value, distributor: $('fv_crop_distributor').value, volumes: $('fv_crop_volumes').value, inputs } }
+    }
+    return base
+  }
+  return {}
+}
+async function fvSubmit(e) {
+  e.preventDefault()
+  const t = $('fv_profile_type').value
+  const body = {
+    visit_date: $('fvForm').visit_date.value,
+    location: $('fvForm').location.value,
+    notes: $('fvForm').notes.value,
+    prospect_name: $('fvForm').prospect_name.value,
+    contact_phone: $('fvForm').contact_phone.value,
+    profile_type: t || null,
+    farming_type: t === 'farming' ? ($('fv_farming_type').value || null) : null,
+    profile: fvCollectProfile()
+  }
+  try { await api.post('/field-visits', body); toast('Field visit logged'); go('field_visits') }
+  catch (err) { toast(err.response?.data?.error || 'Failed', false) }
+}
+
+// Read-only detail modal.
+window.fvView = async (id) => {
+  try {
+    const { data } = await api.get('/field-visits/' + id)
+    const v = data.visit
+    const p = v.profile || {}
+    let profileHtml = '<p class="text-slate-400 text-sm">No profile captured</p>'
+    if (v.profile_type === 'agsme') {
+      profileHtml = `<ul class="text-sm space-y-1">
+        <li><b>Business:</b> ${esc(p.business_name || '—')}</li>
+        <li><b>Type:</b> ${esc(p.business_type || '—')}</li>
+        <li><b>Years in Business:</b> ${esc(p.years_in_business || '—')}</li>
+        ${p.notes ? `<li><b>Notes:</b> ${esc(p.notes)}</li>` : ''}</ul>`
+    } else if (v.profile_type === 'farming' && v.farming_type === 'livestock') {
+      const l = p.livestock || {}
+      profileHtml = `<ul class="text-sm space-y-1">
+        <li><b>Years in Farming:</b> ${esc(p.years_in_farming || '—')}</li>
+        <li><b>Type:</b> ${esc(l.type || '—')}</li>
+        <li><b>Current Number:</b> ${esc(l.count || '—')}</li>
+        <li><b>Stage:</b> ${esc(l.stage || '—')}</li>
+        <li><b>Max Capacity:</b> ${esc(l.max_capacity || '—')}</li>
+        <li><b>Feed Brand:</b> ${esc(l.feed_brand || '—')}</li>
+        <li><b>Buying Price:</b> ${esc(l.buying_price || '—')}</li>
+        <li><b>Distributor:</b> ${esc(l.distributor || '—')}</li>
+        <li><b>Bags / Week:</b> ${esc(l.bags_per_week || '—')}</li></ul>`
+    } else if (v.profile_type === 'farming' && v.farming_type === 'crop') {
+      const cr = p.crop || {}
+      const inputs = (cr.inputs || []).map(i => `<li class="ml-4">• ${esc(i.category || '—')} — ${esc(i.name || '—')}</li>`).join('') || '<li class="ml-4 text-slate-400">None listed</li>'
+      profileHtml = `<ul class="text-sm space-y-1">
+        <li><b>Years in Farming:</b> ${esc(p.years_in_farming || '—')}</li>
+        <li><b>Type:</b> ${esc(cr.type || '—')}</li>
+        <li><b>Acreage:</b> ${esc(cr.acreage || '—')}</li>
+        <li><b>Stage:</b> ${esc(cr.stage || '—')}</li>
+        <li><b>Buying Price:</b> ${esc(cr.buying_price || '—')}</li>
+        <li><b>Distributor:</b> ${esc(cr.distributor || '—')}</li>
+        <li><b>Volumes / Cycle:</b> ${esc(cr.volumes || '—')}</li>
+        <li><b>Inputs Used:</b></li>${inputs}</ul>`
+    }
+    showModal(`<div class="flex items-center justify-between mb-3">
+        <h3 class="text-lg font-bold">${esc(v.prospect_name)}</h3>
+        <span class="font-mono text-xs text-slate-400">${esc(v.visit_ref)}</span></div>
+      <div class="space-y-3">
+        <div class="text-sm text-slate-600"><b>Contact:</b> ${esc(v.contact_phone || '—')} · <b>Location:</b> ${esc(v.location || '—')} · <b>Date:</b> ${esc(v.visit_date || '—')}</div>
+        ${v.notes ? `<div class="text-sm bg-slate-50 rounded-lg p-3">${esc(v.notes)}</div>` : ''}
+        <div><p class="text-xs uppercase text-slate-400 mb-1">${esc(fvProfileLabel(v))}</p>${profileHtml}</div>
+      </div>
+      <div class="flex gap-3 mt-5">
+        ${v.status === 'converted' ? '<span class="text-emerald-600 text-sm"><i class="fas fa-check mr-1"></i>Already converted</span>' : `<button onclick="closeModal();fvConvert(${v.id})" class="btn brand-bg text-white px-5 py-2 rounded-lg text-sm"><i class="fas fa-user-check mr-1"></i>Convert to User</button>`}
+        <button onclick="closeModal()" class="btn bg-slate-100 px-5 py-2 rounded-lg text-sm">Close</button>
+      </div>`)
+  } catch (err) { toast(err.response?.data?.error || 'Failed', false) }
+}
+
+// Convert: open the onboarding form prefilled with prospect data, then on
+// submit create the customer WITH a login (create_login → SMS credentials) and
+// mark the field visit converted.
+window.fvConvert = async (id) => {
+  let v = null
+  try { const { data } = await api.get('/field-visits/' + id); v = data.visit }
+  catch (err) { toast(err.response?.data?.error || 'Failed', false); return }
+  if (!v) return
+  if (v.status === 'converted') { toast('Already converted', false); return }
+  const p = v.profile || {}
+  // Derive onboarding prefill from the captured prospect profile.
+  const vct = v.farming_type === 'crop' ? 'crop' : v.farming_type === 'livestock' ? 'livestock' : ''
+  window._fvConvertId = id
+  viewOnboard()
+  // Inject a conversion banner + prefill known fields.
+  const content = $('content').firstElementChild
+  const banner = document.createElement('div')
+  banner.className = 'bg-teal-50 border border-teal-200 rounded-lg p-3 text-sm text-teal-800 mb-4 flex items-center gap-2'
+  banner.innerHTML = `<i class="fas fa-user-check"></i><span>Converting prospect <b>${esc(v.prospect_name)}</b> (${esc(v.visit_ref)}). Complete the remaining profile; login credentials will be sent by SMS (Phone + OTP).</span>`
+  content.insertBefore(banner, content.firstChild)
+  const f = $('onbForm')
+  if (f.full_name) f.full_name.value = v.prospect_name || ''
+  if (f.mobile) f.mobile.value = v.contact_phone || ''
+  if (f.county) f.county.value = v.location || ''
+  if (vct && f.value_chain_type) { f.value_chain_type.value = vct; updateChain() }
+  if (v.farming_type === 'crop' && p.crop) {
+    if (f.acreage) f.acreage.value = p.crop.acreage || ''
+    if (f.value_chain && p.crop.type) { const opt = Array.from(f.value_chain.options).find(o => o.value.toLowerCase() === String(p.crop.type).toLowerCase()); if (opt) f.value_chain.value = opt.value }
+  }
+  if (v.farming_type === 'livestock' && p.livestock) {
+    if (f.herd_size) f.herd_size.value = p.livestock.count || ''
+    if (f.value_chain && p.livestock.type) { const opt = Array.from(f.value_chain.options).find(o => o.value.toLowerCase() === String(p.livestock.type).toLowerCase()); if (opt) f.value_chain.value = opt.value }
+  }
+  if (f.farm_experience && p.years_in_farming) f.farm_experience.value = p.years_in_farming
+  // Override the onboarding submit to also provision login + mark converted.
+  f.onsubmit = async (e) => {
+    e.preventDefault()
+    const fd = new FormData(e.target); const body = Object.fromEntries(fd.entries())
+    body.create_login = true
+    try {
+      const { data } = await api.post('/customers', body)
+      try { await api.post(`/field-visits/${window._fvConvertId}/convert`, { customer_id: data.id }) } catch (_) {}
+      if (data.credentials && data.credentials.phone) {
+        fvShowCredentials(body.full_name, data.credentials)
+      } else {
+        toast('Prospect converted and onboarded')
+      }
+      window._fvConvertId = null
+      state.route = 'field_visits'; window._fvStatusFilter = 'all'; renderApp()
+    } catch (err) { toast(err.response?.data?.error || 'Failed', false) }
+  }
+}
+function fvShowCredentials(name, cred) {
+  const smsNote = cred.sms_success && !cred.sms_simulated
+    ? 'Login credentials have been sent to the user by SMS.'
+    : (cred.sms_simulated ? 'SMS gateway is in simulation mode — share these credentials manually.' : 'SMS delivery could not be confirmed — share these credentials manually.')
+  showModal(`<div class="text-center">
+    <div class="w-14 h-14 mx-auto rounded-full bg-emerald-100 text-emerald-600 flex items-center justify-center text-2xl mb-3"><i class="fas fa-user-check"></i></div>
+    <h3 class="text-lg font-bold mb-1">Prospect Converted</h3>
+    <p class="text-sm text-slate-600 mb-3">${esc(name)} now has a user account.</p>
+    <div class="bg-slate-50 border border-slate-200 rounded-xl p-4 mb-3 text-left">
+      <p class="text-xs text-slate-500 mb-1">Phone Number (login)</p>
+      <p class="text-lg font-bold text-slate-800 mb-2">${esc(cred.phone)}</p>
+      <p class="text-xs text-slate-500 mb-1">First-time Password (OTP)</p>
+      <p class="text-2xl font-bold tracking-widest text-slate-800">${esc(cred.temporary_password)}</p>
+    </div>
+    <p class="text-xs text-slate-400 mb-4"><i class="fas fa-sms mr-1"></i>${esc(smsNote)}</p>
+    <button onclick="closeModal()" class="btn w-full brand-bg text-white py-2.5 rounded-lg text-sm">Done</button></div>`)
 }
 
 // ---------------------------------------------------------------------------
