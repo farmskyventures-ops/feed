@@ -4825,8 +4825,10 @@ app.get('/api/field-visits', requireAuth, async (c) => {
   const isAdmin = ['admin', 'super_admin'].includes(user.role)
   const clauses: string[] = []
   const params: any[] = []
-  if (!isAdmin) { clauses.push('agent_id = ?'); params.push(String(user.id)) }
-  if (status === 'prospect' || status === 'converted') { clauses.push('status = ?'); params.push(status) }
+  // Qualify with `fv.` — `users` (joined below) also has `agent_id`/`status`
+  // columns, so unqualified references are ambiguous in Postgres.
+  if (!isAdmin) { clauses.push('fv.agent_id = ?'); params.push(String(user.id)) }
+  if (status === 'prospect' || status === 'converted') { clauses.push('fv.status = ?'); params.push(status) }
   const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : ''
   const { results } = await c.env.DB.prepare(
     `SELECT fv.*, u.full_name AS agent_name
