@@ -89,6 +89,20 @@ executes payments and dispatches SMS, OTP and email on its behalf.
   lifecycle). RBAC: available under the Super-Admin permission panel and
   assignable to any user; **agents see only visits they logged**, Super-Admins/
   Admins have global visibility. Granted to agents by default.
+- **KCB (Buni) at checkout** — the payment picker now offers **M-Pesa, SasaPay
+  and KCB**. Selecting KCB presents a secondary choice: **M-Pesa STK Push**
+  (collect into the sale) or **Funds Transfer** (routed to Dashboard →
+  Transactions). All rails are delegated to the Farmsky Central Payment Gateway.
+- **KCB Buni Bank Transfers & Transactions** (`manage_transactions`, **KYC-gated**)
+  — a dashboard module for **Account-to-Account** (internal KCB), **Inter-Bank**
+  (RTGS / EFT / PesaLink), **Mobile-Money Wallet** (KCB → M-Pesa) and **Currency
+  Conversion** transfers, built on the spec-compliant KCB Buni
+  `FundsTransferAPIService`. Access is restricted server-side to users who hold
+  the permission **and** are KYC-verified.
+- **KCB Buni Instant Payment Notification (IPN)** — real-time account / till /
+  validation notifications with **SHA256withRSA signature verification** enforced
+  (unsigned/tampered payloads rejected in production; accepted in sandbox when no
+  public key is configured).
 
 ---
 
@@ -146,6 +160,18 @@ KCB Buni, TalkSASA SMS/OTP, Resend email). Feed does **not** set them directly.
 
 > **Local dev fallback:** if the gateway variables are absent, payments fall back
 > to direct M-Pesa Daraja simulation so checkout stays testable offline.
+
+### KCB Buni (STK Push · Funds Transfer · IPN) — all optional, blank = simulation
+When Feed's local gateway host is used (or for direct testing), the same KCB Buni
+variables as Equipment apply — all optional, blank falls back to simulation:
+`BUNI_CLIENT_ID`, `BUNI_CLIENT_SECRET` (OAuth2 client-credentials), `BUNI_ENV`
+(`sandbox`/`uat` for UAT host), `BUNI_SHARED_SHORTCODE` (default `true` = KCB
+paybill 522533; else set `BUNI_ORG_SHORTCODE` + `BUNI_ORG_PASSKEY`),
+`BUNI_STK_CALLBACK_URL`, `BUNI_DEBIT_ACCOUNT` + `BUNI_COMPANY_CODE` +
+`BUNI_FT_CALLBACK_URL` (enable **Funds Transfer**), and `BUNI_IPN_PUBLIC_KEY`
+(RSA PEM public key from KCB — required in production so inbound **IPN** payloads
+are signature-verified via SHA256withRSA). In production Feed routes payments
+through the Equipment gateway, which holds these credentials.
 
 ### Environment variables for the CRM & Quick-Communication features
 **None are required.** The **Quick Communication buttons** use the device's

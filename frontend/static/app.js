@@ -1146,6 +1146,7 @@ function navItems() {
   const myWallet = { k: 'wallet', i: 'fa-wallet', t: 'My Wallet' }
   const crm = { k: 'crm', i: 'fa-headset', t: 'Sales & Support CRM' }
   const fieldVisits = { k: 'field_visits', i: 'fa-clipboard-user', t: 'Field Visits' }
+  const transactions = { k: 'transactions', i: 'fa-building-columns', t: 'Transactions' }
   if (r === 'super_admin' || r === 'admin') return withAccount([...common,
     { k: 'approvals', i: 'fa-clipboard-check', t: 'Approvals' },
     { k: 'inventory', i: 'fa-boxes-stacked', t: 'Inventory' },
@@ -1153,6 +1154,7 @@ function navItems() {
     { k: 'customers', i: 'fa-users', t: 'Customers' },
     fieldVisits,
     crm,
+    transactions,
     { k: 'contracts', i: 'fa-file-signature', t: 'Purchases' },
     { k: 'agents', i: 'fa-user-tie', t: 'Agents' },
     { k: 'users', i: 'fa-user-gear', t: 'User Accounts' },
@@ -1179,11 +1181,13 @@ function navItems() {
     ...(canDo('manage_field_visits') ? [fieldVisits] : []),
     ...(canDo('view_crm') ? [crm] : []),
     ...(canDo('can_manage_inventory') ? [{ k: 'inventory', i: 'fa-boxes-stacked', t: 'My Inventory' }] : []),
+    ...(canDo('manage_transactions') ? [transactions] : []),
     { k: 'contracts', i: 'fa-file-signature', t: 'Credit Purchases' },
     { k: 'shop', i: 'fa-store', t: 'Shop' },
     myWallet])
   if (r === 'customer') return withAccount([...common,
     { k: 'shop', i: 'fa-store', t: 'Shop' },
+    ...(canDo('manage_transactions') ? [transactions] : []),
     { k: 'contracts', i: 'fa-file-signature', t: 'My Purchases' }])
   if (r === 'support') return withAccount([...common,
     { k: 'customers', i: 'fa-users', t: 'Customers' },
@@ -1238,9 +1242,9 @@ function renderApp() {
 }
 window.go = (r) => { state.route = r; toggleSidebar(false); renderApp() }
 function route() {
-  const titles = { dashboard: 'Dashboard', approvals: 'Financing Approvals', inventory: 'Inventory', finance_queue: 'Finance Approval Queue', customers: 'Customers', field_visits: 'Field Visits & Conversion', crm: 'Sales & Support CRM', contracts: 'Purchases & Contracts', agents: 'Agent Management', users: 'User Accounts & Access', amendments: 'Pending Profile Amendments', ledger: 'Unified Payment Ledger', repayments: 'Repayment Performance', onboard: 'Farmer Onboarding', shop: 'Shop', marketplace: 'Equipment Marketplace', exports: 'Data Export & Reports', imports: 'Bulk User Data Upload', backups: 'Automated System Backups', settings: 'Financing & Markup Settings', profile: 'My Account', wallet: 'My Wallet', wallets: 'Wallets & Payouts', api_access: 'API Access', api_management: 'API Management', tenants: 'Payment Tenants' }
+  const titles = { dashboard: 'Dashboard', approvals: 'Financing Approvals', inventory: 'Inventory', finance_queue: 'Finance Approval Queue', customers: 'Customers', field_visits: 'Field Visits & Conversion', transactions: 'Bank Transfers & Transactions', crm: 'Sales & Support CRM', contracts: 'Purchases & Contracts', agents: 'Agent Management', users: 'User Accounts & Access', amendments: 'Pending Profile Amendments', ledger: 'Unified Payment Ledger', repayments: 'Repayment Performance', onboard: 'Farmer Onboarding', shop: 'Shop', marketplace: 'Equipment Marketplace', exports: 'Data Export & Reports', imports: 'Bulk User Data Upload', backups: 'Automated System Backups', settings: 'Financing & Markup Settings', profile: 'My Account', wallet: 'My Wallet', wallets: 'Wallets & Payouts', api_access: 'API Access', api_management: 'API Management', tenants: 'Payment Tenants' }
   $('pageTitle').textContent = titles[state.route] || 'Dashboard'
-  const map = { dashboard: viewDashboard, approvals: viewApprovals, inventory: viewInventory, finance_queue: viewFinanceQueue, customers: viewCustomers, field_visits: viewFieldVisits, crm: viewCrm, contracts: viewContracts, agents: viewAgents, users: viewUsers, amendments: viewAmendments, ledger: viewLedger, repayments: viewRepayments, onboard: viewOnboard, shop: viewShop, marketplace: viewMarketplace, exports: viewExports, imports: viewImports, backups: viewBackups, settings: viewSettings, profile: viewProfile, wallet: viewMyWallet, wallets: viewWallets, api_access: viewApiAccess, api_management: viewApiManagement, tenants: viewTenants }
+  const map = { dashboard: viewDashboard, approvals: viewApprovals, inventory: viewInventory, finance_queue: viewFinanceQueue, customers: viewCustomers, field_visits: viewFieldVisits, transactions: viewTransactions, crm: viewCrm, contracts: viewContracts, agents: viewAgents, users: viewUsers, amendments: viewAmendments, ledger: viewLedger, repayments: viewRepayments, onboard: viewOnboard, shop: viewShop, marketplace: viewMarketplace, exports: viewExports, imports: viewImports, backups: viewBackups, settings: viewSettings, profile: viewProfile, wallet: viewMyWallet, wallets: viewWallets, api_access: viewApiAccess, api_management: viewApiManagement, tenants: viewTenants }
   ;(map[state.route] || viewDashboard)()
 }
 
@@ -1958,8 +1962,9 @@ window.payModal = async (id, amount, outstanding, kind, opts) => {
   const targetPhone = opts.phone || state.user.phone
   const forFarmer = !!opts.phone
   const payTitle = opts.deposit ? 'Deposit Payment' : opts.balance ? 'Final Balance Payment' : (isCash ? 'Cash Checkout' : 'Repayment')
-  let mpMode = { mode: 'simulation', live: false }
+  let mpMode = { mode: 'simulation', live: false }, kcbMode = { mode: 'simulation', live: false }
   try { mpMode = (await api.get('/mpesa/status')).data } catch {}
+  try { kcbMode = (await api.get('/buni/status')).data } catch {}
   const modeBadge = (m) => m.live
 
   showModal(`<h3 class="text-lg font-bold mb-1"><i class="fas fa-mobile-alt text-teal-600 mr-2"></i>${esc(payTitle)}</h3>
@@ -1972,7 +1977,7 @@ window.payModal = async (id, amount, outstanding, kind, opts) => {
          secrets. NOTE: KCB Buni is deliberately NOT exposed here; it is a
          backend/reconciliation-only rail and must stay hidden from customers. -->
     <label class="text-sm font-medium block mb-2">Choose payment method</label>
-    <div class="grid grid-cols-2 gap-3 mb-3">
+    <div class="grid grid-cols-3 gap-3 mb-3">
       <label class="border rounded-lg p-3 text-center cursor-pointer bg-white border-slate-200 has-[:checked]:ring-2 has-[:checked]:ring-emerald-500 has-[:checked]:border-emerald-400">
         <input type="radio" name="paymethod" value="mpesa" checked onchange="toggleSasaChannels()" class="hidden">
         <img src="/static/mpesa-logo.png" alt="M-Pesa" class="h-10 mx-auto mb-1 object-contain">
@@ -1981,6 +1986,26 @@ window.payModal = async (id, amount, outstanding, kind, opts) => {
         <input type="radio" name="paymethod" value="sasapay" onchange="toggleSasaChannels()" class="hidden">
         <img src="/static/sasapay-logo.png" alt="SasaPay" class="h-10 mx-auto mb-1 object-contain">
       </label>
+      <label class="border rounded-lg p-3 text-center cursor-pointer bg-white border-slate-200 has-[:checked]:ring-2 has-[:checked]:ring-red-500 has-[:checked]:border-red-400">
+        <input type="radio" name="paymethod" value="buni" onchange="toggleSasaChannels()" class="hidden">
+        <div class="h-10 flex items-center justify-center mb-1"><span class="font-extrabold text-red-600 text-lg tracking-tight">KCB</span></div>
+      </label>
+    </div>
+
+    <!-- KCB secondary choice: STK Push vs Funds Transfer -->
+    <div id="kcbChoiceBlock" class="hidden mb-3 p-3 bg-red-50 border border-red-200 rounded-lg">
+      <label class="text-xs font-semibold text-slate-600 uppercase tracking-wider block mb-2">KCB payment option</label>
+      <div class="grid grid-cols-2 gap-2">
+        <label class="border rounded-lg p-2 text-center cursor-pointer bg-white border-slate-200 text-xs has-[:checked]:ring-2 has-[:checked]:ring-red-500 has-[:checked]:border-red-400">
+          <input type="radio" name="kcbmode" value="stk" checked onchange="onKcbModeChange()" class="hidden">
+          <i class="fas fa-mobile-screen-button text-red-600 mb-1"></i><div>M-Pesa STK Push</div>
+        </label>
+        <label class="border rounded-lg p-2 text-center cursor-pointer bg-white border-slate-200 text-xs has-[:checked]:ring-2 has-[:checked]:ring-red-500 has-[:checked]:border-red-400">
+          <input type="radio" name="kcbmode" value="ft" onchange="onKcbModeChange()" class="hidden">
+          <i class="fas fa-building-columns text-red-600 mb-1"></i><div>Funds Transfer</div>
+        </label>
+      </div>
+      <p id="kcbModeHint" class="text-[11px] text-slate-500 mt-2">A payment prompt is sent to the phone number below via KCB channels.</p>
     </div>
 
     <!-- SasaPay channel customizer: Mobile Money / Bank / Wallet. Mirrors the
@@ -2057,6 +2082,9 @@ async function loadSasaChannels() {
 window.toggleSasaChannels = async () => {
   const method = document.querySelector('input[name="paymethod"]:checked')?.value;
   const block = document.getElementById('sasapayChannelBlock');
+  const kcbBlock = document.getElementById('kcbChoiceBlock');
+  if (kcbBlock) kcbBlock.classList.toggle('hidden', method !== 'buni')
+  if (method === 'buni') onKcbModeChange()
   if (!block) return
   if (method === 'sasapay') {
     block.classList.remove('hidden')
@@ -2065,6 +2093,19 @@ window.toggleSasaChannels = async () => {
   } else {
     block.classList.add('hidden')
   }
+}
+// KCB secondary choice hint. In CHECKOUT the collection path is STK Push (money
+// in). Funds Transfer is a disbursement and lives in Dashboard → Transactions.
+window.onKcbModeChange = () => {
+  const mode = document.querySelector('input[name="kcbmode"]:checked')?.value || 'stk'
+  const hint = document.getElementById('kcbModeHint')
+  const btn = document.getElementById('payBtn')
+  if (hint) {
+    hint.textContent = mode === 'ft'
+      ? 'Funds Transfer moves money OUT to a bank/mobile account. For a purchase, use STK Push. To send a transfer, open Dashboard → Transactions.'
+      : 'A KCB M-Pesa STK prompt is sent to the phone number below to authorise this payment.'
+  }
+  if (btn) btn.disabled = false
 }
 
 // Populate the channel picker based on the selected type (mobile/bank/wallet).
@@ -2274,13 +2315,24 @@ window.payStateAlert = (stateName, msg, receipt) => {
 window.doPay = async (id, kind) => {
   const isCash = kind === 'cash'
   const method = document.querySelector('input[name="paymethod"]:checked')?.value || 'mpesa'
-  // BOTH customer-facing rails (M-Pesa + SasaPay) are delegated to the Farmsky
-  // Central Payment Gateway via the single /mpesa/stkpush + /mpesa/confirm pair.
-  // The chosen rail is passed as `payment_method`; the gateway performs the
-  // provider handshake. (KCB Buni is never selectable on the frontend.)
+  // KCB Buni: honour the secondary STK-vs-FundsTransfer choice. In the checkout
+  // context only STK Push collects into the sale; Funds Transfer is a payout and
+  // is redirected to the dashboard Transactions module.
+  if (method === 'buni') {
+    const kcbmode = document.querySelector('input[name="kcbmode"]:checked')?.value || 'stk'
+    if (kcbmode === 'ft') {
+      $('payStatus').innerHTML = `<div class="bg-amber-50 border border-amber-200 rounded-lg p-2 text-xs text-amber-700 mb-3">Funds Transfer sends money out to a bank/mobile account and cannot settle a purchase. Opening Dashboard → Transactions…</div>`
+      setTimeout(() => { closeModal(); go('transactions') }, 1600)
+      return
+    }
+  }
+  // Customer-facing rails (M-Pesa, SasaPay, KCB Buni STK) are all delegated to
+  // the Farmsky Central Payment Gateway via the single /mpesa/stkpush +
+  // /mpesa/confirm pair. The chosen rail is passed as `payment_method`; the
+  // gateway performs the provider handshake.
   const endpoint = '/mpesa/stkpush'
   const confirmEndpoint = '/mpesa/confirm'
-  const methodLabel = method === 'sasapay' ? 'SasaPay' : 'M-Pesa'
+  const methodLabel = method === 'sasapay' ? 'SasaPay' : method === 'buni' ? 'KCB' : 'M-Pesa'
 
   const payload = {
     contract_id: id,
@@ -4246,6 +4298,155 @@ function fvShowCredentials(name, cred) {
     </div>
     <p class="text-xs text-slate-400 mb-4"><i class="fas fa-sms mr-1"></i>${esc(smsNote)}</p>
     <button onclick="closeModal()" class="btn w-full brand-bg text-white py-2.5 rounded-lg text-sm">Done</button></div>`)
+}
+
+// ===========================================================================
+// KCB BANK TRANSFERS & TRANSACTIONS (dashboard module — KYC-gated)
+//   Account-to-Account · Inter-Bank (RTGS/EFT/PesaLink) · Mobile-Money Wallet
+//   · Currency Conversion. Access is gated server-side by RBAC
+//   (manage_transactions) + KYC verification. The UI mirrors that gating so a
+//   non-verified user sees a clear "complete KYC" message instead of the form.
+// ===========================================================================
+let _txMeta = null
+async function viewTransactions() {
+  $('content').innerHTML = '<div class="text-slate-400">Loading…</div>'
+  let meta, list
+  try {
+    meta = (await api.get('/transactions/meta')).data
+    list = (await api.get('/transactions')).data
+  } catch (err) {
+    $('content').innerHTML = `<div class="card p-6 text-red-600">${esc(err.response?.data?.error || 'You are not authorized to view transactions.')}</div>`
+    return
+  }
+  _txMeta = meta
+  if (!meta.kyc_verified) {
+    $('content').innerHTML = `<div class="card p-6 max-w-xl">
+      <div class="flex items-center gap-3 mb-3"><div class="w-12 h-12 rounded-full bg-amber-100 text-amber-600 flex items-center justify-center text-xl"><i class="fas fa-id-card"></i></div>
+        <div><h3 class="font-bold text-lg">KYC Verification Required</h3><p class="text-sm text-slate-500">Bank transfers are restricted to KYC-verified accounts.</p></div></div>
+      <p class="text-sm text-slate-600">Please complete your KYC verification to unlock account-to-account, inter-bank (RTGS/EFT/PesaLink), mobile-money wallet and currency-conversion transfers. Contact your administrator if you believe this is an error.</p>
+    </div>`
+    return
+  }
+  const modeBadge = meta.ft_live
+    ? '<span class="text-[10px] px-2 py-0.5 rounded-full bg-emerald-100 text-emerald-700">live</span>'
+    : '<span class="text-[10px] px-2 py-0.5 rounded-full bg-amber-100 text-amber-700">simulation</span>'
+  $('content').innerHTML = `
+    <div class="flex flex-wrap items-center justify-between gap-3 mb-4">
+      <div class="text-sm text-slate-500">KCB Buni Funds Transfer ${modeBadge}</div>
+      <button onclick="txNewTransfer()" class="btn brand-bg text-white px-4 py-2 rounded-lg text-sm"><i class="fas fa-paper-plane mr-1"></i>New Transfer</button>
+    </div>
+    <div class="card table-card"><table class="w-full text-sm">
+      <thead class="bg-slate-50 text-slate-500 text-xs uppercase"><tr>
+        <th class="text-left px-4 py-3">Ref</th>
+        <th class="text-left px-4 py-3">Beneficiary / Account</th>
+        <th class="text-right px-4 py-3">Amount</th>
+        <th class="text-left px-4 py-3">Description</th>
+        <th class="text-left px-4 py-3">Status</th>
+        <th class="text-left px-4 py-3">Date</th>
+      </tr></thead>
+      <tbody>${(list.transactions || []).map(txRow).join('') || '<tr><td colspan="6" class="text-center py-8 text-slate-400">No transfers yet</td></tr>'}</tbody>
+    </table></div>`
+}
+function txRow(t) {
+  const status = String(t.status || '').toUpperCase()
+  const badge = status === 'SUCCESS'
+    ? '<span class="text-xs px-2 py-0.5 rounded-full bg-emerald-100 text-emerald-700">Success</span>'
+    : status === 'FAILED'
+      ? '<span class="text-xs px-2 py-0.5 rounded-full bg-red-100 text-red-700">Failed</span>'
+      : '<span class="text-xs px-2 py-0.5 rounded-full bg-amber-100 text-amber-700">Pending</span>'
+  return `<tr class="border-t border-slate-100">
+    <td class="px-4 py-3 font-mono text-xs">${esc(t.transaction_ref)}</td>
+    <td class="px-4 py-3">${esc(t.phone || '—')}</td>
+    <td class="px-4 py-3 text-right font-medium">${esc(t.currency || 'KES')} ${esc(String(t.amount))}</td>
+    <td class="px-4 py-3">${esc(t.description || '—')}</td>
+    <td class="px-4 py-3">${badge}</td>
+    <td class="px-4 py-3 text-xs text-slate-500">${esc(String(t.created_at || '').replace('T', ' ').slice(0, 16))}</td>
+  </tr>`
+}
+window.txNewTransfer = () => {
+  const meta = _txMeta || { transaction_types: [], banks: [] }
+  const typeOpts = (meta.transaction_types || []).map(t => `<option value="${esc(t.code)}">${esc(t.label)} (${esc(t.code)})</option>`).join('')
+  const bankOpts = (meta.banks || []).map(b => `<option value="${esc(b.code)}">${esc(b.name)}</option>`).join('')
+  showModal(`<h3 class="text-lg font-bold mb-1"><i class="fas fa-building-columns text-red-600 mr-2"></i>New Bank / Mobile Transfer</h3>
+    <p class="text-xs text-slate-500 mb-4">KCB Buni Funds Transfer — moves money from the organisation KCB account to the beneficiary.</p>
+    <form id="txForm" class="space-y-3">
+      <div>
+        <label class="text-xs font-semibold text-slate-600 uppercase block mb-1">Transfer Type</label>
+        <select id="tx_type" onchange="txOnTypeChange()" class="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm">${typeOpts}</select>
+      </div>
+      <div>
+        <label class="text-xs font-semibold text-slate-600 uppercase block mb-1">Beneficiary Bank</label>
+        <select id="tx_bank" class="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm">${bankOpts}</select>
+      </div>
+      <div>
+        <label class="text-xs font-semibold text-slate-600 uppercase block mb-1">Beneficiary Name</label>
+        <input id="tx_name" class="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm" placeholder="e.g. JOHN DOE">
+      </div>
+      <div>
+        <label class="text-xs font-semibold text-slate-600 uppercase block mb-1" id="tx_acct_label">Credit Account Number</label>
+        <input id="tx_account" class="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm" placeholder="Account number">
+      </div>
+      <div class="grid grid-cols-2 gap-3">
+        <div>
+          <label class="text-xs font-semibold text-slate-600 uppercase block mb-1">Amount</label>
+          <input id="tx_amount" type="number" min="1" class="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm" placeholder="0">
+        </div>
+        <div>
+          <label class="text-xs font-semibold text-slate-600 uppercase block mb-1">Currency</label>
+          <input id="tx_currency" value="KES" maxlength="3" class="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm uppercase">
+        </div>
+      </div>
+      <div>
+        <label class="text-xs font-semibold text-slate-600 uppercase block mb-1">Payment Details</label>
+        <input id="tx_details" class="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm" placeholder="e.g. supplier payment">
+      </div>
+      <div id="txStatus"></div>
+      <div class="flex gap-2 pt-1">
+        <button type="submit" id="txBtn" class="btn flex-1 brand-bg text-white py-2.5 rounded-lg text-sm"><i class="fas fa-paper-plane mr-1"></i>Send Transfer</button>
+        <button type="button" onclick="closeModal()" class="btn px-4 bg-slate-100 rounded-lg text-sm">Cancel</button>
+      </div>
+    </form>`)
+  txOnTypeChange()
+  $('txForm').onsubmit = txSubmit
+}
+// Mobile-money transfers force the MPESA destination + a phone-number field.
+window.txOnTypeChange = () => {
+  const type = $('tx_type')?.value
+  const bank = $('tx_bank'); const acctLabel = $('tx_acct_label'); const acct = $('tx_account')
+  if (type === 'MO') {
+    if (bank) { bank.value = 'MPESA'; bank.disabled = true }
+    if (acctLabel) acctLabel.textContent = 'Recipient Phone (M-Pesa)'
+    if (acct) acct.placeholder = '2547XXXXXXXX'
+  } else {
+    if (bank) bank.disabled = false
+    if (acctLabel) acctLabel.textContent = 'Credit Account Number'
+    if (acct) acct.placeholder = 'Account number'
+  }
+}
+async function txSubmit(e) {
+  e.preventDefault()
+  const body = {
+    transaction_type: $('tx_type').value,
+    bank_code: $('tx_bank').value,
+    beneficiary_name: $('tx_name').value,
+    credit_account: $('tx_account').value,
+    amount: $('tx_amount').value,
+    currency: ($('tx_currency').value || 'KES').toUpperCase(),
+    payment_details: $('tx_details').value,
+  }
+  const btn = $('txBtn'); btn.disabled = true; btn.classList.add('opacity-50')
+  $('txStatus').innerHTML = `<div class="text-xs text-slate-500"><i class="fas fa-spinner fa-spin mr-1"></i>Sending transfer…</div>`
+  try {
+    const { data } = await api.post('/transactions/transfer', body)
+    $('txStatus').innerHTML = `<div class="bg-emerald-50 border border-emerald-300 rounded-lg p-3 text-xs text-emerald-800">
+      <i class="fas fa-circle-check mr-1"></i>${esc(data.message || 'Transfer accepted.')}<br>
+      Ref: <b>${esc(data.transaction_ref)}</b>${data.retrieval_ref ? ' · Retrieval: ' + esc(data.retrieval_ref) : ''} · ${esc(data.status)}${data.simulated ? ' (simulation)' : ''}</div>`
+    toast('Transfer ' + (data.status === 'SUCCESS' ? 'completed' : 'submitted'))
+    setTimeout(() => { closeModal(); viewTransactions() }, 2000)
+  } catch (err) {
+    $('txStatus').innerHTML = `<div class="bg-red-50 border border-red-300 rounded-lg p-3 text-xs text-red-700">${esc(err.response?.data?.error || 'Transfer failed')}</div>`
+    btn.disabled = false; btn.classList.remove('opacity-50')
+  }
 }
 
 // ---------------------------------------------------------------------------

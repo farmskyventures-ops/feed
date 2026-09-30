@@ -41,12 +41,12 @@
 import { Hono } from 'hono'
 import { stkPush, stkQuery, normalizePhone } from './mpesa'
 import { sasapayStkPush, sasapayQuery, sasapayProcessPayment, sasapayB2C, channelByCode } from './sasapay'
-import { buniStkPush, buniQuery } from './buni'
+import { buniStkPush, buniQuery, buniFundsTransfer, buniVerifyIpnSignature, BUNI_TRANSACTION_TYPES, BUNI_BANK_CODES } from './buni'
 import { verifySignature, verifySignatureMulti } from './payment-gateway-shared'
 import { getCookie } from 'hono/cookie'
 import type { Bindings } from './types'
 
-export type PaymentMethod = 'mpesa' | 'sasapay' | 'buni'
+export type PaymentMethod = 'mpesa' | 'sasapay' | 'buni' | 'buni_ft'
 
 const gateway = new Hono<{ Bindings: Bindings }>()
 
@@ -357,7 +357,9 @@ gateway.post('/initiate', async (c) => {
         accountNumber
       })
     } else {
-      providerResult = await buniStkPush(c.env, { phone, amount, account: transaction_ref, description: desc })
+      let buniCb = c.env.BUNI_STK_CALLBACK_URL
+      if (!buniCb) { try { buniCb = new URL('/api/v1/payments/callbacks/buni', c.req.url).toString() } catch { /* noop */ } }
+      providerResult = await buniStkPush(c.env, { phone, amount, account: transaction_ref, description: desc, callbackUrl: buniCb })
     }
   } catch (e: any) {
     return c.json({ success: false, error: e?.message || 'Provider error' }, 502)
@@ -686,6 +688,255 @@ gateway.post('/payout', async (c) => {
 })
 
 // ----------------------------------------------------------------------------
+// POST /funds-transfer   (KCB Buni FundsTransferAPIService)
+// Move money from the host's configured KCB debit account to a beneficiary:
+//   • Account-to-Account (internal KCB)      transactionType=IF, bankCode=01
+//   • Inter-bank RTGS / EFT / PesaLink        transactionType=RT|EF|PL + PIC
+//   • Mobile-money wallet (KCB → M-Pesa)      transactionType=MO, bankCode=MPESA
+//   • Currency conversion                     currency != KES
+// HMAC-signed exactly like /initiate & /payout. The async result is delivered
+// to the host's FT callback (POST /callbacks/funds-transfer) and reconciled.
+// ----------------------------------------------------------------------------
+gateway.post('/funds-transfer', async (c) => {
+  const rawBody = await c.req.text()
+
+  const client_key = c.req.header('X-Farmsky-Client') || ''
+  const timestamp = c.req.header('X-Farmsky-Timestamp') || ''
+  const nonce = c.req.header('X-Farmsky-Nonce') || ''
+  const signature = c.req.header('X-Farmsky-Signature') || ''
+  const idempotencyKey = c.req.header('Idempotency-Key') || null
+
+  if (!client_key) return c.json({ success: false, error: 'Missing X-Farmsky-Client header' }, 401)
+
+  const client = await loadClient(c, client_key)
+  if (!client || !client.is_active) {
+    await auditSecurity(c, 'UNKNOWN_CLIENT', 'WARN', { originApp: client_key, detail: 'funds-transfer from unknown/inactive client' })
+    return c.json({ success: false, error: 'Unknown or inactive client app' }, 401)
+  }
+
+  const marketplace = await loadMarketplace(c, client_key)
+  const marketplaceId = marketplace?.id ?? null
+  await setTenantScope(c, marketplaceId, false)
+
+  const v = await verifySignatureMulti(candidateSecrets(c, client), client_key, timestamp, nonce, rawBody, signature)
+  if (!v.ok) {
+    await auditSecurity(c, 'SIGNATURE_FAIL', 'CRITICAL', { marketplaceId, originApp: client_key, detail: v.error || 'invalid HMAC signature on /funds-transfer' })
+    return c.json({ success: false, error: v.error || 'Invalid signature' }, 401)
+  }
+
+  // Replay protection (shared nonce table).
+  if (nonce) {
+    try {
+      const existingNonce = await c.env.DB.prepare(`SELECT 1 FROM payment_nonces WHERE client_key = ? AND nonce = ? LIMIT 1`).bind(client_key, nonce).first<any>()
+      if (existingNonce) {
+        await auditSecurity(c, 'REPLAY', 'CRITICAL', { marketplaceId, originApp: client_key, detail: `replayed nonce ${nonce}` })
+        return c.json({ success: false, error: 'Replay detected' }, 401)
+      }
+      await c.env.DB.prepare(`INSERT INTO payment_nonces (client_key, nonce) VALUES (?, ?)`).bind(client_key, nonce).run()
+    } catch (e: any) {
+      const code = e?.code || ''
+      if (code === '23505' || /unique|duplicate/i.test(String(e?.message || ''))) {
+        await auditSecurity(c, 'REPLAY', 'CRITICAL', { marketplaceId, originApp: client_key, detail: `replayed nonce ${nonce}` })
+        return c.json({ success: false, error: 'Replay detected' }, 401)
+      }
+    }
+  }
+
+  let body: any = {}
+  try { body = rawBody ? JSON.parse(rawBody) : {} } catch { return c.json({ success: false, error: 'Body must be JSON' }, 400) }
+
+  // Validate + normalise the transfer request.
+  const amount = Number(body.amount ?? body.debitAmount)
+  const beneficiaryDetails = String(body.beneficiary_name || body.beneficiaryDetails || '').trim()
+  const creditAccountNumber = String(body.credit_account || body.creditAccountNumber || '').trim()
+  const transactionType = String(body.transaction_type || body.transactionType || '').trim().toUpperCase()
+  const beneficiaryBankCode = String(body.bank_code || body.beneficiaryBankCode || '').trim().toUpperCase()
+  const currency = String(body.currency || 'KES').trim().toUpperCase().slice(0, 3)
+  const paymentDetails = String(body.payment_details || body.paymentDetails || 'Payment').slice(0, 35)
+  const origin_reference = body.origin_reference ? String(body.origin_reference) : null
+
+  if (!Number.isFinite(amount) || amount <= 0) return c.json({ success: false, error: 'amount must be > 0' }, 400)
+  if (!beneficiaryDetails) return c.json({ success: false, error: 'beneficiary_name is required' }, 400)
+  if (!creditAccountNumber) return c.json({ success: false, error: 'credit_account is required' }, 400)
+  if (!BUNI_TRANSACTION_TYPES[transactionType]) return c.json({ success: false, error: 'transaction_type must be one of IF|RT|PL|EF|MO' }, 400)
+  if (!BUNI_BANK_CODES[beneficiaryBankCode]) return c.json({ success: false, error: 'bank_code is not a recognised participant code' }, 400)
+
+  // Idempotent replay.
+  if (idempotencyKey) {
+    const existing = await c.env.DB.prepare(
+      `SELECT transaction_ref, status FROM central_transactions WHERE origin_app = ? AND idempotency_key = ? LIMIT 1`
+    ).bind(client_key, idempotencyKey).first<any>()
+    if (existing) return c.json({ success: true, idempotent_replay: true, transaction_ref: existing.transaction_ref, status: existing.status })
+  }
+
+  const transaction_ref = genRef()
+  let ft: any
+  try {
+    ft = await buniFundsTransfer(c.env, {
+      beneficiaryDetails, creditAccountNumber, debitAmount: amount,
+      transactionReference: transaction_ref.slice(0, 12), transactionType, beneficiaryBankCode,
+      currency, paymentDetails,
+    })
+  } catch (e: any) {
+    return c.json({ success: false, error: e?.message || 'Funds transfer provider error' }, 502)
+  }
+  if (!ft?.success) {
+    await auditSecurity(c, 'FT_FAIL', 'WARN', { marketplaceId, originApp: client_key, transactionRef: transaction_ref, detail: ft?.error || 'FT rejected' })
+    return c.json({ success: false, error: ft?.error || ft?.status_description || 'Funds transfer rejected by provider' }, 502)
+  }
+
+  const ip = c.req.header('CF-Connecting-IP') || c.req.header('X-Forwarded-For') || null
+  const desc = `${BUNI_TRANSACTION_TYPES[transactionType]} → ${beneficiaryDetails}`.slice(0, 40)
+  await c.env.DB.prepare(
+    `INSERT INTO central_transactions
+        (transaction_ref, idempotency_key, origin_app, marketplace_id, origin_reference, payment_method,
+         provider_request_id, phone, amount, currency, description, status, direction, ip_address)
+      VALUES (?,?,?,?,?, 'buni_ft', ?,?,?,?,?, ?, 'payout', ?)`
+  ).bind(
+    transaction_ref, idempotencyKey, client_key, marketplaceId, origin_reference,
+    ft.merchant_id || ft.retrieval_ref || null, creditAccountNumber, amount, currency,
+    desc, ft.simulated ? 'SUCCESS' : 'PENDING', ip
+  ).run().catch(async () => {
+    await c.env.DB.prepare(
+      `INSERT INTO central_transactions
+          (transaction_ref, idempotency_key, origin_app, marketplace_id, origin_reference, payment_method,
+           provider_request_id, phone, amount, currency, description, status, ip_address)
+        VALUES (?,?,?,?,?, 'buni_ft', ?,?,?,?,?, ?, ?)`
+    ).bind(
+      transaction_ref, idempotencyKey, client_key, marketplaceId, origin_reference,
+      ft.merchant_id || ft.retrieval_ref || null, creditAccountNumber, amount, currency,
+      desc, ft.simulated ? 'SUCCESS' : 'PENDING', ip
+    ).run()
+  })
+
+  return c.json({
+    success: true,
+    transaction_ref,
+    payment_method: 'buni_ft',
+    transaction_type: transactionType,
+    transaction_type_label: BUNI_TRANSACTION_TYPES[transactionType],
+    bank: BUNI_BANK_CODES[beneficiaryBankCode],
+    simulated: !!ft.simulated,
+    merchant_id: ft.merchant_id || null,
+    retrieval_ref: ft.retrieval_ref || null,
+    status: ft.simulated ? 'SUCCESS' : 'PENDING',
+    customer_message: ft.status_description || (ft.simulated ? 'Funds transfer completed (simulation).' : 'Funds transfer accepted for processing.'),
+  })
+})
+
+// ----------------------------------------------------------------------------
+// POST /callbacks/funds-transfer   (KCB → host, after FT processing)
+// Reconciles a pending funds-transfer by provider merchant/retrieval ref.
+// ----------------------------------------------------------------------------
+gateway.post('/callbacks/funds-transfer', async (c) => {
+  const raw = await c.req.text()
+  try {
+    const body: any = JSON.parse(raw)
+    const providerReqId = body?.merchantId || body?.merchantID || body?.transactionReference || null
+    const status = String(body?.transactionStatus || '').toUpperCase()
+    const success = status === 'SUCCESS'
+    const receipt = body?.ftReference || body?.transactionReference || null
+    await settleCallback(c, 'buni_ft' as PaymentMethod, providerReqId, success, receipt ? String(receipt) : null, success ? '0' : '1', body?.transactionMessage || null, raw)
+  } catch (_) {
+    await logCallback(c, null, 'buni_ft', null, raw, false)
+  }
+  return c.json({ statusCode: '0', statusMessage: 'Notification received' })
+})
+
+// ----------------------------------------------------------------------------
+// INSTANT PAYMENT NOTIFICATION (IPN)  — KCB → host
+// KCB signs every IPN payload (SHA256withRSA). We verify the `signature`
+// header with the configured public key. Three flavours per the spec:
+//   POST /ipn/account       account credit notification
+//   POST /ipn/till          Vooma / Lipa-na-KCB till notification
+//   POST /ipn/validate      optional OTC/Agency bill validation
+// Verification result: true=valid, false=invalid(REJECT), null=no key.
+// In production a missing/invalid signature is rejected; in simulation
+// (no public key configured) we accept so sandbox testing works.
+// ----------------------------------------------------------------------------
+async function verifyIpn(c: any, raw: string): Promise<{ ok: boolean; reason?: string }> {
+  const sig = c.req.header('signature') || c.req.header('Signature') || null
+  const result = await buniVerifyIpnSignature(c.env, raw, sig)
+  if (result === null) return { ok: true, reason: 'unverified_no_public_key' } // sandbox/sim
+  if (result === true) return { ok: true }
+  return { ok: false, reason: 'signature_verification_failed' }
+}
+
+gateway.post('/ipn/account', async (c) => {
+  const raw = await c.req.text()
+  const v = await verifyIpn(c, raw)
+  if (!v.ok) {
+    await logCallback(c, null, 'buni_ipn', null, raw, false)
+    await auditSecurity(c, 'IPN_SIGNATURE_FAIL', 'CRITICAL', { originApp: 'buni', detail: v.reason || 'invalid IPN signature' })
+    return c.json({ statusCode: '1', statusMessage: 'Signature verification failed' }, 401)
+  }
+  let body: any = {}
+  try { body = raw ? JSON.parse(raw) : {} } catch { return c.json({ statusCode: '1', statusMessage: 'Invalid payload' }, 400) }
+  await setTenantScope(c, null, true)
+  await c.env.DB.prepare(
+    `INSERT INTO ipn_notifications (kind, transaction_reference, request_id, amount, currency, customer_reference, customer_name, customer_msisdn, narration, raw_payload, signature_verified)
+     VALUES ('account', ?,?,?,?,?,?,?,?,?, ?)`
+  ).bind(
+    body.transactionReference || null, body.requestId || null, body.transactionAmount || null,
+    body.currency || 'KES', body.customerReference || null, body.customerName || null,
+    body.customerMobileNumber || null, body.narration || null, raw, v.reason ? 0 : 1
+  ).run().catch(() => {})
+  // Echo the transactionID the 3rd party generated (our request_id/txref).
+  return c.json({ transactionID: body.requestId || genRef(), statusCode: '0', statusMessage: 'Notification received' })
+})
+
+gateway.post('/ipn/till', async (c) => {
+  const raw = await c.req.text()
+  const v = await verifyIpn(c, raw)
+  if (!v.ok) {
+    await logCallback(c, null, 'buni_ipn', null, raw, false)
+    await auditSecurity(c, 'IPN_SIGNATURE_FAIL', 'CRITICAL', { originApp: 'buni', detail: v.reason || 'invalid till IPN signature' })
+    return c.json({ header: { statusCode: '1', statusMessage: 'Signature verification failed' } }, 401)
+  }
+  let body: any = {}
+  try { body = raw ? JSON.parse(raw) : {} } catch { return c.json({ header: { statusCode: '1', statusMessage: 'Invalid payload' } }, 400) }
+  const nd = body?.requestPayload?.additionalData?.notificationData || {}
+  const hdr = body?.header || {}
+  await setTenantScope(c, null, true)
+  await c.env.DB.prepare(
+    `INSERT INTO ipn_notifications (kind, transaction_reference, request_id, amount, currency, customer_reference, customer_name, customer_msisdn, narration, raw_payload, signature_verified)
+     VALUES ('till', ?,?,?,?,?,?,?,?,?, ?)`
+  ).bind(
+    nd.transactionID || null, hdr.messageID || null, nd.transactionAmt || null,
+    nd.currency || 'KES', nd.businessKey || null,
+    [nd.firstName, nd.middleName, nd.lastName].filter(Boolean).join(' ') || null,
+    nd.debitMSISDN || null, nd.narration || null, raw, v.reason ? 0 : 1
+  ).run().catch(() => {})
+  return c.json({
+    header: { messageID: hdr.messageID || genRef(), originatorConversationID: hdr.originatorConversationID || '', statusCode: '0', statusMessage: 'Notification received' },
+    responsePayload: { transactionInfo: { transactionId: nd.transactionID || genRef() } }
+  })
+})
+
+gateway.post('/ipn/validate', async (c) => {
+  const raw = await c.req.text()
+  const v = await verifyIpn(c, raw)
+  if (!v.ok) {
+    await auditSecurity(c, 'IPN_SIGNATURE_FAIL', 'CRITICAL', { originApp: 'buni', detail: v.reason || 'invalid validation signature' })
+    return c.json({ statusCode: '1', statusMessage: 'Signature verification failed' }, 401)
+  }
+  let body: any = {}
+  try { body = raw ? JSON.parse(raw) : {} } catch { return c.json({ statusCode: '1', statusMessage: 'Invalid payload' }, 400) }
+  // Bill validation lookup: resolve the customerReference against origin references.
+  await setTenantScope(c, null, true)
+  const ref = String(body.customerReference || '').trim()
+  const tx = ref ? await c.env.DB.prepare(
+    `SELECT amount, currency, description FROM central_transactions WHERE origin_reference = ? OR transaction_ref = ? LIMIT 1`
+  ).bind(ref, ref).first<any>() : null
+  if (!tx) return c.json({ transactionID: genRef(), statusCode: '1', statusMessage: 'Bill not found' })
+  return c.json({
+    transactionID: genRef(), statusCode: '0', statusMessage: 'Success',
+    CustomerName: tx.description || 'Customer', billAmount: String(tx.amount), currency: tx.currency || 'KES',
+    billType: 'FIXED', creditAccountIdentifier: ref,
+  })
+})
+
+// ----------------------------------------------------------------------------
 // CALLBACKS (provider IPNs)
 // ----------------------------------------------------------------------------
 async function settleCallback(c: any, method: PaymentMethod, providerReqId: string | null, success: boolean, receipt: string | null, resultCode: string | null, resultDesc: string | null, rawBody: string) {
@@ -787,15 +1038,35 @@ gateway.post('/callbacks/buni', async (c) => {
   const raw = await c.req.text()
   try {
     const body: any = JSON.parse(raw)
-    const providerReqId = body?.CheckoutRequestID || body?.TransactionID || null
-    const code = body?.ResponseCode ?? body?.ResultCode
+    // KCB Buni STK result notifications are nested under Body.stkCallback per
+    // the M-Pesa Express spec. Support that canonical shape AND the older flat
+    // shape (backward compatible) so no in-flight transaction is missed.
+    const stk = body?.Body?.stkCallback || null
+    let providerReqId: string | null
+    let code: any
+    let receipt: string | null = null
+    let resultDesc: string | null
+    if (stk) {
+      providerReqId = stk.CheckoutRequestID || stk.MerchantRequestID || null
+      code = stk.ResultCode
+      resultDesc = stk.ResultDesc || null
+      const items = stk?.CallbackMetadata?.Item
+      if (Array.isArray(items)) {
+        const r = items.find((i: any) => i?.Name === 'MpesaReceiptNumber')
+        if (r && r.Value != null) receipt = String(r.Value)
+      }
+    } else {
+      providerReqId = body?.CheckoutRequestID || body?.TransactionID || null
+      code = body?.ResponseCode ?? body?.ResultCode
+      resultDesc = body?.ResponseDescription || body?.ResultDesc || null
+      receipt = body?.TransactionID || body?.ReceiptNumber || null
+    }
     const success = code === '00' || code === 0 || code === '0' || body?.status === true
-    const receipt = body?.TransactionID || body?.ReceiptNumber || null
-    await settleCallback(c, 'buni', providerReqId, success, receipt ? String(receipt) : null, String(code ?? ''), body?.ResponseDescription || body?.ResultDesc || null, raw)
+    await settleCallback(c, 'buni', providerReqId, success, receipt ? String(receipt) : null, String(code ?? ''), resultDesc, raw)
   } catch (_) {
     await logCallback(c, null, 'buni', null, raw, false)
   }
-  return c.json({ ResponseCode: '00', ResponseMessage: 'Success' })
+  return c.json({ ResultCode: 0, ResultDesc: 'Accepted' })
 })
 
 // ----------------------------------------------------------------------------

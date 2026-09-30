@@ -10,7 +10,7 @@ import {
   SASAPAY_CHANNELS, channelByCode, accountTypeForChannel,
   normalizePhone as sasapayNormalizePhone
 } from './sasapay'
-import { buniStkPush, buniQuery, buniConfigured } from './buni'
+import { buniStkPush, buniQuery, buniConfigured, buniFundsTransfer, buniFtConfigured, BUNI_TRANSACTION_TYPES, BUNI_BANK_CODES } from './buni'
 import paymentGateway from './payment-gateway-host'
 import { sendSms, smsConfigured, generateOtp } from './sms'
 import { sendEmail, emailConfigured } from './email'
@@ -3389,6 +3389,135 @@ app.get('/api/buni/status', requireAuth, (c) => {
   // Buni is hidden from the front-end user. The gateway routes remain
   // functional for server-to-server integrations, but the UI never exposes it.
   return c.json({ live: buniConfigured(c.env), mode: buniConfigured(c.env) ? (c.env.BUNI_ENV || 'sandbox') : 'simulation', hidden: true })
+})
+
+// ----------------------------------------------------------------------------
+// KCB BANK TRANSFERS & TRANSACTIONS (dashboard module — KYC-gated)
+//
+// Exposes the KCB Buni FundsTransfer capability to the dashboard:
+//   • Account-to-Account (internal KCB)        transaction_type=IF, bank_code=01
+//   • Inter-Bank RTGS / EFT / PesaLink          transaction_type=RT|EF|PL + PIC
+//   • Mobile-Money Wallet (KCB → M-Pesa)        transaction_type=MO, bank_code=MPESA
+//   • Currency Conversion                       currency != KES
+//
+// ACCESS CONTROL (defense-in-depth):
+//   1. RBAC — the caller must hold `manage_transactions` (admins always do).
+//   2. KYC — the caller must be KYC-verified. Admin/super_admin are treated as
+//      institutionally verified; every other role must have a linked customer
+//      record with kyc_status='verified'. Enforced server-side, never trusting
+//      the client.
+// ----------------------------------------------------------------------------
+async function isKycVerified(c: any, user: SessionUser): Promise<boolean> {
+  if (['admin', 'super_admin'].includes(user.role)) return true
+  // A user is verified if any customer record they own / are linked to is verified.
+  const row = await c.env.DB.prepare(
+    `SELECT 1 FROM customers WHERE kyc_status='verified' AND (user_id=? OR agent_id=? OR onboarded_by=?) LIMIT 1`
+  ).bind(String(user.id), String(user.id), String(user.id)).first<any>()
+  return !!row
+}
+function canManageTransactions(user: SessionUser): boolean {
+  return user.role === 'admin' || user.role === 'super_admin' || hasPermission(user, 'manage_transactions')
+}
+
+// Reference data the transactions form needs (transaction types + bank codes).
+app.get('/api/transactions/meta', requireAuth, async (c) => {
+  const user = c.get('user') as SessionUser
+  if (!canManageTransactions(user)) return c.json({ error: 'Forbidden' }, 403)
+  const kyc = await isKycVerified(c, user)
+  return c.json({
+    kyc_verified: kyc,
+    ft_live: buniFtConfigured(c.env),
+    transaction_types: Object.entries(BUNI_TRANSACTION_TYPES).map(([code, label]) => ({ code, label })),
+    banks: Object.entries(BUNI_BANK_CODES).map(([code, name]) => ({ code, name })),
+  })
+})
+
+// Initiate a bank/mobile funds transfer (KYC-gated).
+app.post('/api/transactions/transfer', requireAuth, async (c) => {
+  const user = c.get('user') as SessionUser
+  if (!canManageTransactions(user)) return c.json({ error: 'Forbidden — you are not authorized to make transfers.' }, 403)
+  if (!(await isKycVerified(c, user))) return c.json({ error: 'KYC verification required. Complete your KYC to access bank transfers.' }, 403)
+  const b = await c.req.json()
+  const amount = Number(b.amount)
+  const beneficiaryDetails = String(b.beneficiary_name || '').trim()
+  const creditAccountNumber = String(b.credit_account || '').trim()
+  const transactionType = String(b.transaction_type || '').trim().toUpperCase()
+  const beneficiaryBankCode = String(b.bank_code || '').trim().toUpperCase()
+  const currency = String(b.currency || 'KES').trim().toUpperCase().slice(0, 3)
+  const paymentDetails = String(b.payment_details || 'Payment').slice(0, 35)
+  if (!Number.isFinite(amount) || amount <= 0) return c.json({ error: 'Enter a valid amount greater than zero.' }, 400)
+  if (!beneficiaryDetails) return c.json({ error: 'Beneficiary name is required.' }, 400)
+  if (!creditAccountNumber) return c.json({ error: 'Credit account / phone number is required.' }, 400)
+  if (!BUNI_TRANSACTION_TYPES[transactionType]) return c.json({ error: 'Select a valid transfer type (IF, RT, PL, EF or MO).' }, 400)
+  if (!BUNI_BANK_CODES[beneficiaryBankCode]) return c.json({ error: 'Select a valid beneficiary bank.' }, 400)
+  // Mobile-money transfers must target the MPESA participant code.
+  if (transactionType === 'MO' && beneficiaryBankCode !== 'MPESA') return c.json({ error: 'Mobile-money transfers must use the MPESA destination.' }, 400)
+
+  const transaction_ref = ref('FT')
+  let ftResult: any
+  try {
+    ftResult = await buniFundsTransfer(c.env, {
+      beneficiaryDetails, creditAccountNumber, debitAmount: amount,
+      transactionReference: transaction_ref.slice(0, 12), transactionType, beneficiaryBankCode,
+      currency, paymentDetails,
+    })
+  } catch (e: any) {
+    return c.json({ error: e?.message || 'Funds transfer failed' }, 502)
+  }
+  if (!ftResult?.success) return c.json({ error: ftResult?.error || ftResult?.status_description || 'Funds transfer rejected.' }, 502)
+
+  // Record on the shared central ledger (payout direction) so it appears in the
+  // dashboard transactions list and admin reporting.
+  const desc = `${BUNI_TRANSACTION_TYPES[transactionType]} → ${beneficiaryDetails}`.slice(0, 40)
+  try {
+    await c.env.DB.prepare(
+      `INSERT INTO central_transactions
+          (transaction_ref, origin_app, origin_reference, payment_method, provider_request_id, phone, amount, currency, description, status, direction, initiated_by_user, ip_address)
+        VALUES (?, 'equipment', ?, 'buni_ft', ?, ?, ?, ?, ?, ?, 'payout', ?, ?)`
+    ).bind(
+      transaction_ref, b.origin_reference || null, ftResult.merchant_id || ftResult.retrieval_ref || null,
+      creditAccountNumber, amount, currency, desc, ftResult.simulated ? 'SUCCESS' : 'PENDING',
+      Number(user.id) || null, c.req.header('CF-Connecting-IP') || null
+    ).run()
+  } catch (_) { /* ledger optional; do not fail the transfer */ }
+  await audit(c, user.id, 'funds_transfer', 'buni_ft', `${currency} ${amount} → ${beneficiaryDetails} (${BUNI_TRANSACTION_TYPES[transactionType]}, ${ftResult.simulated ? 'sim' : 'live'})`)
+  return c.json({
+    ok: true,
+    transaction_ref,
+    simulated: !!ftResult.simulated,
+    status: ftResult.simulated ? 'SUCCESS' : 'PENDING',
+    merchant_id: ftResult.merchant_id || null,
+    retrieval_ref: ftResult.retrieval_ref || null,
+    transaction_type_label: BUNI_TRANSACTION_TYPES[transactionType],
+    bank: BUNI_BANK_CODES[beneficiaryBankCode],
+    message: ftResult.status_description || (ftResult.simulated ? 'Transfer completed (simulation).' : 'Transfer accepted for processing.'),
+  })
+})
+
+// List transfers the caller initiated (admins see all). KYC-gated.
+app.get('/api/transactions', requireAuth, async (c) => {
+  const user = c.get('user') as SessionUser
+  if (!canManageTransactions(user)) return c.json({ error: 'Forbidden' }, 403)
+  const isAdmin = ['admin', 'super_admin'].includes(user.role)
+  const rows = isAdmin
+    ? await c.env.DB.prepare(
+        `SELECT transaction_ref, payment_method, phone, amount, currency, description, status, direction, created_at
+           FROM central_transactions WHERE payment_method='buni_ft' ORDER BY created_at DESC LIMIT 200`
+      ).all()
+    : await c.env.DB.prepare(
+        `SELECT transaction_ref, payment_method, phone, amount, currency, description, status, direction, created_at
+           FROM central_transactions WHERE payment_method='buni_ft' AND initiated_by_user=? ORDER BY created_at DESC LIMIT 200`
+      ).bind(Number(user.id) || -1).all()
+  return c.json({ transactions: rows.results || [], kyc_verified: await isKycVerified(c, user) })
+})
+
+// Admin view of received Instant Payment Notifications.
+app.get('/api/ipn/notifications', requireAuth, requireRole('admin', 'super_admin'), async (c) => {
+  const { results } = await c.env.DB.prepare(
+    `SELECT id, kind, transaction_reference, amount, currency, customer_name, customer_msisdn, narration, signature_verified, created_at
+       FROM ipn_notifications ORDER BY created_at DESC LIMIT 200`
+  ).all()
+  return c.json({ notifications: results || [] })
 })
 
 // ----------------------------------------------------------------------------
