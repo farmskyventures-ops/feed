@@ -1167,7 +1167,9 @@ function navItems() {
     { k: 'imports', i: 'fa-file-arrow-up', t: 'Bulk Import' },
     { k: 'backups', i: 'fa-shield-halved', t: 'Backups' },
     { k: 'api_management', i: 'fa-plug', t: 'API Management' },
-    { k: 'tenants', i: 'fa-cubes', t: 'Payment Tenants' }])
+    { k: 'tenants', i: 'fa-cubes', t: 'Payment Tenants' },
+    ...(canDo('manage_payment_channels') ? [{ k: 'channels', i: 'fa-money-check-dollar', t: 'Payment Channels' }] : []),
+    ...(canDo('manage_features') ? [{ k: 'features', i: 'fa-flask', t: 'Feature Management' }] : [])])
   if (r === 'operations_finance') return withAccount([...common,
     { k: 'approvals', i: 'fa-clipboard-check', t: 'Approvals' },
     financeQueue,
@@ -1242,9 +1244,9 @@ function renderApp() {
 }
 window.go = (r) => { state.route = r; toggleSidebar(false); renderApp() }
 function route() {
-  const titles = { dashboard: 'Dashboard', approvals: 'Financing Approvals', inventory: 'Inventory', finance_queue: 'Finance Approval Queue', customers: 'Customers', field_visits: 'Field Visits & Conversion', transactions: 'Bank Transfers & Transactions', crm: 'Sales & Support CRM', contracts: 'Purchases & Contracts', agents: 'Agent Management', users: 'User Accounts & Access', amendments: 'Pending Profile Amendments', ledger: 'Unified Payment Ledger', repayments: 'Repayment Performance', onboard: 'Farmer Onboarding', shop: 'Shop', marketplace: 'Equipment Marketplace', exports: 'Data Export & Reports', imports: 'Bulk User Data Upload', backups: 'Automated System Backups', settings: 'Financing & Markup Settings', profile: 'My Account', wallet: 'My Wallet', wallets: 'Wallets & Payouts', api_access: 'API Access', api_management: 'API Management', tenants: 'Payment Tenants' }
+  const titles = { dashboard: 'Dashboard', approvals: 'Financing Approvals', inventory: 'Inventory', finance_queue: 'Finance Approval Queue', customers: 'Customers', field_visits: 'Field Visits & Conversion', transactions: 'Bank Transfers & Transactions', crm: 'Sales & Support CRM', contracts: 'Purchases & Contracts', agents: 'Agent Management', users: 'User Accounts & Access', amendments: 'Pending Profile Amendments', ledger: 'Unified Payment Ledger', repayments: 'Repayment Performance', onboard: 'Farmer Onboarding', shop: 'Shop', marketplace: 'Equipment Marketplace', exports: 'Data Export & Reports', imports: 'Bulk User Data Upload', backups: 'Automated System Backups', settings: 'Financing & Markup Settings', profile: 'My Account', wallet: 'My Wallet', wallets: 'Wallets & Payouts', api_access: 'API Access', api_management: 'API Management', tenants: 'Payment Tenants', channels: 'Payment Channel Management', features: 'Feature Management & QA' }
   $('pageTitle').textContent = titles[state.route] || 'Dashboard'
-  const map = { dashboard: viewDashboard, approvals: viewApprovals, inventory: viewInventory, finance_queue: viewFinanceQueue, customers: viewCustomers, field_visits: viewFieldVisits, transactions: viewTransactions, crm: viewCrm, contracts: viewContracts, agents: viewAgents, users: viewUsers, amendments: viewAmendments, ledger: viewLedger, repayments: viewRepayments, onboard: viewOnboard, shop: viewShop, marketplace: viewMarketplace, exports: viewExports, imports: viewImports, backups: viewBackups, settings: viewSettings, profile: viewProfile, wallet: viewMyWallet, wallets: viewWallets, api_access: viewApiAccess, api_management: viewApiManagement, tenants: viewTenants }
+  const map = { dashboard: viewDashboard, approvals: viewApprovals, inventory: viewInventory, finance_queue: viewFinanceQueue, customers: viewCustomers, field_visits: viewFieldVisits, transactions: viewTransactions, crm: viewCrm, contracts: viewContracts, agents: viewAgents, users: viewUsers, amendments: viewAmendments, ledger: viewLedger, repayments: viewRepayments, onboard: viewOnboard, shop: viewShop, marketplace: viewMarketplace, exports: viewExports, imports: viewImports, backups: viewBackups, settings: viewSettings, profile: viewProfile, wallet: viewMyWallet, wallets: viewWallets, api_access: viewApiAccess, api_management: viewApiManagement, tenants: viewTenants, channels: viewChannels, features: viewFeatures }
   ;(map[state.route] || viewDashboard)()
 }
 
@@ -1976,6 +1978,10 @@ window.payModal = async (id, amount, outstanding, kind, opts) => {
   let mpMode = { mode: 'simulation', live: false }, kcbMode = { mode: 'simulation', live: false }
   try { mpMode = (await api.get('/mpesa/status')).data } catch {}
   try { kcbMode = (await api.get('/buni/status')).data } catch {}
+  // Payment Channel Management: only render rails enabled for THIS user.
+  let availChannels = ['mpesa', 'sasapay', 'buni']
+  try { const r = await api.get('/payment-channels/available'); if (Array.isArray(r.data.available)) availChannels = r.data.available } catch {}
+  const chOn = (k) => availChannels.includes(k)
   const modeBadge = (m) => m.live
 
   showModal(`<h3 class="text-lg font-bold mb-1"><i class="fas fa-mobile-alt text-teal-600 mr-2"></i>${esc(payTitle)}</h3>
@@ -1989,18 +1995,18 @@ window.payModal = async (id, amount, outstanding, kind, opts) => {
          backend/reconciliation-only rail and must stay hidden from customers. -->
     <label class="text-sm font-medium block mb-2">Choose payment method</label>
     <div class="grid grid-cols-3 gap-3 mb-3">
-      <label class="border rounded-lg p-3 text-center cursor-pointer bg-white border-slate-200 has-[:checked]:ring-2 has-[:checked]:ring-emerald-500 has-[:checked]:border-emerald-400">
-        <input type="radio" name="paymethod" value="mpesa" checked onchange="toggleSasaChannels()" class="hidden">
+      ${chOn('mpesa') ? `<label class="border rounded-lg p-3 text-center cursor-pointer bg-white border-slate-200 has-[:checked]:ring-2 has-[:checked]:ring-emerald-500 has-[:checked]:border-emerald-400">
+        <input type="radio" name="paymethod" value="mpesa" ${availChannels[0] === 'mpesa' ? 'checked' : ''} onchange="toggleSasaChannels()" class="hidden">
         <img src="/static/mpesa-logo.png" alt="M-Pesa" class="h-10 mx-auto mb-1 object-contain">
-      </label>
-      <label class="border rounded-lg p-3 text-center cursor-pointer bg-white border-slate-200 has-[:checked]:ring-2 has-[:checked]:ring-green-500 has-[:checked]:border-green-400">
-        <input type="radio" name="paymethod" value="sasapay" onchange="toggleSasaChannels()" class="hidden">
+      </label>` : ''}
+      ${chOn('sasapay') ? `<label class="border rounded-lg p-3 text-center cursor-pointer bg-white border-slate-200 has-[:checked]:ring-2 has-[:checked]:ring-green-500 has-[:checked]:border-green-400">
+        <input type="radio" name="paymethod" value="sasapay" ${availChannels[0] === 'sasapay' ? 'checked' : ''} onchange="toggleSasaChannels()" class="hidden">
         <img src="/static/sasapay-logo.png" alt="SasaPay" class="h-10 mx-auto mb-1 object-contain">
-      </label>
-      <label class="border rounded-lg p-3 text-center cursor-pointer bg-white border-slate-200 has-[:checked]:ring-2 has-[:checked]:ring-red-500 has-[:checked]:border-red-400">
-        <input type="radio" name="paymethod" value="buni" onchange="toggleSasaChannels()" class="hidden">
+      </label>` : ''}
+      ${chOn('buni') ? `<label class="border rounded-lg p-3 text-center cursor-pointer bg-white border-slate-200 has-[:checked]:ring-2 has-[:checked]:ring-red-500 has-[:checked]:border-red-400">
+        <input type="radio" name="paymethod" value="buni" ${availChannels[0] === 'buni' ? 'checked' : ''} onchange="toggleSasaChannels()" class="hidden">
         <div class="h-10 flex items-center justify-center mb-1"><span class="font-extrabold text-red-600 text-lg tracking-tight">KCB</span></div>
-      </label>
+      </label>` : ''}
     </div>
 
     <!-- KCB secondary choice: STK Push vs Funds Transfer -->
@@ -4494,6 +4500,87 @@ async function txSubmit(e) {
     $('txStatus').innerHTML = `<div class="bg-red-50 border border-red-300 rounded-lg p-3 text-xs text-red-700">${esc(err.response?.data?.error || 'Transfer failed')}</div>`
     btn.disabled = false; btn.classList.remove('opacity-50')
   }
+}
+
+// ===========================================================================
+// PAYMENT CHANNEL MANAGEMENT  +  FEATURE MANAGEMENT & QA (Super-Admin console)
+//   Both render the same 3-step lifecycle control (sandbox → testing → live)
+//   with a global/system-wide toggle and a per-user selection. Access is gated
+//   by canDo(manage_payment_channels) / canDo(manage_features).
+// ===========================================================================
+const STAGE_BADGE = { sandbox: 'bg-slate-100 text-slate-600', testing: 'bg-amber-100 text-amber-700', live: 'bg-emerald-100 text-emerald-700' }
+function stageSelect(id, cur) {
+  return `<select id="${id}" class="px-2 py-1 border rounded-lg text-xs">
+    ${['sandbox','testing','live'].map(s => `<option value="${s}" ${cur === s ? 'selected' : ''}>${s.charAt(0).toUpperCase()+s.slice(1)}</option>`).join('')}
+  </select>`
+}
+async function viewChannels() {
+  $('content').innerHTML = '<div class="text-slate-400">Loading…</div>'
+  let channels = []
+  try { channels = (await api.get('/payment-channels')).data.channels || [] }
+  catch (err) { $('content').innerHTML = `<div class="card p-6 text-red-600">${esc(err.response?.data?.error || 'Forbidden')}</div>`; return }
+  $('content').innerHTML = `
+    <div class="card p-4 mb-4 text-sm text-slate-600"><i class="fas fa-circle-info text-teal-600 mr-1"></i>Control which payment rails are visible and where in the rollout each sits. <b>Sandbox</b> = Super-Admin only; <b>Testing</b> = selected pilot users; <b>Live</b> = selected users, or everyone when <b>Global</b> is on.</div>
+    <div class="card table-card"><table class="w-full text-sm">
+      <thead class="bg-slate-50 text-slate-500 text-xs uppercase"><tr><th class="text-left px-4 py-3">Channel</th><th class="text-left px-4 py-3">Stage</th><th class="text-left px-4 py-3">Global</th><th class="text-left px-4 py-3">Pilot/Selected Users (comma phone/ids)</th><th class="text-right px-4 py-3">Save</th></tr></thead>
+      <tbody>${channels.map(ch => `<tr class="border-t border-slate-100" data-key="${esc(ch.channel_key)}">
+        <td class="px-4 py-3 font-medium">${esc(ch.label)} <span class="text-[10px] px-2 py-0.5 rounded-full ${STAGE_BADGE[ch.stage] || ''}">${esc(ch.stage)}</span></td>
+        <td class="px-4 py-3">${stageSelect('ch_stage_' + ch.channel_key, ch.stage)}</td>
+        <td class="px-4 py-3"><input type="checkbox" id="ch_global_${esc(ch.channel_key)}" ${Number(ch.global_enabled) ? 'checked' : ''} class="h-4 w-4"></td>
+        <td class="px-4 py-3"><input id="ch_users_${esc(ch.channel_key)}" value="${esc((ch.users||[]).join(', '))}" placeholder="user ids" class="w-full px-2 py-1 border rounded-lg text-xs"></td>
+        <td class="px-4 py-3 text-right"><button onclick="saveChannel('${esc(ch.channel_key)}')" class="btn brand-bg text-white px-3 py-1.5 rounded-lg text-xs">Save</button></td>
+      </tr>`).join('')}</tbody>
+    </table></div>`
+}
+window.saveChannel = async (key) => {
+  const stage = $('ch_stage_' + key).value
+  const global_enabled = $('ch_global_' + key).checked
+  const users = ($('ch_users_' + key).value || '').split(',').map(s => s.trim()).filter(Boolean)
+  try { await api.put('/payment-channels/' + key, { stage, global_enabled, users }); toast('Channel updated'); viewChannels() }
+  catch (err) { toast(err.response?.data?.error || 'Failed', false) }
+}
+async function viewFeatures() {
+  $('content').innerHTML = '<div class="text-slate-400">Loading…</div>'
+  let features = []
+  try { features = (await api.get('/features')).data.features || [] }
+  catch (err) { $('content').innerHTML = `<div class="card p-6 text-red-600">${esc(err.response?.data?.error || 'Forbidden')}</div>`; return }
+  $('content').innerHTML = `
+    <div class="flex items-center justify-between mb-4">
+      <div class="text-sm text-slate-600"><i class="fas fa-flask text-teal-600 mr-1"></i>Govern feature release. Features in <b>Sandbox</b> are hidden from end users; <b>Testing</b> exposes to a whitelist; <b>Live</b> to selected users or everyone (Global).</div>
+      <button onclick="newFeature()" class="btn brand-bg text-white px-4 py-2 rounded-lg text-sm"><i class="fas fa-plus mr-1"></i>Register Feature</button>
+    </div>
+    <div class="card table-card"><table class="w-full text-sm">
+      <thead class="bg-slate-50 text-slate-500 text-xs uppercase"><tr><th class="text-left px-4 py-3">Feature</th><th class="text-left px-4 py-3">Stage</th><th class="text-left px-4 py-3">Global</th><th class="text-left px-4 py-3">Whitelist Users</th><th class="text-right px-4 py-3">Save</th></tr></thead>
+      <tbody>${features.map(f => `<tr class="border-t border-slate-100">
+        <td class="px-4 py-3"><div class="font-medium">${esc(f.label)}</div><div class="text-[11px] text-slate-400 font-mono">${esc(f.feature_key)}</div></td>
+        <td class="px-4 py-3">${stageSelect('ft_stage_' + f.feature_key, f.stage)}</td>
+        <td class="px-4 py-3"><input type="checkbox" id="ft_global_${esc(f.feature_key)}" ${Number(f.global_enabled) ? 'checked' : ''} class="h-4 w-4"></td>
+        <td class="px-4 py-3"><input id="ft_users_${esc(f.feature_key)}" value="${esc((f.users||[]).join(', '))}" placeholder="user ids" class="w-full px-2 py-1 border rounded-lg text-xs"></td>
+        <td class="px-4 py-3 text-right"><button onclick="saveFeature('${esc(f.feature_key)}')" class="btn brand-bg text-white px-3 py-1.5 rounded-lg text-xs">Save</button></td>
+      </tr>`).join('') || '<tr><td colspan="5" class="text-center py-8 text-slate-400">No features registered yet</td></tr>'}</tbody>
+    </table></div>`
+}
+window.newFeature = () => {
+  showModal(`<h3 class="text-lg font-bold mb-3">Register Feature</h3>
+    <form id="ftForm" class="space-y-3">
+      <div><label class="field-label">Feature name</label><input id="ft_label" class="w-full px-3 py-2 border rounded-lg" placeholder="e.g. New Analytics Dashboard"></div>
+      <div><label class="field-label">Key (optional)</label><input id="ft_key" class="w-full px-3 py-2 border rounded-lg" placeholder="auto from name if blank"></div>
+      <div><label class="field-label">Description</label><textarea id="ft_desc" class="w-full px-3 py-2 border rounded-lg" rows="2"></textarea></div>
+      <div class="flex gap-2"><button class="btn flex-1 brand-bg text-white py-2 rounded-lg text-sm">Create (Sandbox)</button>
+      <button type="button" onclick="closeModal()" class="btn px-4 bg-slate-100 rounded-lg text-sm">Cancel</button></div>
+    </form>`)
+  $('ftForm').onsubmit = async (e) => {
+    e.preventDefault()
+    try { await api.post('/features', { label: $('ft_label').value, feature_key: $('ft_key').value, description: $('ft_desc').value }); toast('Feature registered'); closeModal(); viewFeatures() }
+    catch (err) { toast(err.response?.data?.error || 'Failed', false) }
+  }
+}
+window.saveFeature = async (key) => {
+  const stage = $('ft_stage_' + key).value
+  const global_enabled = $('ft_global_' + key).checked
+  const users = ($('ft_users_' + key).value || '').split(',').map(s => s.trim()).filter(Boolean)
+  try { await api.put('/features/' + key, { stage, global_enabled, users }); toast('Feature updated'); viewFeatures() }
+  catch (err) { toast(err.response?.data?.error || 'Failed', false) }
 }
 
 // ---------------------------------------------------------------------------

@@ -3533,6 +3533,138 @@ app.get('/api/ipn/notifications', requireAuth, requireRole('admin', 'super_admin
   return c.json({ notifications: results || [] })
 })
 
+// ============================================================================
+// PAYMENT CHANNEL MANAGEMENT  +  FEATURE MANAGEMENT & QA
+//   Two governance modules sharing one lifecycle: sandbox → testing → live.
+//     • sandbox  — visible only to Super-Admins (internal validation)
+//     • testing  — visible to a restricted whitelist of selected users
+//     • live     — selected users OR global (system-wide) when global_enabled
+//   Config is restricted to Super-Admins or holders of the matching delegable
+//   permission (manage_payment_channels / manage_features).
+// ============================================================================
+function canManagePaymentChannels(user: SessionUser) {
+  return user.role === 'super_admin' || hasPermission(user, 'manage_payment_channels')
+}
+function canManageFeatures(user: SessionUser) {
+  return user.role === 'super_admin' || hasPermission(user, 'manage_features')
+}
+// Resolve whether a lifecycle row is available to a given user.
+//   admins/super_admins: always (so they can see & QA every stage)
+//   sandbox: only super_admin
+//   testing: only whitelisted users
+//   live: global_enabled → everyone; else only whitelisted/selected users
+async function isLifecycleAvailable(c: any, table: 'payment_channel' | 'feature_flag', keyCol: string, keyVal: string, row: any, user: SessionUser): Promise<boolean> {
+  if (!row || !user) return false
+  if (['admin', 'super_admin'].includes(user.role)) return true
+  const stage = String(row.stage || 'sandbox')
+  if (stage === 'sandbox') return false
+  if (stage === 'live' && Number(row.global_enabled)) return true
+  // testing, or live-but-not-global → must be whitelisted.
+  const whTable = table === 'payment_channel' ? 'payment_channel_users' : 'feature_flag_users'
+  const wh = await c.env.DB.prepare(`SELECT 1 FROM ${whTable} WHERE ${keyCol}=? AND user_id=? LIMIT 1`).bind(keyVal, String(user.id)).first<any>()
+  return !!wh
+}
+
+// ---- Payment Channels ------------------------------------------------------
+// Admin config list (full detail incl. whitelist counts).
+app.get('/api/payment-channels', requireAuth, async (c) => {
+  const user = c.get('user') as SessionUser
+  if (!canManagePaymentChannels(user)) return c.json({ error: 'Forbidden' }, 403)
+  const { results } = await c.env.DB.prepare(`SELECT * FROM payment_channels ORDER BY id`).all()
+  const out: any[] = []
+  for (const ch of (results || []) as any[]) {
+    const users = await c.env.DB.prepare(`SELECT user_id FROM payment_channel_users WHERE channel_key=?`).bind(ch.channel_key).all()
+    out.push({ ...ch, users: (users.results || []).map((u: any) => u.user_id) })
+  }
+  return c.json({ channels: out })
+})
+// Per-user "which channels can I use at checkout" (consumed by the checkout UI).
+app.get('/api/payment-channels/available', requireAuth, async (c) => {
+  const user = c.get('user') as SessionUser
+  const { results } = await c.env.DB.prepare(`SELECT * FROM payment_channels WHERE active=1 ORDER BY id`).all()
+  const avail: string[] = []
+  for (const ch of (results || []) as any[]) {
+    if (await isLifecycleAvailable(c, 'payment_channel', 'channel_key', ch.channel_key, ch, user)) avail.push(ch.channel_key)
+  }
+  return c.json({ available: avail })
+})
+// Update a channel's lifecycle stage / scope / whitelist.
+app.put('/api/payment-channels/:key', requireAuth, async (c) => {
+  const user = c.get('user') as SessionUser
+  if (!canManagePaymentChannels(user)) return c.json({ error: 'Forbidden' }, 403)
+  const key = c.req.param('key')
+  const b = await c.req.json()
+  const ch = await c.env.DB.prepare(`SELECT * FROM payment_channels WHERE channel_key=?`).bind(key).first<any>()
+  if (!ch) return c.json({ error: 'Channel not found' }, 404)
+  const stage = ['sandbox', 'testing', 'live'].includes(String(b.stage)) ? String(b.stage) : ch.stage
+  const globalEnabled = b.global_enabled != null ? (b.global_enabled ? 1 : 0) : ch.global_enabled
+  const active = b.active != null ? (b.active ? 1 : 0) : ch.active
+  await c.env.DB.prepare(`UPDATE payment_channels SET stage=?, global_enabled=?, active=?, updated_by=?, updated_at=CURRENT_TIMESTAMP WHERE channel_key=?`)
+    .bind(stage, globalEnabled, active, String(user.id), key).run()
+  // Optional whitelist replacement.
+  if (Array.isArray(b.users)) {
+    await c.env.DB.prepare(`DELETE FROM payment_channel_users WHERE channel_key=?`).bind(key).run()
+    for (const uid of b.users) { if (uid) await c.env.DB.prepare(`INSERT INTO payment_channel_users (channel_key, user_id) VALUES (?,?)`).bind(key, String(uid)).run() }
+  }
+  await audit(c, user.id, 'update', 'payment_channel', `${key} → ${stage}${globalEnabled ? ' (global)' : ''}`)
+  return c.json({ ok: true })
+})
+
+// ---- Feature Flags ---------------------------------------------------------
+app.get('/api/features', requireAuth, async (c) => {
+  const user = c.get('user') as SessionUser
+  if (!canManageFeatures(user)) return c.json({ error: 'Forbidden' }, 403)
+  const { results } = await c.env.DB.prepare(`SELECT * FROM feature_flags ORDER BY id`).all()
+  const out: any[] = []
+  for (const f of (results || []) as any[]) {
+    const users = await c.env.DB.prepare(`SELECT user_id FROM feature_flag_users WHERE feature_key=?`).bind(f.feature_key).all()
+    out.push({ ...f, users: (users.results || []).map((u: any) => u.user_id) })
+  }
+  return c.json({ features: out })
+})
+// Register (create) a governed feature — idempotent on feature_key.
+app.post('/api/features', requireAuth, async (c) => {
+  const user = c.get('user') as SessionUser
+  if (!canManageFeatures(user)) return c.json({ error: 'Forbidden' }, 403)
+  const b = await c.req.json()
+  const key = slugifyKey(b.feature_key || b.label || '')
+  if (!key) return c.json({ error: 'A feature key or label is required.' }, 400)
+  const existing = await c.env.DB.prepare(`SELECT id FROM feature_flags WHERE feature_key=?`).bind(key).first<any>()
+  if (existing) return c.json({ ok: true, feature_key: key, existed: true })
+  await c.env.DB.prepare(`INSERT INTO feature_flags (feature_key, label, description, stage, global_enabled, updated_by) VALUES (?,?,?, 'sandbox', 0, ?)`)
+    .bind(key, b.label || key, b.description || null, String(user.id)).run()
+  await audit(c, user.id, 'create', 'feature_flag', key)
+  return c.json({ ok: true, feature_key: key })
+})
+// Per-user "which features are enabled for me" (consumed by the UI to gate rendering).
+app.get('/api/features/enabled', requireAuth, async (c) => {
+  const user = c.get('user') as SessionUser
+  const { results } = await c.env.DB.prepare(`SELECT * FROM feature_flags ORDER BY id`).all()
+  const enabled: string[] = []
+  for (const f of (results || []) as any[]) {
+    if (await isLifecycleAvailable(c, 'feature_flag', 'feature_key', f.feature_key, f, user)) enabled.push(f.feature_key)
+  }
+  return c.json({ enabled })
+})
+app.put('/api/features/:key', requireAuth, async (c) => {
+  const user = c.get('user') as SessionUser
+  if (!canManageFeatures(user)) return c.json({ error: 'Forbidden' }, 403)
+  const key = c.req.param('key')
+  const b = await c.req.json()
+  const f = await c.env.DB.prepare(`SELECT * FROM feature_flags WHERE feature_key=?`).bind(key).first<any>()
+  if (!f) return c.json({ error: 'Feature not found' }, 404)
+  const stage = ['sandbox', 'testing', 'live'].includes(String(b.stage)) ? String(b.stage) : f.stage
+  const globalEnabled = b.global_enabled != null ? (b.global_enabled ? 1 : 0) : f.global_enabled
+  await c.env.DB.prepare(`UPDATE feature_flags SET stage=?, global_enabled=?, updated_by=?, updated_at=CURRENT_TIMESTAMP WHERE feature_key=?`)
+    .bind(stage, globalEnabled, String(user.id), key).run()
+  if (Array.isArray(b.users)) {
+    await c.env.DB.prepare(`DELETE FROM feature_flag_users WHERE feature_key=?`).bind(key).run()
+    for (const uid of b.users) { if (uid) await c.env.DB.prepare(`INSERT INTO feature_flag_users (feature_key, user_id) VALUES (?,?)`).bind(key, String(uid)).run() }
+  }
+  await audit(c, user.id, 'update', 'feature_flag', `${key} → ${stage}${globalEnabled ? ' (global)' : ''}`)
+  return c.json({ ok: true })
+})
+
 // ----------------------------------------------------------------------------
 // CENTRAL PAYMENT GATEWAY (shared by equipment / feed / input marketplaces)
 // Public endpoint URL:  https://equipment.farmsky.africa/api/v1/payments/*
