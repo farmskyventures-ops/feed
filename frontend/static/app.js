@@ -1656,8 +1656,13 @@ window.buyModal = async (productId) => {
       </div>
       <div><label class="font-medium">Delivery Location</label><input id="dloc" type="text" placeholder="Village / Ward" class="w-full mt-1 px-3 py-2 border border-slate-300 rounded-lg"></div>
     </div>
-    <div class="responsive-grid cols-2 mt-3 text-xs">
+    <!-- Cash-only facts (shown only when Cash is selected) -->
+    <div id="cashFacts" class="responsive-grid cols-2 mt-3 text-xs hidden">
       <div class="bg-slate-50 border border-slate-200 rounded-lg p-3"><div class="text-slate-500">Cash deposit requirement</div><div class="font-semibold mt-1">${Number(p.cash_deposit_pct ?? 100)}%</div></div>
+      <div class="bg-slate-50 border border-slate-200 rounded-lg p-3"><div class="text-slate-500">Purchase type</div><div class="font-semibold mt-1">Outright cash</div></div>
+    </div>
+    <!-- Financing-only facts (shown only when Financing is selected) -->
+    <div id="finFacts" class="responsive-grid cols-2 mt-3 text-xs hidden">
       <div class="bg-slate-50 border border-slate-200 rounded-lg p-3"><div class="text-slate-500">Financing deposit requirement</div><div class="font-semibold mt-1">${Number(p.financing_deposit_pct ?? 10)}%</div></div>
       <div class="bg-slate-50 border border-slate-200 rounded-lg p-3"><div class="text-slate-500">Financing model</div><div class="font-semibold mt-1">${'Murabaha'}</div></div>
       <div class="bg-slate-50 border border-slate-200 rounded-lg p-3"><div class="text-slate-500">Profit / markup rate</div><div class="font-semibold mt-1">${Number(p.financing_interest_pct || 0)}%</div></div>
@@ -1670,19 +1675,25 @@ window.buyModal = async (productId) => {
   toggleTerm()
 }
 window.toggleTerm = () => {
+  const isFin = $('ptype') && $('ptype').value === 'financing'
   const wrap = $('termWrap')
-  if (wrap) wrap.classList.toggle('hidden', $('ptype').value !== 'financing')
+  if (wrap) wrap.classList.toggle('hidden', !isFin)
+  // DYNAMIC CHECKOUT: show only the facts relevant to the selected payment type
+  // and clear any stale quote so cash and financing never show mixed figures.
+  const cf = $('cashFacts'); if (cf) cf.classList.toggle('hidden', isFin)
+  const ff = $('finFacts'); if (ff) ff.classList.toggle('hidden', !isFin)
+  const qb = $('quoteBox'); if (qb) qb.innerHTML = ''
 }
 window.getQuote = async (productId) => {
   const body = { product_id: productId, quantity: $('qty').value, payment_type: $('ptype').value, term_months: $('term') ? $('term').value : 0 }
-  const { data } = await api.post('/murabaha/quote', body)
+  const { data } = await api.post('/checkout/quote', body)
   const financing = body.payment_type === 'financing'
   $('quoteBox').innerHTML = `
     <div class="bg-teal-50 border border-teal-200 rounded-xl p-4">
       <h4 class="font-bold text-teal-800 mb-2"><i class="fas fa-file-invoice-dollar mr-1"></i>Payment Summary</h4>
       <div class="space-y-1 text-sm">
         <div class="flex justify-between"><span>Purchase type</span><b>${payLabel(data.payment_type, data.financing_model)}</b></div>
-        <div class="flex justify-between"><span>Supplier cost</span><b>${fmt(data.supplier_cost)}</b></div>
+        ${(data.show_buyer || (state.user && state.user.role !== 'customer')) ? `<div class="flex justify-between"><span>Supplier cost</span><b>${fmt(data.supplier_cost)}</b></div>` : ''}
         <div class="flex justify-between"><span>Deposit required</span><b>${data.deposit_pct}% (${fmt(data.deposit_amount)})</b></div>
         <div class="flex justify-between"><span>Amount due now</span><b>${fmt(data.amount_due_now)}</b></div>
         <div class="flex justify-between"><span>Total payable</span><b>${fmt(data.total_payable)}</b></div>
@@ -1709,7 +1720,7 @@ window.submitBuy = async (productId, ev) => {
   // AGENT "Buy For": target the selected farmer's customer profile.
   if (_buyFor) body.customer_id = _buyFor.id
   try {
-    const { data } = await api.post('/murabaha/apply', body)
+    const { data } = await api.post('/checkout/apply', body)
     if (data.requires_payment) {
       // Cash purchase -> deposit due now. If an agent placed this order for a
       // farmer, direct the STK prompt to the farmer's phone; otherwise the
@@ -2628,7 +2639,17 @@ function productForm(prefix, p = {}) {
       <div><label class="field-label">Buying cost</label><input id="${prefix}_buy" type="number" value="${Number(p.buying_price || 0)}" placeholder="Buying price" class="px-3 py-2 border rounded-lg"></div>
       <div><label class="field-label">Quantity in stock</label><input id="${prefix}_qty" type="number" value="${Number(p.quantity || 0)}" placeholder="Quantity" class="px-3 py-2 border rounded-lg"></div>
       <div><label class="field-label">Reorder threshold</label><input id="${prefix}_rt" type="number" value="${Number(p.reorder_threshold || 10)}" placeholder="Reorder threshold" class="px-3 py-2 border rounded-lg"></div>
-      <div style="grid-column:1 / -1" class="border rounded-xl p-3 bg-white">
+      <div style="grid-column:1 / -1"><label class="field-label">Payment availability</label><select id="${prefix}_mode" onchange="onPaymentModeChange('${prefix}')" class="px-3 py-2 border rounded-lg w-full">
+        <option value="both" ${paymentMode === 'both' ? 'selected' : ''}>Cash + Financing</option>
+        <option value="cash" ${paymentMode === 'cash' ? 'selected' : ''}>Cash only</option>
+        <option value="financing" ${paymentMode === 'financing' ? 'selected' : ''}>Financing only</option>
+      </select></div>
+      <label style="grid-column:1 / -1" class="flex items-center justify-between rounded-lg border border-slate-200 px-3 py-2.5 cursor-pointer">
+        <span><span class="text-sm font-medium text-slate-700">Show buyer the cost &amp; markup breakdown</span>
+        <span class="block text-[11px] text-slate-400">If ON, buyers see Supplier Cost and Markups. If OFF, buyers see only the final price.</span></span>
+        <input id="${prefix}_show_buyer" type="checkbox" ${Number(p.show_buyer) ? 'checked' : ''} class="h-4 w-4 rounded">
+      </label>
+      <div id="${prefix}_cashBlock" style="grid-column:1 / -1" class="border rounded-xl p-3 bg-white">
         <div class="font-medium text-slate-700 mb-2 text-sm"><i class="fas fa-tags text-teal-600 mr-1"></i>Cash selling price</div>
         <div class="responsive-grid cols-2">
           <div><label class="field-label">Cash price mode</label><select id="${prefix}_cash_mode" onchange="onPriceModeChange('${prefix}','cash')" class="px-3 py-2 border rounded-lg">
@@ -2637,15 +2658,11 @@ function productForm(prefix, p = {}) {
           <div id="${prefix}_cash_pct_wrap"><label class="field-label">Cash markup %</label><input id="${prefix}_cm" type="number" value="${Number(p.cash_markup_pct ?? 10)}" placeholder="Cash markup %" class="px-3 py-2 border rounded-lg"></div>
           <div id="${prefix}_cash_amt_wrap"><label class="field-label">Cash markup amount (KES)</label><input id="${prefix}_cash_amt" type="number" value="${Number(p.cash_markup_amount || 0)}" placeholder="Fixed amount added to cost" class="px-3 py-2 border rounded-lg"></div>
           <div id="${prefix}_cash_man_wrap"><label class="field-label">Cash selling price (KES)</label><input id="${prefix}_cash_price" type="number" value="${Number(p.cash_price || 0)}" placeholder="Direct selling price" class="px-3 py-2 border rounded-lg"></div>
+          <div><label class="field-label">Cash deposit %</label><input id="${prefix}_cash_dep" type="number" value="${Number(p.cash_deposit_pct ?? 100)}" placeholder="Cash deposit % (0/10/100)" class="px-3 py-2 border rounded-lg"></div>
         </div>
+        ${agreementSourceBlock(prefix, 'cash', 'Cash agreement', p, '')}
       </div>
-      <div><label class="field-label">Payment availability</label><select id="${prefix}_mode" class="px-3 py-2 border rounded-lg">
-        <option value="both" ${paymentMode === 'both' ? 'selected' : ''}>Cash + Financing</option>
-        <option value="cash" ${paymentMode === 'cash' ? 'selected' : ''}>Cash only</option>
-        <option value="financing" ${paymentMode === 'financing' ? 'selected' : ''}>Financing only</option>
-      </select></div>
-      <div><label class="field-label">Cash deposit %</label><input id="${prefix}_cash_dep" type="number" value="${Number(p.cash_deposit_pct ?? 100)}" placeholder="Cash deposit % (0/10/100)" class="px-3 py-2 border rounded-lg"></div>
-      ${agreementSourceBlock(prefix, 'cash', 'Cash agreement', p, '')}
+      <div id="${prefix}_finBlock" style="grid-column:1 / -1">
       <div style="grid-column:1 / -1" class="mt-2 mb-1 flex items-center gap-2 text-sm font-semibold text-slate-700 border-t pt-3">
         <i class="fas fa-hand-holding-dollar text-teal-600"></i>Financial components ${canFin ? '' : '<span class="badge bg-amber-100 text-amber-700 ml-1">finance-authorized only</span>'}
       </div>
@@ -2688,7 +2705,15 @@ function productForm(prefix, p = {}) {
       <div><label class="field-label">Minimum term (months)</label><input id="${prefix}_tmin" ${finDis} type="number" value="${Number(p.financing_term_min_months || 3)}" placeholder="Minimum term (months)" class="px-3 py-2 border rounded-lg ${finDis ? 'bg-slate-100 text-slate-400' : ''}"></div>
       <div><label class="field-label">Maximum term (months)</label><input id="${prefix}_tmax" ${finDis} type="number" value="${Number(p.financing_term_max_months || 12)}" placeholder="Maximum term (months)" class="px-3 py-2 border rounded-lg ${finDis ? 'bg-slate-100 text-slate-400' : ''}"></div>
       ${agreementSourceBlock(prefix, 'fin', 'Financing agreement', p, finDis)}
+      </div>
     </div>`
+}
+// DYNAMIC PAYMENT AVAILABILITY: show cash block, financing block, or both.
+window.onPaymentModeChange = (prefix) => {
+  const mode = ($(prefix + '_mode') || {}).value || 'both'
+  const cash = $(prefix + '_cashBlock'); const fin = $(prefix + '_finBlock')
+  if (cash) cash.classList.toggle('hidden', mode === 'financing')
+  if (fin) fin.classList.toggle('hidden', mode === 'cash')
 }
 // Accept PDF + Word (.doc/.docx) + images for uploaded agreement documents.
 const AGREEMENT_UPLOAD_ACCEPT = 'application/pdf,application/msword,application/vnd.openxmlformats-officedocument.wordprocessingml.document,image/*'
@@ -2782,6 +2807,7 @@ window.onTenureUnitChange = (prefix) => {
 async function initProductForm(prefix) {
   onPriceModeChange(prefix, 'cash')
   onPriceModeChange(prefix, 'credit')
+  onPaymentModeChange(prefix)
   onTenureUnitChange(prefix)
   // Apply agreement source-mode visibility + keep the hidden textarea in sync
   // with the rich-text editor so productPayload() always reads current content.
@@ -2816,6 +2842,7 @@ function productPayload(prefix) {
     reorder_threshold: Number($(prefix + '_rt').value || 10),
     image: $(prefix + '_img').value || null,
     payment_option_mode: mode,
+    show_buyer: ($(prefix + '_show_buyer') && $(prefix + '_show_buyer').checked) ? 1 : 0,
     cash_enabled: mode !== 'financing',
     financing_enabled: mode !== 'cash',
     // Dynamic pricing modes (percentage | fixed | manual) + their inputs.
@@ -4025,6 +4052,14 @@ function fvProfileLabel(v) {
   if (v.profile_type === 'farming') return 'Farming · ' + (v.farming_type === 'crop' ? 'Crop' : v.farming_type === 'livestock' ? 'Livestock' : '—')
   return '—'
 }
+// Delete a field visit is Super-Admin-only by default, delegable via the
+// `delete_field_visits` permission. Unlike canDo(), plain admins do NOT get it
+// implicitly — they need the explicit grant.
+function canDeleteFieldVisit() {
+  if (!state.user) return false
+  if (state.user.role === 'super_admin') return true
+  return !!state.user.permissions?.delete_field_visits
+}
 function fvRow(v) {
   const converted = v.status === 'converted'
   const statusBadge = converted
@@ -4033,6 +4068,9 @@ function fvRow(v) {
   const action = converted
     ? '<span class="text-xs text-slate-400"><i class="fas fa-check mr-1"></i>Onboarded</span>'
     : `<button onclick="fvConvert(${v.id})" class="btn brand-bg text-white px-3 py-1.5 rounded-lg text-xs"><i class="fas fa-user-check mr-1"></i>Convert</button>`
+  const delBtn = canDeleteFieldVisit()
+    ? `<button onclick="fvDelete(${v.id}, '${esc(v.prospect_name)}')" class="text-red-600 hover:underline text-xs ml-3"><i class="fas fa-trash mr-1"></i>Delete</button>`
+    : ''
   return `<tr class="border-t border-slate-100">
     <td class="px-4 py-3 font-mono text-xs">${esc(v.visit_ref)}</td>
     <td class="px-4 py-3 font-medium">${esc(v.prospect_name)}</td>
@@ -4043,7 +4081,7 @@ function fvRow(v) {
     <td class="px-4 py-3">${statusBadge}</td>
     <td class="px-4 py-3 text-right">
       <button onclick="fvView(${v.id})" class="text-teal-600 hover:underline text-xs mr-3">View</button>
-      ${action}
+      ${action}${delBtn}
     </td></tr>`
 }
 
@@ -4225,6 +4263,7 @@ window.fvView = async (id) => {
       </div>
       <div class="flex gap-3 mt-5">
         ${v.status === 'converted' ? '<span class="text-emerald-600 text-sm"><i class="fas fa-check mr-1"></i>Already converted</span>' : `<button onclick="closeModal();fvConvert(${v.id})" class="btn brand-bg text-white px-5 py-2 rounded-lg text-sm"><i class="fas fa-user-check mr-1"></i>Convert to User</button>`}
+        ${canDeleteFieldVisit() ? `<button onclick="closeModal();fvDelete(${v.id}, '${esc(v.prospect_name)}')" class="btn bg-red-50 text-red-600 px-5 py-2 rounded-lg text-sm"><i class="fas fa-trash mr-1"></i>Delete</button>` : ''}
         <button onclick="closeModal()" class="btn bg-slate-100 px-5 py-2 rounded-lg text-sm">Close</button>
       </div>`)
   } catch (err) { toast(err.response?.data?.error || 'Failed', false) }
@@ -4233,6 +4272,14 @@ window.fvView = async (id) => {
 // Convert: open the onboarding form prefilled with prospect data, then on
 // submit create the customer WITH a login (create_login → SMS credentials) and
 // mark the field visit converted.
+window.fvDelete = async (id, name) => {
+  if (!confirm('Permanently delete the field visit for "' + name + '"? This cannot be undone.')) return
+  try {
+    await api.delete('/field-visits/' + id)
+    toast('Field visit deleted')
+    viewFieldVisits()
+  } catch (err) { toast(err.response?.data?.error || 'Failed to delete', false) }
+}
 window.fvConvert = async (id) => {
   let v = null
   try { const { data } = await api.get('/field-visits/' + id); v = data.visit }

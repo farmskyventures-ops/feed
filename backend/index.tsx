@@ -473,6 +473,7 @@ function normalizeProductPayload(b: any) {
     cash_enabled: boolInt(b.cash_enabled, paymentMode !== 'financing'),
     financing_enabled: boolInt(b.financing_enabled, paymentMode !== 'cash'),
     payment_option_mode: paymentMode,
+    show_buyer: boolInt(b.show_buyer, false),
     financing_model: b.financing_model || 'loan_interest',
     financing_interest_pct: numberVal(b.financing_interest_pct, 0),
     financing_frequency: b.financing_frequency || 'monthly',
@@ -1483,12 +1484,12 @@ app.post('/api/products', requireAuth, requirePermission('can_manage_inventory')
   const financeSetBy = canFinance ? user.id : null
   try {
     const r = await c.env.DB.prepare(
-      `INSERT INTO products (sku,name,category,description,product_type,supplier_id,buying_price,cash_markup_pct,credit_markup_pct,cash_price,credit_price,cash_price_mode,cash_markup_amount,credit_price_mode,credit_markup_amount,quantity,unit,reorder_threshold,image,cash_enabled,financing_enabled,payment_option_mode,financing_model,financing_type_key,financing_interest_pct,financing_frequency,financing_term_min_months,financing_term_max_months,financing_tenure_unit,financing_rate_per_cycle,financing_amount_per_cycle,financing_cycle_count,financing_cycle_length_days,cash_deposit_pct,financing_deposit_pct,cash_terms_text,financing_terms_text,cash_terms_doc_url,financing_terms_doc_url,cash_agreement_source,financing_agreement_source,created_by,finance_status,finance_set_by)
-       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
+      `INSERT INTO products (sku,name,category,description,product_type,supplier_id,buying_price,cash_markup_pct,credit_markup_pct,cash_price,credit_price,cash_price_mode,cash_markup_amount,credit_price_mode,credit_markup_amount,quantity,unit,reorder_threshold,image,cash_enabled,financing_enabled,payment_option_mode,show_buyer,financing_model,financing_type_key,financing_interest_pct,financing_frequency,financing_term_min_months,financing_term_max_months,financing_tenure_unit,financing_rate_per_cycle,financing_amount_per_cycle,financing_cycle_count,financing_cycle_length_days,cash_deposit_pct,financing_deposit_pct,cash_terms_text,financing_terms_text,cash_terms_doc_url,financing_terms_doc_url,cash_agreement_source,financing_agreement_source,created_by,finance_status,finance_set_by)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
     ).bind(
       p.sku, p.name, p.category, p.description, p.product_type, p.supplier_id, p.buying_price, p.cash_markup_pct, p.credit_markup_pct,
       p.cash_price, p.credit_price, p.cash_price_mode, p.cash_markup_amount, p.credit_price_mode, p.credit_markup_amount, p.quantity, p.unit, p.reorder_threshold, p.image, p.cash_enabled, p.financing_enabled,
-      p.payment_option_mode, p.financing_model, p.financing_type_key, p.financing_interest_pct, p.financing_frequency, p.financing_term_min_months,
+      p.payment_option_mode, p.show_buyer, p.financing_model, p.financing_type_key, p.financing_interest_pct, p.financing_frequency, p.financing_term_min_months,
       p.financing_term_max_months, p.financing_tenure_unit, p.financing_rate_per_cycle, p.financing_amount_per_cycle, p.financing_cycle_count, p.financing_cycle_length_days, p.cash_deposit_pct, p.financing_deposit_pct, p.cash_terms_text, p.financing_terms_text,
       p.cash_terms_doc_url, p.financing_terms_doc_url, p.cash_agreement_source, p.financing_agreement_source, user.id, financeStatus, financeSetBy
     ).run()
@@ -1537,12 +1538,12 @@ app.put('/api/products/:id', requireAuth, requirePermission('can_manage_inventor
     sku: p.sku, name: p.name, category: p.category, description: p.description, product_type: p.product_type,
     buying_price: p.buying_price, cash_markup_pct: p.cash_markup_pct, cash_price: p.cash_price, cash_price_mode: p.cash_price_mode, cash_markup_amount: p.cash_markup_amount,
     quantity: p.quantity, unit: p.unit, reorder_threshold: p.reorder_threshold, image: p.image || existing.image,
-    cash_enabled: p.cash_enabled, cash_deposit_pct: p.cash_deposit_pct, cash_terms_text: p.cash_terms_text, cash_terms_doc_url: p.cash_terms_doc_url, cash_agreement_source: p.cash_agreement_source
+    cash_enabled: p.cash_enabled, cash_deposit_pct: p.cash_deposit_pct, cash_terms_text: p.cash_terms_text, cash_terms_doc_url: p.cash_terms_doc_url, cash_agreement_source: p.cash_agreement_source, show_buyer: p.show_buyer
   } : {
     sku: existing.sku, name: existing.name, category: existing.category, description: existing.description, product_type: existing.product_type,
     buying_price: existing.buying_price, cash_markup_pct: existing.cash_markup_pct, cash_price: existing.cash_price, cash_price_mode: existing.cash_price_mode, cash_markup_amount: existing.cash_markup_amount,
     quantity: existing.quantity, unit: existing.unit, reorder_threshold: existing.reorder_threshold, image: existing.image,
-    cash_enabled: existing.cash_enabled, cash_deposit_pct: existing.cash_deposit_pct, cash_terms_text: existing.cash_terms_text, cash_terms_doc_url: existing.cash_terms_doc_url, cash_agreement_source: existing.cash_agreement_source
+    cash_enabled: existing.cash_enabled, cash_deposit_pct: existing.cash_deposit_pct, cash_terms_text: existing.cash_terms_text, cash_terms_doc_url: existing.cash_terms_doc_url, cash_agreement_source: existing.cash_agreement_source, show_buyer: p.show_buyer
   }
   const finCols = canFinance ? {
     credit_markup_pct: p.credit_markup_pct, credit_price: p.credit_price, credit_price_mode: p.credit_price_mode, credit_markup_amount: p.credit_markup_amount, financing_enabled: p.financing_enabled,
@@ -1563,11 +1564,11 @@ app.put('/api/products/:id', requireAuth, requirePermission('can_manage_inventor
   }
   try {
     await c.env.DB.prepare(
-      `UPDATE products SET sku=?, name=?, category=?, description=?, product_type=?, buying_price=?, cash_markup_pct=?, credit_markup_pct=?, cash_price=?, credit_price=?, cash_price_mode=?, cash_markup_amount=?, credit_price_mode=?, credit_markup_amount=?, quantity=?, unit=?, reorder_threshold=?, image=COALESCE(?, image), cash_enabled=?, financing_enabled=?, payment_option_mode=?, financing_model=?, financing_type_key=?, financing_interest_pct=?, financing_frequency=?, financing_term_min_months=?, financing_term_max_months=?, financing_tenure_unit=?, financing_rate_per_cycle=?, financing_amount_per_cycle=?, financing_cycle_count=?, financing_cycle_length_days=?, cash_deposit_pct=?, financing_deposit_pct=?, cash_terms_text=?, financing_terms_text=?, cash_terms_doc_url=?, financing_terms_doc_url=?, cash_agreement_source=?, financing_agreement_source=?, finance_status=?, finance_set_by=?, finance_set_at=CASE WHEN ?='published' THEN CURRENT_TIMESTAMP ELSE finance_set_at END WHERE id=?`
+      `UPDATE products SET sku=?, name=?, category=?, description=?, product_type=?, buying_price=?, cash_markup_pct=?, credit_markup_pct=?, cash_price=?, credit_price=?, cash_price_mode=?, cash_markup_amount=?, credit_price_mode=?, credit_markup_amount=?, quantity=?, unit=?, reorder_threshold=?, image=COALESCE(?, image), cash_enabled=?, financing_enabled=?, payment_option_mode=?, show_buyer=?, financing_model=?, financing_type_key=?, financing_interest_pct=?, financing_frequency=?, financing_term_min_months=?, financing_term_max_months=?, financing_tenure_unit=?, financing_rate_per_cycle=?, financing_amount_per_cycle=?, financing_cycle_count=?, financing_cycle_length_days=?, cash_deposit_pct=?, financing_deposit_pct=?, cash_terms_text=?, financing_terms_text=?, cash_terms_doc_url=?, financing_terms_doc_url=?, cash_agreement_source=?, financing_agreement_source=?, finance_status=?, finance_set_by=?, finance_set_at=CASE WHEN ?='published' THEN CURRENT_TIMESTAMP ELSE finance_set_at END WHERE id=?`
     ).bind(
       coreCols.sku, coreCols.name, coreCols.category, coreCols.description, coreCols.product_type, coreCols.buying_price, coreCols.cash_markup_pct, finCols.credit_markup_pct,
       coreCols.cash_price, finCols.credit_price, coreCols.cash_price_mode, coreCols.cash_markup_amount, finCols.credit_price_mode, finCols.credit_markup_amount, coreCols.quantity, coreCols.unit, coreCols.reorder_threshold, coreCols.image || null, coreCols.cash_enabled, finCols.financing_enabled,
-      finCols.payment_option_mode, finCols.financing_model, finCols.financing_type_key, finCols.financing_interest_pct, finCols.financing_frequency, finCols.financing_term_min_months,
+      finCols.payment_option_mode, coreCols.show_buyer, finCols.financing_model, finCols.financing_type_key, finCols.financing_interest_pct, finCols.financing_frequency, finCols.financing_term_min_months,
       finCols.financing_term_max_months, finCols.financing_tenure_unit, finCols.financing_rate_per_cycle, finCols.financing_amount_per_cycle, finCols.financing_cycle_count, finCols.financing_cycle_length_days, coreCols.cash_deposit_pct, finCols.financing_deposit_pct, coreCols.cash_terms_text, finCols.financing_terms_text,
       coreCols.cash_terms_doc_url, finCols.financing_terms_doc_url, coreCols.cash_agreement_source, finCols.financing_agreement_source, finCols.finance_status, finCols.finance_set_by, finCols.finance_status, id
     ).run()
@@ -1974,7 +1975,11 @@ app.post('/api/customers/:id/verify', requireAuth, async (c) => {
 // ----------------------------------------------------------------------------
 // MURABAHA
 // ----------------------------------------------------------------------------
-app.post('/api/murabaha/quote', requireAuth, async (c) => {
+// Unified checkout QUOTE handler. Handles BOTH cash and financing via
+// payment_type. Registered on the clean /api/checkout/quote path AND the legacy
+// /api/murabaha/quote path (backward compatible). A CASH checkout never relies
+// on any financing-only branch below.
+const checkoutQuoteHandler = async (c: any) => {
   const { product_id, quantity, payment_type, term_months } = await c.req.json()
   // Read the catalog under admin context so ownership RLS (which scopes products
   // to their lister) doesn't hide the storefront item from a buyer requesting a quote.
@@ -1984,9 +1989,15 @@ app.post('/api/murabaha/quote', requireAuth, async (c) => {
   if (payment_type !== 'cash' && !p.financing_enabled) return c.json({ error: 'Financing is not enabled for this equipment' }, 400)
   const feeCfg = await getSetting(c, 'processing_fee', DEFAULT_PROCESSING_FEE)
   const q = financingQuote(p, quantity, payment_type === 'cash' ? 'cash' : 'financing', term_months, feeCfg)
-  return c.json({ product: p.name, ...q })
-})
-app.post('/api/murabaha/apply', requireAuth, async (c) => {
+  return c.json({ product: p.name, show_buyer: Number(p.show_buyer) ? 1 : 0, ...q })
+}
+app.post('/api/checkout/quote', requireAuth, checkoutQuoteHandler)
+app.post('/api/murabaha/quote', requireAuth, checkoutQuoteHandler)
+// Unified checkout APPLY handler (cash + financing). Registered on the clean
+// /api/checkout/apply path AND the legacy /api/murabaha/apply path. A CASH
+// checkout skips every financing-only branch (KYC gate, installment math) and
+// creates a CSH contract that requires only the cash amount due.
+const checkoutApplyHandler = async (c: any) => {
   const user = c.get('user')
   const { customer_id, product_id, quantity, payment_type, term_months, delivery_location, consent } = await c.req.json()
   if (!consent) return c.json({ error: 'Customer consent to the configured terms is required' }, 400)
@@ -2061,7 +2072,9 @@ app.post('/api/murabaha/apply', requireAuth, async (c) => {
     buy_for: user.role === 'agent',
     farmer: { id: custRow.id, name: custRow.full_name || 'Farmer', phone: custRow.mobile || '' }
   })
-})
+}
+app.post('/api/checkout/apply', requireAuth, checkoutApplyHandler)
+app.post('/api/murabaha/apply', requireAuth, checkoutApplyHandler)
 
 // ---------------------------------------------------------------------------
 // KYC PRE-CHECK for checkout. The client calls this before opening the cart so
@@ -4550,6 +4563,13 @@ function canManageFieldVisits(user: SessionUser) {
   return user.role === 'admin' || user.role === 'super_admin' ||
     hasPermission(user, 'manage_field_visits')
 }
+// Deleting a field visit is a DESTRUCTIVE action restricted by default to
+// Super-Admins only. Any other user (including plain admins) may delete ONLY if
+// a Super-Admin explicitly grants them the delegable `delete_field_visits`
+// permission via the RBAC module.
+function canDeleteFieldVisits(user: SessionUser) {
+  return user.role === 'super_admin' || hasPermission(user, 'delete_field_visits')
+}
 // Whether `user` may see/act on an individual field-visit row. Agents are
 // strictly scoped to visits they logged; admins/super-admins have global
 // visibility (matches the RBAC visibility rules of the rest of the app).
@@ -5018,6 +5038,21 @@ app.post('/api/field-visits/:id/convert', requireAuth, async (c) => {
     `UPDATE field_visits SET status='converted', converted_customer_id=?, converted_at=CURRENT_TIMESTAMP, converted_by=?, updated_at=CURRENT_TIMESTAMP WHERE id=?`
   ).bind(b.customer_id || null, String(user.id), id).run()
   await audit(c, user.id, 'convert', 'field_visit', fv.visit_ref)
+  return c.json({ ok: true })
+})
+
+// Delete a field visit. DESTRUCTIVE — gated by canDeleteFieldVisits (Super-Admin
+// by default; delegable via the `delete_field_visits` RBAC permission). Account
+// scoping still applies for delegated non-admins.
+app.delete('/api/field-visits/:id', requireAuth, async (c) => {
+  const user = c.get('user') as SessionUser
+  if (!canDeleteFieldVisits(user)) return c.json({ error: 'Forbidden — deleting field visits is restricted to Super-Admins or users granted the permission.' }, 403)
+  const id = c.req.param('id')
+  const fv = await c.env.DB.prepare(`SELECT * FROM field_visits WHERE id=?`).bind(id).first<any>()
+  if (!fv) return c.json({ error: 'Not found' }, 404)
+  if (user.role !== 'super_admin' && !isFieldVisitAccessible(user, fv)) return c.json({ error: 'Not found' }, 404)
+  await c.env.DB.prepare(`DELETE FROM field_visits WHERE id=?`).bind(id).run()
+  await audit(c, user.id, 'delete', 'field_visit', fv.visit_ref)
   return c.json({ ok: true })
 })
 
