@@ -1876,8 +1876,13 @@ window.contractDetail = async (id) => {
   // Who may push a cash balance payment (button next to the contract).
   const canCollect = state.user.role === 'customer' || canDo('collect_payment') ||
     ['admin', 'super_admin', 'operations_finance', 'sales_agent'].includes(state.user.role)
-  // Cash contract that has taken a deposit but still owes a balance.
-  const cashBalanceDue = isCash && hasBalance && (c.status === 'awaiting_cash_balance' || c.ownership_recorded)
+  // The owning agent may prompt THEIR farmer for payment on cash OR credit orders.
+  const canPrompt = canCollect || isOwningAgent
+  // Cash contract that still owes a balance — a "Pay Balance" prompt applies
+  // whether the deposit has been taken or it is awaiting the cash balance.
+  const cashBalanceDue = isCash && hasBalance
+  // Sales Manual Reconciliation — settle a balance paid directly to the bank.
+  const canReconcile = hasBalance && (state.user.role === 'super_admin' || canDo('sales_manual_reconciliation'))
 
   // Compute the next financing installment + days to due (for reminders).
   let nextDue = null
@@ -1934,9 +1939,10 @@ window.contractDetail = async (id) => {
     <tbody>${data.repayments.map(r => `<tr class="border-t border-slate-100"><td>${r.installment_no}</td><td>${r.due_date}</td><td class="text-right">${fmt(r.amount_due)}</td><td class="text-right">${fmt(r.amount_paid)}</td><td class="text-center">${badge(r.status)}</td></tr>`).join('')}</tbody></table>` : ''}
     <div class="flex flex-wrap gap-2">
       ${canPay ? `<button onclick="payModal(${c.id}, ${c.monthly_payment || c.installment_amount || c.outstanding}, ${c.outstanding})" class="btn flex-1 brand-bg text-white py-2.5 rounded-lg text-sm"><i class="fas fa-mobile-alt mr-1"></i>Pay via M-Pesa</button>` : ''}
-      ${cashBalanceDue && canCollect ? `<button onclick="payModal(${c.id}, ${outstanding}, ${outstanding}, 'cash')" class="btn flex-1 bg-amber-500 text-white py-2.5 rounded-lg text-sm"><i class="fas fa-wallet mr-1"></i>Pay Balance (${fmt(outstanding)})</button>` : ''}
-      ${!isCash && hasBalance && canCollect ? `<button onclick="payModal(${c.id}, ${nextDue ? (Number(nextDue.amount_due) - Number(nextDue.amount_paid||0)) : outstanding}, ${outstanding}, 'repay')" class="btn flex-1 bg-teal-600 text-white py-2.5 rounded-lg text-sm"><i class="fas fa-coins mr-1"></i>Collect Installment</button>` : ''}
-      ${canDispatch ? `<button onclick="dispatchContract(${c.id})" class="btn flex-1 bg-emerald-600 text-white py-2.5 rounded-lg text-sm"><i class="fas fa-truck mr-1"></i>Dispatch Feed</button>` : ''}
+      ${cashBalanceDue && canPrompt ? `<button onclick="payModal(${c.id}, ${outstanding}, ${outstanding}, 'cash')" class="btn flex-1 bg-amber-500 text-white py-2.5 rounded-lg text-sm"><i class="fas fa-wallet mr-1"></i>Pay Balance (${fmt(outstanding)})</button>` : ''}
+      ${!isCash && hasBalance && canPrompt ? `<button onclick="payModal(${c.id}, ${nextDue ? (Number(nextDue.amount_due) - Number(nextDue.amount_paid||0)) : outstanding}, ${outstanding}, 'repay')" class="btn flex-1 bg-teal-600 text-white py-2.5 rounded-lg text-sm"><i class="fas fa-coins mr-1"></i>Pay Balance (${fmt(outstanding)})</button>` : ''}
+      ${canReconcile ? `<button onclick="reconcileModal(${c.id}, ${outstanding})" class="btn flex-1 bg-purple-600 text-white py-2.5 rounded-lg text-sm"><i class="fas fa-building-columns mr-1"></i>Manual Reconciliation</button>` : ''}
+      ${canDispatch ? `<button onclick="dispatchContract(${c.id})" class="btn flex-1 bg-emerald-600 text-white py-2.5 rounded-lg text-sm"><i class="fas fa-truck mr-1"></i>Dispatch product</button>` : ''}
       ${canDeliver ? `<button onclick="deliverContract(${c.id})" class="btn flex-1 bg-indigo-600 text-white py-2.5 rounded-lg text-sm"><i class="fas fa-box-open mr-1"></i>Mark Delivered</button>` : ''}
       ${canRequest ? `<button onclick="requestChangeModal('contract', ${c.id}, 'amend contract')" class="btn flex-1 bg-amber-500 text-white py-2.5 rounded-lg text-sm"><i class="fas fa-paper-plane mr-1"></i>Request Admin Change</button>` : ''}
       <button onclick="viewDoc(${c.id})" class="btn flex-1 bg-slate-800 text-white py-2.5 rounded-lg text-sm"><i class="fas fa-file-pdf mr-1"></i>Documents</button>
@@ -1947,7 +1953,7 @@ window.contractDetail = async (id) => {
 window.dispatchContract = async (id) => {
   try {
     await api.post(`/murabaha/${id}/dispatch`, {})
-    toast('Feed dispatched')
+    toast('Product dispatched')
     closeModal(); viewContracts()
   } catch (err) { toast(err.response?.data?.error || 'Dispatch failed', false) }
 }
@@ -2048,7 +2054,15 @@ window.payModal = async (id, amount, outstanding, kind, opts) => {
     </div>
 
     <label class="text-sm font-medium">Phone${forFarmer ? ' (farmer)' : ''}</label><input id="mpphone" value="${esc(targetPhone)}" class="w-full mt-1 mb-3 px-3 py-2 border border-slate-300 rounded-lg">
-    <label class="text-sm font-medium">Amount (KES)</label><input id="mpamt" type="number" value="${amount}" ${isCash ? 'readonly' : ''} class="w-full mt-1 mb-2 px-3 py-2 border border-slate-300 rounded-lg ${isCash ? 'bg-slate-50' : ''}">
+    <!-- Partial Payment: the amount is fully editable so an admin/agent can enter
+         an arbitrary installment against the total due. A quick link fills the
+         full outstanding balance; the field is capped at the outstanding amount. -->
+    <div class="flex items-center justify-between mb-1 mt-1">
+      <label class="text-sm font-medium" for="mpamt">Amount (KES)</label>
+      <button type="button" onclick="payFillBalance(${Number(outstanding) || 0})" class="text-[11px] text-teal-600 underline">Pay full balance (${fmt(outstanding)})</button>
+    </div>
+    <input id="mpamt" type="number" min="1" max="${Number(outstanding) || ''}" step="0.01" value="${amount}" oninput="payClampAmount(${Number(outstanding) || 0})" class="w-full mb-1 px-3 py-2 border border-slate-300 rounded-lg">
+    <p class="text-[11px] text-slate-400 mb-2" id="payAmtHint">Enter any amount up to ${fmt(outstanding)} to make a partial payment. The remaining balance will be tracked automatically.</p>
 
     <!-- Dynamic legal agreement block — the terms shown here are loaded from the
          agreement template that matches THIS contract's payment path
@@ -2064,6 +2078,29 @@ window.payModal = async (id, amount, outstanding, kind, opts) => {
     <button onclick="closeModal()" class="btn px-4 bg-slate-100 rounded-lg text-sm">Cancel</button></div>`)
   // Load the correct terms for this contract's payment path (dynamic checkout).
   loadPayTerms(id, isCash)
+}
+// Partial Payment helpers — fill the full balance, and keep a typed amount
+// within [0, outstanding] while updating the hint.
+window.payFillBalance = (outstanding) => {
+  const el = $('mpamt'); if (!el) return
+  el.value = outstanding
+  payClampAmount(outstanding)
+}
+window.payClampAmount = (outstanding) => {
+  const el = $('mpamt'); if (!el) return
+  const hint = $('payAmtHint')
+  let v = Number(el.value)
+  if (!Number.isFinite(v)) { if (hint) hint.textContent = `Enter any amount up to ${fmt(outstanding)}.`; return }
+  if (outstanding > 0 && v > outstanding) { el.value = outstanding; v = outstanding }
+  if (v < 0) { el.value = ''; v = 0 }
+  if (hint) {
+    const remaining = Math.max(0, Math.round((outstanding - v) * 100) / 100)
+    hint.textContent = v > 0 && remaining > 0
+      ? `Partial payment — ${fmt(remaining)} will remain after this installment.`
+      : v > 0 && remaining === 0
+        ? 'This settles the full balance — the purchase will be marked Paid.'
+        : `Enter any amount up to ${fmt(outstanding)} to make a partial payment.`
+  }
 }
 // Populate the checkout terms block from the contract's matched agreement.
 async function loadPayTerms(id, isCash) {
@@ -2311,14 +2348,15 @@ function crossPoll(checkoutId, simulated) {
 // Issue 3: render an explicit, persistent state alert inside the payment modal.
 // state = 'success' | 'failed' | 'info'. On success we auto-dismiss the modal
 // after a brief delay so the operator clearly sees the confirmation first.
-window.payStateAlert = (stateName, msg, receipt) => {
+window.payStateAlert = (stateName, msg, receipt, contractId) => {
   const box = $('payStatus'); if (!box) return
   if (stateName === 'success') {
-    box.innerHTML = `<div class="bg-emerald-50 border border-emerald-300 rounded-lg p-3 mb-3 flex items-center gap-2">
+    box.innerHTML = `<div class="bg-emerald-50 border border-emerald-300 rounded-lg p-3 mb-3">
+        <div class="flex items-center gap-2">
         <i class="fas fa-circle-check text-emerald-600 text-lg"></i>
         <div><div class="text-sm font-semibold text-emerald-800">Paid Successfully</div>
-        ${receipt ? `<div class="text-xs text-emerald-700">Receipt: ${esc(receipt)}</div>` : ''}
-        <div class="text-[11px] text-emerald-600 mt-0.5">Closing…</div></div></div>`
+        ${receipt ? `<div class="text-xs text-emerald-700">Receipt: ${esc(receipt)}</div>` : ''}</div></div>
+        ${contractId ? `<button onclick="viewDoc(${contractId}, 'receipt')" class="mt-2 w-full text-xs bg-white border border-emerald-300 text-emerald-700 py-1.5 rounded-lg"><i class="fas fa-file-pdf mr-1"></i>View / download receipt</button>` : ''}</div>`
   } else if (stateName === 'failed') {
     box.innerHTML = `<div class="bg-red-50 border border-red-300 rounded-lg p-3 mb-3 flex items-center gap-2">
         <i class="fas fa-circle-xmark text-red-600 text-lg"></i>
@@ -2350,6 +2388,19 @@ window.doPay = async (id, kind) => {
   const endpoint = '/mpesa/stkpush'
   const confirmEndpoint = '/mpesa/confirm'
   const methodLabel = method === 'sasapay' ? 'SasaPay' : method === 'buni' ? 'KCB' : 'M-Pesa'
+
+  // Partial Payment validation — the amount is operator-editable, so guard it
+  // client-side before sending (the server enforces the same rules).
+  const amtVal = Number($('mpamt')?.value)
+  const maxVal = Number($('mpamt')?.max)
+  if (!Number.isFinite(amtVal) || amtVal <= 0) {
+    $('payStatus').innerHTML = `<div class="bg-red-50 border border-red-200 rounded-lg p-2 text-xs text-red-700 mb-3">Enter an amount greater than zero.</div>`
+    return
+  }
+  if (Number.isFinite(maxVal) && maxVal > 0 && amtVal > maxVal + 0.005) {
+    $('payStatus').innerHTML = `<div class="bg-red-50 border border-red-200 rounded-lg p-2 text-xs text-red-700 mb-3">Amount exceeds the outstanding balance of ${fmt(maxVal)}.</div>`
+    return
+  }
 
   const payload = {
     contract_id: id,
@@ -2426,9 +2477,9 @@ window.doPay = async (id, kind) => {
         // UPDATED: Request transaction verification through gateway logs
         const { data: cd } = await gatewayApi.post(confirmEndpoint, { checkout_request_id: data.checkout_request_id })
         if (cd.status === 'success') {
-          payStateAlert('success', null, cd.mpesa_receipt)
+          payStateAlert('success', null, cd.mpesa_receipt, id)
           toast((isCash ? 'Cash purchase complete! Receipt: ' : 'Payment received! Receipt: ') + cd.mpesa_receipt)
-          setTimeout(() => { closeModal(); state.route = 'contracts'; renderApp() }, 1800)
+          setTimeout(() => { closeModal(); state.route = 'contracts'; renderApp() }, 4200)
           return
         }
         else if (cd.status === 'failed') { payStateAlert('failed', cd.result_desc || 'Payment failed'); reEnable(); return }
@@ -2471,9 +2522,9 @@ window.doSasaOtp = async (checkoutId, id, kind) => {
         // Poll the definitive status via the central production gateway.
         const { data: cd } = await gatewayApi.post('/mpesa/confirm', { checkout_request_id: checkoutId })
         if (cd.status === 'success') {
-          payStateAlert('success', null, cd.mpesa_receipt)
+          payStateAlert('success', null, cd.mpesa_receipt, id)
           toast((isCash ? 'Cash purchase complete! Receipt: ' : 'Payment received! Receipt: ') + cd.mpesa_receipt)
-          setTimeout(() => { closeModal(); state.route = 'contracts'; renderApp() }, 1800)
+          setTimeout(() => { closeModal(); state.route = 'contracts'; renderApp() }, 4200)
           return
         }
         else if (cd.status === 'failed') { payStateAlert('failed', cd.result_desc || 'Payment failed'); btnReset('spOtpBtn'); return }
@@ -2549,41 +2600,226 @@ function agreementDocumentHtml(ag) {
     ${agreementTermsBody(ag)}
   </div>`
 }
-window.viewDoc = async (id) => {
-  let ag, qr = null
-  try {
-    const { data } = await api.get('/murabaha/' + id + '/agreement')
-    ag = data
-  } catch (err) { toast(err.response?.data?.error || 'Could not load agreement', false); return }
-  // QR (optional) from the legacy documents endpoint — non-fatal if unavailable.
-  try { const { data: dd } = await api.get('/documents/contract/' + id); qr = dd.qr } catch (_) {}
-  window._lastAgreement = ag
+// ---------------------------------------------------------------------------
+// DOCUMENT CENTER — Contract · Invoice · Receipt
+//
+// One modal exposes all three dynamically-generated documents for a purchase.
+// Each is viewable and downloadable/printable as a branded PDF (Farmsky logo).
+//   * Contract — the sale/financing agreement (from /agreement)
+//   * Invoice  — generated when the order was placed (/documents/invoice)
+//   * Receipt  — every payment (partial or full) with the running balance
+//                (/documents/receipt)
+// ---------------------------------------------------------------------------
+window._docCenter = { id: null, tab: 'contract', agreement: null, invoice: null, receipt: null, qr: null }
+window.viewDoc = async (id, tab) => {
+  window._docCenter = { id, tab: tab || 'contract', agreement: null, invoice: null, receipt: null, qr: null }
   showModal(`<div>
     <div class="flex items-center justify-between mb-3">
-      <h3 class="font-bold text-lg">${esc(ag.title)}</h3>
-      <span class="badge bg-teal-100 text-teal-700">${esc(ag.type_label)}</span>
+      <h3 class="font-bold text-lg"><i class="fas fa-folder-open text-teal-600 mr-2"></i>Documents</h3>
+      <span class="badge bg-slate-100 text-slate-600 text-xs">#${esc(String(id))}</span>
     </div>
-    ${qr ? `<img src="${qr}" class="mx-auto mb-3 w-24 h-24" alt="QR">` : ''}
-    <div id="agreementDoc" class="border border-slate-200 rounded-lg p-4 bg-white max-h-[55vh] overflow-auto">
-      ${agreementDocumentHtml(ag)}
+    <div class="flex gap-1 mb-4 bg-slate-100 p-1 rounded-lg text-sm">
+      <button id="docTabContract" onclick="docTab('contract')" class="flex-1 py-2 rounded-md">Contract</button>
+      <button id="docTabInvoice" onclick="docTab('invoice')" class="flex-1 py-2 rounded-md">Invoice</button>
+      <button id="docTabReceipt" onclick="docTab('receipt')" class="flex-1 py-2 rounded-md">Receipt</button>
     </div>
+    <div id="docBody" class="border border-slate-200 rounded-lg p-4 bg-white max-h-[52vh] overflow-auto text-sm text-slate-500">Loading…</div>
     <div class="flex gap-2 mt-4">
-      <button onclick="downloadAgreementPdf()" class="btn flex-1 bg-slate-800 text-white py-2.5 rounded-lg text-sm"><i class="fas fa-file-pdf mr-1"></i>Download PDF</button>
+      <button id="docDownloadBtn" onclick="docDownload()" class="btn flex-1 bg-slate-800 text-white py-2.5 rounded-lg text-sm"><i class="fas fa-file-pdf mr-1"></i>Download PDF</button>
       <button onclick="closeModal()" class="btn px-4 bg-slate-100 rounded-lg text-sm">Close</button>
     </div>
   </div>`)
+  docTab(window._docCenter.tab)
 }
-// Styled PDF export — opens a print window carrying the configured styling so
-// "Save as PDF" produces the justified / Calibri / 1.5-spacing document.
-window.downloadAgreementPdf = () => {
-  const ag = window._lastAgreement
-  if (!ag) return
+window.docTab = async (tab) => {
+  const dc = window._docCenter; dc.tab = tab
+  ;['contract', 'invoice', 'receipt'].forEach(t => {
+    const b = $('docTab' + t.charAt(0).toUpperCase() + t.slice(1))
+    if (b) b.className = `flex-1 py-2 rounded-md ${t === tab ? 'bg-white shadow-sm font-semibold text-slate-800' : 'text-slate-500'}`
+  })
+  const body = $('docBody'); if (body) body.innerHTML = '<div class="text-slate-400 text-sm py-6 text-center"><i class="fas fa-spinner fa-spin mr-1"></i>Loading…</div>'
+  try {
+    if (tab === 'contract') {
+      if (!dc.agreement) {
+        const { data } = await api.get('/murabaha/' + dc.id + '/agreement'); dc.agreement = data
+        try { const { data: dd } = await api.get('/documents/contract/' + dc.id); dc.qr = dd.qr } catch (_) {}
+      }
+      if (body) body.innerHTML = agreementDocumentHtml(dc.agreement)
+    } else if (tab === 'invoice') {
+      if (!dc.invoice) { const { data } = await api.get('/documents/invoice/' + dc.id); dc.invoice = data; dc.qr = dc.qr || data.qr }
+      if (body) body.innerHTML = invoiceDocumentHtml(dc.invoice)
+    } else {
+      if (!dc.receipt) { const { data } = await api.get('/documents/receipt/' + dc.id); dc.receipt = data; dc.qr = dc.qr || data.qr }
+      if (body) body.innerHTML = receiptDocumentHtml(dc.receipt)
+    }
+  } catch (err) {
+    if (body) body.innerHTML = `<div class="text-red-600 text-sm py-6 text-center">${esc(err.response?.data?.error || 'Could not load this document')}</div>`
+  }
+}
+// Branded document chrome (Farmsky logo header) used by Invoice + Receipt.
+function brandDocHeader(subtitle) {
+  return `<div style="display:flex;align-items:center;gap:12px;border-bottom:3px solid #0f766e;padding-bottom:12px;margin-bottom:16px;">
+    <img src="/static/farmsky-logo.png" alt="Farmsky" style="height:56px;width:56px;object-fit:contain;"/>
+    <div>
+      <div style="font-size:18pt;font-weight:800;color:#0f172a;letter-spacing:-0.5px;">Farmsky Ventures</div>
+      <div style="font-size:11pt;color:#0f766e;font-weight:600;">${esc(subtitle || '')}</div>
+    </div>
+  </div>`
+}
+function docMoney(v) { return 'KES ' + (Math.round(Number(v || 0) * 100) / 100).toLocaleString() }
+function docDate(v) { try { return new Date(v).toLocaleString() } catch (_) { return String(v || '—') } }
+// INVOICE document body.
+function invoiceDocumentHtml(d) {
+  const c = d.contract || {}, inv = d.invoice || {}
+  const statusColor = inv.status === 'paid' ? '#059669' : inv.status === 'partial' ? '#d97706' : '#dc2626'
+  return `<div style="font-family:Arial,Helvetica,sans-serif;color:#0f172a;">
+    ${brandDocHeader('Tax Invoice')}
+    <div style="display:flex;justify-content:space-between;flex-wrap:wrap;gap:8px;margin-bottom:12px;">
+      <div>
+        <div style="font-size:9pt;color:#64748b;text-transform:uppercase;">Billed to</div>
+        <div style="font-weight:700;">${esc(c.customer_name || '—')}</div>
+        <div style="font-size:9pt;color:#64748b;">${esc(c.county || '')} ${c.customer_mobile ? '· ' + esc(c.customer_mobile) : ''}</div>
+      </div>
+      <div style="text-align:right;">
+        <div style="font-size:9pt;color:#64748b;text-transform:uppercase;">Invoice Ref</div>
+        <div style="font-weight:700;font-family:monospace;">${esc(inv.invoice_ref || c.contract_ref || '')}</div>
+        <div style="font-size:9pt;color:#64748b;">Issued ${docDate(inv.issued_at)}</div>
+        <div style="display:inline-block;margin-top:4px;padding:2px 10px;border-radius:999px;color:#fff;font-size:9pt;font-weight:700;background:${statusColor};">${esc(String(inv.status || 'unpaid').toUpperCase())}</div>
+      </div>
+    </div>
+    <table style="width:100%;border-collapse:collapse;margin:12px 0;font-size:10pt;">
+      <thead><tr style="background:#f1f5f9;">
+        <th style="text-align:left;padding:8px;border:1px solid #cbd5e1;">Item</th>
+        <th style="text-align:center;padding:8px;border:1px solid #cbd5e1;">Qty</th>
+        <th style="text-align:right;padding:8px;border:1px solid #cbd5e1;">Amount</th>
+      </tr></thead>
+      <tbody><tr>
+        <td style="padding:8px;border:1px solid #cbd5e1;">${esc(c.product_name || 'Product')}${c.sku ? ` <span style="color:#94a3b8;">(${esc(c.sku)})</span>` : ''}</td>
+        <td style="text-align:center;padding:8px;border:1px solid #cbd5e1;">${esc(String(c.quantity || 1))} ${esc(c.unit || '')}</td>
+        <td style="text-align:right;padding:8px;border:1px solid #cbd5e1;">${docMoney(inv.total)}</td>
+      </tr></tbody>
+    </table>
+    <div style="margin-left:auto;width:260px;font-size:10pt;">
+      <div style="display:flex;justify-content:space-between;padding:4px 0;"><span style="color:#64748b;">Total</span><b>${docMoney(inv.total)}</b></div>
+      <div style="display:flex;justify-content:space-between;padding:4px 0;"><span style="color:#64748b;">Paid</span><b style="color:#059669;">${docMoney(inv.paid)}</b></div>
+      <div style="display:flex;justify-content:space-between;padding:8px 0;border-top:2px solid #0f766e;margin-top:4px;"><span style="font-weight:700;">Balance Due</span><b style="color:${inv.outstanding > 0 ? '#d97706' : '#059669'};">${docMoney(inv.outstanding)}</b></div>
+    </div>
+    ${d.qr ? `<div style="text-align:center;margin-top:12px;"><img src="${d.qr}" style="width:96px;height:96px;" alt="QR"/></div>` : ''}
+  </div>`
+}
+// RECEIPT document body — lists each payment with the running balance.
+function receiptDocumentHtml(d) {
+  const c = d.contract || {}, r = d.receipt || {}
+  const pays = r.payments || []
+  if (!pays.length) return `<div style="text-align:center;color:#64748b;padding:24px;">No payments have been recorded for this purchase yet. A receipt is generated as soon as the first payment (partial or full) is made.</div>`
+  const last = pays[pays.length - 1]
+  return `<div style="font-family:Arial,Helvetica,sans-serif;color:#0f172a;">
+    ${brandDocHeader('Payment Receipt')}
+    <div style="display:flex;justify-content:space-between;flex-wrap:wrap;gap:8px;margin-bottom:12px;">
+      <div>
+        <div style="font-size:9pt;color:#64748b;text-transform:uppercase;">Received from</div>
+        <div style="font-weight:700;">${esc(c.customer_name || '—')}</div>
+        <div style="font-size:9pt;color:#64748b;">${esc(c.product_name || '')} · ${esc(c.contract_ref || '')}</div>
+      </div>
+      <div style="text-align:right;">
+        <div style="font-size:9pt;color:#64748b;text-transform:uppercase;">Status</div>
+        <div style="display:inline-block;margin-top:2px;padding:2px 10px;border-radius:999px;color:#fff;font-size:9pt;font-weight:700;background:${r.fully_paid ? '#059669' : '#d97706'};">${r.fully_paid ? 'PAID IN FULL' : 'PARTIALLY PAID'}</div>
+        <div style="font-size:9pt;color:#64748b;margin-top:4px;">Latest: ${docDate(last.paid_at)}</div>
+      </div>
+    </div>
+    <table style="width:100%;border-collapse:collapse;margin:12px 0;font-size:9.5pt;">
+      <thead><tr style="background:#f1f5f9;">
+        <th style="text-align:left;padding:7px;border:1px solid #cbd5e1;">Date</th>
+        <th style="text-align:left;padding:7px;border:1px solid #cbd5e1;">Receipt No.</th>
+        <th style="text-align:left;padding:7px;border:1px solid #cbd5e1;">Method</th>
+        <th style="text-align:right;padding:7px;border:1px solid #cbd5e1;">Amount Paid</th>
+        <th style="text-align:right;padding:7px;border:1px solid #cbd5e1;">Balance After</th>
+      </tr></thead>
+      <tbody>${pays.map(p => `<tr>
+        <td style="padding:7px;border:1px solid #cbd5e1;">${docDate(p.paid_at)}</td>
+        <td style="padding:7px;border:1px solid #cbd5e1;font-family:monospace;">${esc(p.receipt_no)}</td>
+        <td style="padding:7px;border:1px solid #cbd5e1;text-transform:capitalize;">${esc(String(p.method || '').replace(/_/g, ' '))}</td>
+        <td style="text-align:right;padding:7px;border:1px solid #cbd5e1;color:#059669;font-weight:600;">${docMoney(p.amount)}</td>
+        <td style="text-align:right;padding:7px;border:1px solid #cbd5e1;">${docMoney(p.balance_after)}</td>
+      </tr>`).join('')}</tbody>
+    </table>
+    <div style="margin-left:auto;width:280px;font-size:10pt;">
+      <div style="display:flex;justify-content:space-between;padding:4px 0;"><span style="color:#64748b;">Total payable</span><b>${docMoney(r.total)}</b></div>
+      <div style="display:flex;justify-content:space-between;padding:4px 0;"><span style="color:#64748b;">Total paid</span><b style="color:#059669;">${docMoney(r.paid)}</b></div>
+      <div style="display:flex;justify-content:space-between;padding:8px 0;border-top:2px solid #0f766e;margin-top:4px;"><span style="font-weight:700;">Balance remaining</span><b style="color:${r.outstanding > 0 ? '#d97706' : '#059669'};">${docMoney(r.outstanding)}</b></div>
+    </div>
+    ${d.qr ? `<div style="text-align:center;margin-top:12px;"><img src="${d.qr}" style="width:96px;height:96px;" alt="QR"/></div>` : ''}
+    <div style="text-align:center;font-size:8.5pt;color:#94a3b8;margin-top:12px;">This is a system-generated receipt from Farmsky Ventures. Thank you for your business.</div>
+  </div>`
+}
+// Download the currently-active document as a branded, printable PDF.
+window.docDownload = () => {
+  const dc = window._docCenter
+  let html = '', title = 'Document'
+  if (dc.tab === 'contract' && dc.agreement) { html = agreementDocumentHtml(dc.agreement); title = dc.agreement.title || 'Agreement' }
+  else if (dc.tab === 'invoice' && dc.invoice) { html = invoiceDocumentHtml(dc.invoice); title = 'Invoice ' + (dc.invoice.invoice?.invoice_ref || '') }
+  else if (dc.tab === 'receipt' && dc.receipt) { html = receiptDocumentHtml(dc.receipt); title = 'Receipt ' + (dc.receipt.contract?.contract_ref || '') }
+  if (!html) { toast('Nothing to download yet', false); return }
+  openPrintWindow(title, html)
+}
+// Shared print-to-PDF helper. Waits for images (e.g. the logo + QR) to load so
+// they are captured in the generated PDF.
+function openPrintWindow(title, bodyHtml) {
   const w = window.open('', '_blank')
-  if (!w) { toast('Please allow pop-ups to download the agreement PDF', false); return }
-  w.document.write(`<!doctype html><html><head><meta charset="utf-8"><title>${esc(ag.title)}</title>
-    <style>@page{margin:24mm 18mm;} body{margin:0;color:#0f172a;}</style></head>
-    <body onload="window.print()">${agreementDocumentHtml(ag)}</body></html>`)
+  if (!w) { toast('Please allow pop-ups to download the PDF', false); return }
+  w.document.write(`<!doctype html><html><head><meta charset="utf-8"><title>${esc(title)}</title>
+    <style>@page{margin:18mm 16mm;} body{margin:0;color:#0f172a;font-family:Arial,Helvetica,sans-serif;}</style></head>
+    <body>${bodyHtml}
+    <script>
+      (function(){
+        var imgs = Array.prototype.slice.call(document.images);
+        var pending = imgs.filter(function(i){return !i.complete;}).length;
+        function go(){ setTimeout(function(){ window.focus(); window.print(); }, 150); }
+        if (!pending) return go();
+        imgs.forEach(function(i){ if(!i.complete){ i.addEventListener('load', done); i.addEventListener('error', done); } });
+        function done(){ pending--; if(pending<=0) go(); }
+        setTimeout(go, 2500);
+      })();
+    <\/script></body></html>`)
   w.document.close()
+}
+// Back-compat alias (older callers).
+window.downloadAgreementPdf = () => { const dc = window._docCenter; if (dc.agreement) openPrintWindow(dc.agreement.title || 'Agreement', agreementDocumentHtml(dc.agreement)) }
+
+// ---------------------------------------------------------------------------
+// SALES MANUAL RECONCILIATION — settle a balance paid directly to the bank.
+// ---------------------------------------------------------------------------
+window.reconcileModal = (id, outstanding) => {
+  showModal(`<h3 class="text-lg font-bold mb-1"><i class="fas fa-building-columns text-purple-600 mr-2"></i>Sales Manual Reconciliation</h3>
+    <p class="text-xs text-slate-500 mb-3">Settle a cash sale paid directly into the bank. Outstanding balance: <b>${fmt(outstanding)}</b>.</p>
+    <label class="text-sm font-medium">Bank transaction code / reference</label>
+    <input id="recRef" placeholder="e.g. FT25A1B2C3" class="w-full mt-1 mb-3 px-3 py-2 border border-slate-300 rounded-lg uppercase">
+    <label class="text-sm font-medium">Amount paid (KES)</label>
+    <input id="recAmt" type="number" min="1" step="0.01" max="${Number(outstanding) || ''}" value="${Number(outstanding) || ''}" class="w-full mt-1 mb-2 px-3 py-2 border border-slate-300 rounded-lg">
+    <p class="text-[11px] text-slate-400 mb-3">The amount is deducted from the due balance and an official receipt — identical to the automated checkout receipt — is generated.</p>
+    <div id="recStatus"></div>
+    <div class="flex gap-2"><button id="recBtn" onclick="doReconcile(${id}, ${Number(outstanding) || 0})" class="btn flex-1 bg-purple-600 text-white py-2.5 rounded-lg text-sm">Reconcile &amp; Generate Receipt</button>
+    <button onclick="closeModal()" class="btn px-4 bg-slate-100 rounded-lg text-sm">Cancel</button></div>`)
+}
+window.doReconcile = async (id, outstanding) => {
+  const ref = $('recRef')?.value?.trim()
+  const amt = Number($('recAmt')?.value)
+  if (!ref) { $('recStatus').innerHTML = `<div class="bg-red-50 border border-red-200 rounded-lg p-2 text-xs text-red-700 mb-3">Enter the unique bank transaction reference.</div>`; return }
+  if (!Number.isFinite(amt) || amt <= 0) { $('recStatus').innerHTML = `<div class="bg-red-50 border border-red-200 rounded-lg p-2 text-xs text-red-700 mb-3">Enter a valid amount.</div>`; return }
+  if (outstanding > 0 && amt > outstanding + 0.005) { $('recStatus').innerHTML = `<div class="bg-red-50 border border-red-200 rounded-lg p-2 text-xs text-red-700 mb-3">Amount exceeds the outstanding balance of ${fmt(outstanding)}.</div>`; return }
+  const btn = $('recBtn'); if (btn) { btn.disabled = true; btn.classList.add('opacity-50') }
+  $('recStatus').innerHTML = `<div class="text-xs text-slate-500 mb-3"><i class="fas fa-spinner fa-spin mr-1"></i>Reconciling…</div>`
+  try {
+    const { data } = await api.post(`/murabaha/${id}/manual-reconcile`, { transaction_code: ref, amount: amt })
+    toast(`Reconciled. Balance: ${fmt(data.outstanding)}${data.status === 'completed' ? ' — Paid in full' : ''}`)
+    closeModal()
+    // Open the freshly-generated receipt for download.
+    viewDoc(id, 'receipt')
+    if (typeof viewContracts === 'function') viewContracts()
+  } catch (err) {
+    $('recStatus').innerHTML = `<div class="bg-red-50 border border-red-200 rounded-lg p-2 text-xs text-red-700 mb-3">${esc(err.response?.data?.error || 'Reconciliation failed')}</div>`
+    if (btn) { btn.disabled = false; btn.classList.remove('opacity-50') }
+  }
 }
 // ---------------------------------------------------------------------------
 // APPROVALS (admin)

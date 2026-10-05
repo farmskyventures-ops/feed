@@ -5497,14 +5497,118 @@ app.get('/api/repayments', requireAuth, requireRole('admin', 'super_admin', 'sup
   return c.json({ repayments: results })
 })
 // Documents
+// ----------------------------------------------------------------------------
+// DOCUMENT MANAGEMENT — Contract, Invoice & Receipt
+//
+// A single endpoint backs three dynamically-generated documents for every
+// purchase (cash or financing):
+//   * contract — the sale/financing agreement (generated on agreement execution)
+//   * invoice  — generated automatically when the order is placed
+//   * receipt  — generated for every payment (full OR partial); lists each
+//                payment with the running balance after it.
+// The response is structured JSON that the SPA renders into a branded,
+// printable/downloadable document carrying the Farmsky logo.
+// ----------------------------------------------------------------------------
 app.get('/api/documents/:type/:id', requireAuth, async (c) => {
+  const user = c.get('user') as SessionUser
   const type = c.req.param('type'), id = c.req.param('id')
-  const contract = await c.env.DB.prepare(
-    `SELECT mc.*, p.name product_name, cu.full_name customer_name, cu.national_id, cu.county
+  const contract = await withAdminContext(c, async () => await c.env.DB.prepare(
+    `SELECT mc.*, p.name product_name, p.sku, p.unit, cu.full_name customer_name, cu.national_id, cu.county, cu.mobile customer_mobile, cu.user_id customer_user_id
      FROM murabaha_contracts mc JOIN products p ON p.id=mc.product_id JOIN customers cu ON cu.id=mc.customer_id WHERE mc.id=?`
-  ).bind(id).first()
+  ).bind(id).first<any>())
   if (!contract) return c.json({ error: 'Not found' }, 404)
-  return c.json({ type, contract, txn_id: contract.contract_ref, qr: `https://api.qrserver.com/v1/create-qr-code/?size=120x120&data=${contract.contract_ref}` })
+  // Access control mirrors the agreement endpoint (owner farmer / placing agent / staff).
+  const isOwnerFarmer = user.role === 'customer' && String(contract.customer_user_id) === String(user.id)
+  const isPlacingAgent = user.role === 'agent' && String(contract.agent_id) === String(user.id)
+  const isStaff = ['admin', 'super_admin', 'operations_finance'].includes(user.role) ||
+    hasVisibility(user, 'view_cash_sales') || hasVisibility(user, 'view_financed_sales') || canManageFinanceConfig(user)
+  if (!isOwnerFarmer && !isPlacingAgent && !isStaff) return c.json({ error: 'Forbidden' }, 403)
+
+  const qr = `https://api.qrserver.com/v1/create-qr-code/?size=120x120&data=${encodeURIComponent(contract.contract_ref)}`
+  const total = roundMoney(numberVal(contract.murabaha_price, 0))
+  const paid = roundMoney(numberVal(contract.amount_paid, 0))
+  const outstanding = roundMoney(numberVal(contract.outstanding, Math.max(0, total - paid)))
+
+  // INVOICE — generated when the order is placed. Resolve (or synthesize) it.
+  if (type === 'invoice') {
+    const invoice = await c.env.DB.prepare(`SELECT * FROM invoices WHERE contract_id=? ORDER BY id DESC LIMIT 1`).bind(id).first<any>()
+    const invStatus = outstanding <= 0 ? 'paid' : (paid > 0 ? 'partial' : 'unpaid')
+    return c.json({
+      type, contract, qr, txn_id: contract.contract_ref,
+      invoice: {
+        invoice_ref: invoice?.invoice_ref || contract.contract_ref,
+        issued_at: invoice?.created_at || contract.created_at,
+        amount: invoice ? numberVal(invoice.amount, total) : total,
+        status: invoice?.status || invStatus,
+        total, paid, outstanding
+      }
+    })
+  }
+
+  // RECEIPT — generated for every payment. Returns the full payment ledger with
+  // a running balance after each payment, so one receipt documents partial and
+  // full settlements alike.
+  if (type === 'receipt') {
+    const { results: txns } = await c.env.DB.prepare(
+      `SELECT txn_ref, amount, method, type, mpesa_receipt, status, created_at FROM transactions WHERE contract_id=? AND status='success' ORDER BY id ASC`
+    ).bind(id).all<any>()
+    let running = 0
+    const payments = (txns || []).map((t: any) => {
+      running = roundMoney(running + numberVal(t.amount, 0))
+      return {
+        txn_ref: t.txn_ref,
+        receipt_no: t.mpesa_receipt || t.txn_ref,
+        amount: numberVal(t.amount, 0),
+        method: t.method,
+        type: t.type,
+        paid_at: t.created_at,
+        cumulative_paid: running,
+        balance_after: roundMoney(Math.max(0, total - running))
+      }
+    })
+    return c.json({
+      type, contract, qr, txn_id: contract.contract_ref,
+      receipt: { total, paid, outstanding, fully_paid: outstanding <= 0, payments }
+    })
+  }
+
+  // CONTRACT (default) — metadata + QR; the rich agreement body comes from the
+  // dedicated /agreement endpoint the SPA already consumes.
+  return c.json({ type: type || 'contract', contract, txn_id: contract.contract_ref, qr })
+})
+
+// ----------------------------------------------------------------------------
+// SALES MANUAL RECONCILIATION
+//
+// Lets a Super-Admin (or a holder of the delegable `sales_manual_reconciliation`
+// permission) manually settle a cash sale's dues/installments when the farmer
+// paid directly into the bank. Inputs: a unique bank transaction code/reference
+// + the exact amount. The settlement runs through the SAME applyPayment engine
+// used by the automated checkout, so it deducts against the due balance, writes
+// the transaction + invoice rows, advances the status lifecycle and generates a
+// receipt identical to the automated one.
+// ----------------------------------------------------------------------------
+app.post('/api/murabaha/:id/manual-reconcile', requireAuth, requirePermission('sales_manual_reconciliation'), async (c) => {
+  const id = c.req.param('id')
+  const body = await c.req.json().catch(() => ({})) as any
+  const txnCode = String(body.transaction_code || body.reference || '').trim()
+  const amt = roundMoney(Number(body.amount))
+  if (!txnCode) return c.json({ error: 'A unique bank transaction code / reference is required' }, 400)
+  if (!Number.isFinite(amt) || amt <= 0) return c.json({ error: 'Enter a valid amount greater than zero' }, 400)
+  const contract = await c.env.DB.prepare(`SELECT * FROM murabaha_contracts WHERE id=?`).bind(id).first<any>()
+  if (!contract) return c.json({ error: 'Purchase not found' }, 404)
+  if (!['active', 'completed', 'awaiting_cash_balance', 'pending_payment'].includes(contract.status)) {
+    return c.json({ error: 'This purchase is not open for reconciliation' }, 400)
+  }
+  const outstanding = roundMoney(numberVal(contract.outstanding, 0))
+  if (outstanding <= 0) return c.json({ error: 'This purchase is already fully settled' }, 400)
+  if (amt > outstanding) return c.json({ error: `Amount exceeds the outstanding balance of KES ${outstanding.toLocaleString()}` }, 400)
+  // Enforce the unique transaction reference (idempotency / no double-posting).
+  const dup = await c.env.DB.prepare(`SELECT id FROM transactions WHERE mpesa_receipt=?`).bind(txnCode).first<any>()
+  if (dup) return c.json({ error: 'That transaction reference has already been recorded' }, 409)
+  const res = await applyPayment(c, contract, amt, txnCode, 'bank_manual', contract.phone || '')
+  await audit(c, c.get('user').id, 'manual_reconcile', 'contract', `${contract.contract_ref} · ref ${txnCode} · KES ${amt}`)
+  return c.json({ ok: true, receipt: txnCode, amount_paid: res?.amount_paid, outstanding: res?.outstanding, status: res?.status })
 })
 
 // ----------------------------------------------------------------------------
