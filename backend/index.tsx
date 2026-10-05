@@ -182,6 +182,14 @@ function hasPermission(user: SessionUser, perm: string) {
   if (['super_admin', 'admin'].includes(user.role)) return true
   return Boolean(user.permissions?.[perm])
 }
+// Strict permission check: true ONLY when the flag is explicitly set on the user
+// (no blanket admin/super-admin override). For actions that must be exclusively
+// available to explicitly-assigned users (e.g. Sales Manual Reconciliation).
+// Super-Admins receive the flag explicitly via migration 0040, so they qualify;
+// a plain admin without the grant does not.
+function hasExplicitPermission(user: SessionUser, perm: string) {
+  return user?.permissions?.[perm] === true
+}
 // Visibility permissions are opt-out: absent key = allowed (backward compatible),
 // explicit false = hidden. Admins always allowed.
 function hasVisibility(user: SessionUser, perm: string) {
@@ -671,7 +679,7 @@ async function getSessionUser(c: any): Promise<SessionUser | null> {
   // sibling app). sessions.user_id is TEXT (migration 0023_sessions_user_id_text).
   const row = await c.env.DB.prepare(
     `SELECT u.id, u.full_name, u.phone, u.email, u.avatar_url, u.role, u.region, u.label, u.permissions, u.status,
-            u.schedule_enabled, u.access_days, u.access_start, u.access_end, s.expires_at
+            u.inventory_is_merchant, u.schedule_enabled, u.access_days, u.access_start, u.access_end, s.expires_at
      FROM sessions s JOIN users u ON CAST(u.id AS TEXT) = s.user_id WHERE s.token = ?`
   ).bind(token).first<any>()
   if (!row) return null
@@ -704,7 +712,8 @@ async function getSessionUser(c: any): Promise<SessionUser | null> {
     role: row.role,
     region: row.region,
     label: row.label || null,
-    permissions: parsePermissions(row.permissions, row.role, fallback)
+    permissions: parsePermissions(row.permissions, row.role, fallback),
+    inventory_is_merchant: Boolean(Number(row.inventory_is_merchant))
   } as any
 }
 // Declare the executing user's identity + capabilities inside the DB session so
@@ -767,6 +776,18 @@ function requirePermission(...perms: string[]) {
   return async (c: any, next: any) => {
     const user = c.get('user') as SessionUser
     if (!perms.some((perm) => hasPermission(user, perm))) {
+      return c.json({ error: "You don't have permission to perform this action. Please contact your administrator if you believe this is a mistake." }, 403)
+    }
+    await next()
+  }
+}
+// Like requirePermission but STRICT: requires the permission flag to be explicitly
+// set on the user (no blanket admin/super-admin pass). Use for actions that must
+// be exclusively accessible to users specifically assigned the capability.
+function requireExplicitPermission(...perms: string[]) {
+  return async (c: any, next: any) => {
+    const user = c.get('user') as SessionUser
+    if (!perms.some((perm) => hasExplicitPermission(user, perm))) {
       return c.json({ error: "You don't have permission to perform this action. Please contact your administrator if you believe this is a mistake." }, 403)
     }
     await next()
@@ -1482,19 +1503,24 @@ app.post('/api/products', requireAuth, requirePermission('can_manage_inventory')
     financeStatus = 'pending_finance'
   }
   const financeSetBy = canFinance ? user.id : null
+  // Merchant inventory users: if the creating user was flagged as a Merchant
+  // inventory source during onboarding, every product they create is PERMANENTLY
+  // tagged source_platform='merchant' (the marketplace category split is kept).
+  // Otherwise products originate from this app ('feed').
+  const sourcePlatform = user.inventory_is_merchant ? 'merchant' : 'feed'
   try {
     const r = await c.env.DB.prepare(
-      `INSERT INTO products (sku,name,category,description,product_type,supplier_id,buying_price,cash_markup_pct,credit_markup_pct,cash_price,credit_price,cash_price_mode,cash_markup_amount,credit_price_mode,credit_markup_amount,quantity,unit,reorder_threshold,image,cash_enabled,financing_enabled,payment_option_mode,show_buyer,financing_model,financing_type_key,financing_interest_pct,financing_frequency,financing_term_min_months,financing_term_max_months,financing_tenure_unit,financing_rate_per_cycle,financing_amount_per_cycle,financing_cycle_count,financing_cycle_length_days,cash_deposit_pct,financing_deposit_pct,cash_terms_text,financing_terms_text,cash_terms_doc_url,financing_terms_doc_url,cash_agreement_source,financing_agreement_source,created_by,finance_status,finance_set_by)
-       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
+      `INSERT INTO products (sku,name,category,source_platform,description,product_type,supplier_id,buying_price,cash_markup_pct,credit_markup_pct,cash_price,credit_price,cash_price_mode,cash_markup_amount,credit_price_mode,credit_markup_amount,quantity,unit,reorder_threshold,image,cash_enabled,financing_enabled,payment_option_mode,show_buyer,financing_model,financing_type_key,financing_interest_pct,financing_frequency,financing_term_min_months,financing_term_max_months,financing_tenure_unit,financing_rate_per_cycle,financing_amount_per_cycle,financing_cycle_count,financing_cycle_length_days,cash_deposit_pct,financing_deposit_pct,cash_terms_text,financing_terms_text,cash_terms_doc_url,financing_terms_doc_url,cash_agreement_source,financing_agreement_source,created_by,finance_status,finance_set_by)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
     ).bind(
-      p.sku, p.name, p.category, p.description, p.product_type, p.supplier_id, p.buying_price, p.cash_markup_pct, p.credit_markup_pct,
+      p.sku, p.name, p.category, sourcePlatform, p.description, p.product_type, p.supplier_id, p.buying_price, p.cash_markup_pct, p.credit_markup_pct,
       p.cash_price, p.credit_price, p.cash_price_mode, p.cash_markup_amount, p.credit_price_mode, p.credit_markup_amount, p.quantity, p.unit, p.reorder_threshold, p.image, p.cash_enabled, p.financing_enabled,
       p.payment_option_mode, p.show_buyer, p.financing_model, p.financing_type_key, p.financing_interest_pct, p.financing_frequency, p.financing_term_min_months,
       p.financing_term_max_months, p.financing_tenure_unit, p.financing_rate_per_cycle, p.financing_amount_per_cycle, p.financing_cycle_count, p.financing_cycle_length_days, p.cash_deposit_pct, p.financing_deposit_pct, p.cash_terms_text, p.financing_terms_text,
       p.cash_terms_doc_url, p.financing_terms_doc_url, p.cash_agreement_source, p.financing_agreement_source, user.id, financeStatus, financeSetBy
     ).run()
-    await audit(c, user.id, 'create', 'product', `${p.name} (${financeStatus})`)
-    return c.json({ id: r.meta.last_row_id, finance_status: financeStatus })
+    await audit(c, user.id, 'create', 'product', `${p.name} (${financeStatus}, ${sourcePlatform})`)
+    return c.json({ id: r.meta.last_row_id, finance_status: financeStatus, source_platform: sourcePlatform })
   } catch (err: any) {
     const msg = String(err?.message || err || '')
     if (/unique|duplicate|sku/i.test(msg)) return c.json({ error: `A product with SKU "${p.sku}" already exists. Use a unique SKU.` }, 409)
@@ -4409,7 +4435,7 @@ app.put('/api/agents/:id', requireAuth, requireRole('admin', 'super_admin'), asy
 app.get('/api/users', requireAuth, requireRole('admin', 'super_admin'), async (c) => {
   const caller = c.get('user') as SessionUser
   const callerIsSuper = isSuperAdmin(caller)
-  const { results } = await c.env.DB.prepare(`SELECT id, full_name, phone, whatsapp, email, role, label, permissions, status, region, schedule_enabled, access_days, access_start, access_end, created_at FROM users ORDER BY id`).all()
+  const { results } = await c.env.DB.prepare(`SELECT id, full_name, phone, whatsapp, email, role, label, permissions, status, region, inventory_is_merchant, schedule_enabled, access_days, access_start, access_end, created_at FROM users ORDER BY id`).all()
   const usersWithPerms = [] as any[]
   for (const u of results as any[]) {
     // Super-Admin credential/profile data is visible ONLY to Super-Admins.
@@ -4417,7 +4443,7 @@ app.get('/api/users', requireAuth, requireRole('admin', 'super_admin'), async (c
     // OTHER Super-Admin account is withheld entirely.
     if (String(u.role || '').toLowerCase() === 'super_admin' && !callerIsSuper && String(u.id) !== String(caller.id)) continue
     const fallback = await loadRoleTemplate(c, u.role)
-    usersWithPerms.push({ ...u, permissions: parsePermissions(u.permissions, u.role, fallback), access_days: safeJson(u.access_days, []) })
+    usersWithPerms.push({ ...u, permissions: parsePermissions(u.permissions, u.role, fallback), inventory_is_merchant: Boolean(Number(u.inventory_is_merchant)), access_days: safeJson(u.access_days, []) })
   }
   return c.json({ users: usersWithPerms })
 })
@@ -4467,6 +4493,9 @@ app.post('/api/users', requireAuth, requireRole('admin', 'super_admin'), async (
     ? await c.env.DB.prepare(`INSERT INTO users (full_name, phone, email, password, role, label, permissions, status, region, password_set, schedule_enabled, access_days, access_start, access_end, created_by, org_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).bind(b.full_name, p, email, await hashPassword(pwd), b.role, label, JSON.stringify(perms), b.status || 'active', b.region || null, provided, schedEnabled, schedDays, b.access_start || null, b.access_end || null, creatorId, usrOrgId).run()
     : await c.env.DB.prepare(`INSERT INTO users (full_name, phone, email, password, role, label, permissions, status, region, password_set, schedule_enabled, access_days, access_start, access_end, created_by) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).bind(b.full_name, p, email, await hashPassword(pwd), b.role, label, JSON.stringify(perms), b.status || 'active', b.region || null, provided, schedEnabled, schedDays, b.access_start || null, b.access_end || null, creatorId).run()
   if (b.role === 'agent') await c.env.DB.prepare(`INSERT INTO agents (user_id,region,permissions) VALUES (?,?,?)`).bind(r.meta.last_row_id, b.region || null, JSON.stringify(perms)).run()
+  // Merchant inventory source flag — only honoured when can_manage_inventory is set.
+  const isMerchantInv = (boolInt(b.inventory_is_merchant, false) && !!perms.can_manage_inventory) ? 1 : 0
+  await c.env.DB.prepare(`UPDATE users SET inventory_is_merchant=? WHERE id=?`).bind(isMerchantInv, r.meta.last_row_id).run()
   // Optional WhatsApp number for the quick-communication buttons (defaults to phone).
   await c.env.DB.prepare(`UPDATE users SET whatsapp=? WHERE id=?`).bind(cleanText(b.whatsapp, 40) || p, r.meta.last_row_id).run()
   await audit(c, creatorId, 'create', 'user', `${b.full_name} (${b.role})`)
@@ -4497,6 +4526,11 @@ app.put('/api/users/:id', requireAuth, requireRole('admin', 'super_admin'), asyn
     await c.env.DB.prepare(`UPDATE users SET full_name=?, phone=?, email=?, role=?, label=?, permissions=?, region=?, schedule_enabled=?, access_days=?, access_start=?, access_end=? WHERE id=?`).bind(b.full_name, b.phone, usrUpdEmail, b.role, b.label || null, JSON.stringify(perms), b.region, schedEnabled, schedDays, b.access_start || null, b.access_end || null, id).run()
   }
   if (b.whatsapp !== undefined) await c.env.DB.prepare(`UPDATE users SET whatsapp=? WHERE id=?`).bind(cleanText(b.whatsapp, 40) || b.phone || null, id).run()
+  // Merchant inventory source flag (only honoured when can_manage_inventory set).
+  if (b.inventory_is_merchant !== undefined) {
+    const isMerchantInv = (boolInt(b.inventory_is_merchant, false) && !!perms.can_manage_inventory) ? 1 : 0
+    await c.env.DB.prepare(`UPDATE users SET inventory_is_merchant=? WHERE id=?`).bind(isMerchantInv, id).run()
+  }
   if (b.role === 'agent') {
     const exists = await c.env.DB.prepare(`SELECT user_id FROM agents WHERE user_id=?`).bind(id).first<any>()
     if (exists) await c.env.DB.prepare(`UPDATE agents SET region=?, permissions=? WHERE user_id=?`).bind(b.region || null, JSON.stringify(perms), id).run()
@@ -5357,12 +5391,14 @@ app.post('/api/settings/quick-product', requireAuth, async (c) => {
   if (!allowed) return c.json({ error: "You don't have permission to add products from the settings builder." }, 403)
   const p = normalizeProductPayload(await c.req.json())
   if (!p.sku || !p.name) return c.json({ error: 'SKU and name are required' }, 400)
+  // Merchant inventory users: tag their products source_platform='merchant'.
+  const sourcePlatform = user.inventory_is_merchant ? 'merchant' : 'feed'
   try {
     const r = await c.env.DB.prepare(
-      `INSERT INTO products (sku,name,category,description,product_type,supplier_id,buying_price,cash_markup_pct,credit_markup_pct,cash_price,credit_price,cash_price_mode,cash_markup_amount,credit_price_mode,credit_markup_amount,quantity,unit,reorder_threshold,image,cash_enabled,financing_enabled,payment_option_mode,financing_model,financing_type_key,financing_interest_pct,financing_frequency,financing_term_min_months,financing_term_max_months,financing_tenure_unit,financing_rate_per_cycle,financing_amount_per_cycle,financing_cycle_count,financing_cycle_length_days,cash_deposit_pct,financing_deposit_pct,cash_terms_text,financing_terms_text,cash_terms_doc_url,financing_terms_doc_url,cash_agreement_source,financing_agreement_source)
-       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
+      `INSERT INTO products (sku,name,category,source_platform,description,product_type,supplier_id,buying_price,cash_markup_pct,credit_markup_pct,cash_price,credit_price,cash_price_mode,cash_markup_amount,credit_price_mode,credit_markup_amount,quantity,unit,reorder_threshold,image,cash_enabled,financing_enabled,payment_option_mode,financing_model,financing_type_key,financing_interest_pct,financing_frequency,financing_term_min_months,financing_term_max_months,financing_tenure_unit,financing_rate_per_cycle,financing_amount_per_cycle,financing_cycle_count,financing_cycle_length_days,cash_deposit_pct,financing_deposit_pct,cash_terms_text,financing_terms_text,cash_terms_doc_url,financing_terms_doc_url,cash_agreement_source,financing_agreement_source)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
     ).bind(
-      p.sku, p.name, p.category, p.description, p.product_type, p.supplier_id, p.buying_price, p.cash_markup_pct, p.credit_markup_pct,
+      p.sku, p.name, p.category, sourcePlatform, p.description, p.product_type, p.supplier_id, p.buying_price, p.cash_markup_pct, p.credit_markup_pct,
       p.cash_price, p.credit_price, p.cash_price_mode, p.cash_markup_amount, p.credit_price_mode, p.credit_markup_amount, p.quantity, p.unit, p.reorder_threshold, p.image, p.cash_enabled, p.financing_enabled,
       p.payment_option_mode, p.financing_model, p.financing_type_key, p.financing_interest_pct, p.financing_frequency, p.financing_term_min_months,
       p.financing_term_max_months, p.financing_tenure_unit, p.financing_rate_per_cycle, p.financing_amount_per_cycle, p.financing_cycle_count, p.financing_cycle_length_days, p.cash_deposit_pct, p.financing_deposit_pct, p.cash_terms_text, p.financing_terms_text,
@@ -5588,7 +5624,7 @@ app.get('/api/documents/:type/:id', requireAuth, async (c) => {
 // the transaction + invoice rows, advances the status lifecycle and generates a
 // receipt identical to the automated one.
 // ----------------------------------------------------------------------------
-app.post('/api/murabaha/:id/manual-reconcile', requireAuth, requirePermission('sales_manual_reconciliation'), async (c) => {
+app.post('/api/murabaha/:id/manual-reconcile', requireAuth, requireExplicitPermission('sales_manual_reconciliation'), async (c) => {
   const id = c.req.param('id')
   const body = await c.req.json().catch(() => ({})) as any
   const txnCode = String(body.transaction_code || body.reference || '').trim()

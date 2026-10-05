@@ -164,6 +164,35 @@ function refreshPermissionChecklist(prefix, roleSelectId, readOnly = false) {
   const box = $(prefix + '_box')
   if (!box || !$(roleSelectId)) return
   box.innerHTML = permissionChecklist(prefix, templatePermissions($(roleSelectId).value), readOnly)
+  // Keep the Merchant inventory-source option in sync with the (re-rendered)
+  // Inventory Management permission checkbox.
+  syncMerchantField(prefix)
+}
+// Returns the live checked-state of the can_manage_inventory permission checkbox
+// inside the given permission-group prefix.
+function inventoryPermChecked(prefix) {
+  const el = document.querySelector(`[data-perm-group="${prefix}"][value="can_manage_inventory"]`)
+  return !!(el && el.checked)
+}
+// Merchant inventory-source toggle. Rendered under the permission check-boxes;
+// only relevant (and only shown) when the Inventory Management role is assigned.
+function merchantInventoryField(prefix, checked = false, readOnly = false) {
+  const dis = readOnly ? 'disabled' : ''
+  return `<div id="${prefix}_merchant_wrap" class="border border-amber-200 bg-amber-50/60 rounded-lg px-3 py-2.5 mt-1 ${inventoryPermChecked(prefix) ? '' : 'hidden'}">
+    <label class="flex items-start gap-2">
+      <input type="checkbox" id="${prefix}_is_merchant" ${checked ? 'checked' : ''} ${dis}>
+      <span><span class="block text-sm font-medium text-slate-700"><i class="fas fa-store text-amber-600 mr-1"></i>Mark inventory source as "Merchant"</span>
+      <span class="block text-[11px] text-slate-500">Items this user adds are tagged as coming from a Merchant. They still keep the marketplace category split (Equipment, Feeds, Crop Inputs).</span></span>
+    </label>
+  </div>`
+}
+// Show/hide the Merchant field based on the Inventory Management permission.
+function syncMerchantField(prefix) {
+  const wrap = $(prefix + '_merchant_wrap')
+  if (!wrap) return
+  const on = inventoryPermChecked(prefix)
+  wrap.classList.toggle('hidden', !on)
+  if (!on) { const cb = $(prefix + '_is_merchant'); if (cb) cb.checked = false }
 }
 // Password input with a show/hide eye toggle (Instruction 4).
 // Renders an <input type=password> wrapped so an eye button can flip its type.
@@ -217,6 +246,15 @@ function canDo(perm) {
   if (!state.user) return false
   if (['super_admin', 'admin'].includes(state.user.role)) return true
   return !!state.user.permissions?.[perm]
+}
+// Strict permission check: true ONLY when the permission flag is explicitly set
+// on the user (no blanket admin/super-admin override). Used for actions that must
+// be exclusively visible to users specifically assigned the capability — e.g.
+// Sales Manual Reconciliation. Super-Admins are granted the flag explicitly by
+// migration 0040, so they still qualify; a plain admin without the grant does not.
+function hasExplicitPerm(perm) {
+  if (!state.user) return false
+  return state.user.permissions?.[perm] === true
 }
 function boolBadge(v, yes='Yes', no='No') { return v ? `<span class="text-emerald-600">${yes}</span>` : `<span class="text-slate-400">${no}</span>` }
 
@@ -366,8 +404,60 @@ async function init() {
     const { data } = await api.get('/me'); state.user = data.user
     try { const cfg = await api.get('/cross/config'); state.crossApp = cfg.data } catch (_) { state.crossApp = null }
     renderApp()
+    startSessionSync()
   }
   catch { renderLogin() }
+}
+
+// ---------------------------------------------------------------------------
+// DYNAMIC RBAC / SESSION SYNC
+//
+// Permissions are evaluated server-side on every request and the sidebar nav is
+// derived from state.user.permissions. Historically the cached session was only
+// refreshed on login, so when a Super-Admin toggled a module for an already
+// signed-in user, that user had to refresh or re-login to see it. This poller
+// re-fetches /me on an interval and, when the role/permissions actually change,
+// live-updates the cached session + re-renders the sidebar (without disturbing
+// an open modal or the user's current view).
+// ---------------------------------------------------------------------------
+let _sessionSyncTimer = null
+let _navDirty = false
+function permsFingerprint(u) {
+  if (!u) return ''
+  const p = u.permissions || {}
+  const keys = Object.keys(p).sort()
+  return u.role + '|' + keys.map(k => `${k}:${p[k] ? 1 : 0}`).join(',')
+}
+async function refreshSession({ force = false } = {}) {
+  if (!state.user) return false
+  let data
+  try { ({ data } = await api.get('/me')) } catch (_) { return false }
+  if (!data?.user) return false
+  const before = permsFingerprint(state.user)
+  const after = permsFingerprint(data.user)
+  state.user = data.user
+  if (force || before !== after) {
+    const allowed = navItems().some(it => it.k === state.route) || state.route === 'profile'
+    if (!allowed) state.route = 'dashboard'
+    const modal = $('modal')
+    if (modal && modal.children.length > 0) { _navDirty = true; return true }
+    renderApp()
+    if (before !== after) toast('Your access has been updated.')
+    return true
+  }
+  return false
+}
+function startSessionSync() {
+  if (_sessionSyncTimer) clearInterval(_sessionSyncTimer)
+  _sessionSyncTimer = setInterval(() => { refreshSession() }, 15000)
+  if (!window._sessionVisBound) {
+    window._sessionVisBound = true
+    document.addEventListener('visibilitychange', () => { if (!document.hidden) refreshSession() })
+    window.addEventListener('focus', () => refreshSession())
+  }
+}
+function stopSessionSync() {
+  if (_sessionSyncTimer) { clearInterval(_sessionSyncTimer); _sessionSyncTimer = null }
 }
 
 // Cross-platform navigation (Phase 2): open the sibling marketplace with a
@@ -565,7 +655,7 @@ function authSignIn() {
         return
       }
       if (data.must_change_password) { done(); renderForceChangePassword(data.user); return }
-      state.user = data.user; toast('Welcome, ' + data.user.full_name); renderApp()
+      state.user = data.user; toast('Welcome, ' + data.user.full_name); renderApp(); startSessionSync()
     } catch (err) {
       done()
       const resp = err.response?.data || {}
@@ -609,7 +699,7 @@ window.doLoginVerifyOtp = async () => {
     const { data } = await api.post('/login/verify-otp', { phone: _loginOtpCtx.phone, password: _loginOtpCtx.password, code })
     // OTP passed → STEP 3: mandatory password change (change-session token is set).
     if (data.must_change_password) { renderForceChangePassword(data.user); return }
-    state.user = data.user; toast('Welcome, ' + data.user.full_name); renderApp()
+    state.user = data.user; toast('Welcome, ' + data.user.full_name); renderApp(); startSessionSync()
   } catch (err) {
     done()
     const resp = err.response?.data || {}
@@ -1056,7 +1146,7 @@ function authSignUpVerify(phone, name, demoOtp) {
         existing_loans: ($('su_existing_loans')?.value || '').trim(),
         sacco_membership: ($('su_sacco')?.value || 'no').trim()
       })
-      state.user = data.user; toast('Account created. Welcome, ' + data.user.full_name); renderApp()
+      state.user = data.user; toast('Account created. Welcome, ' + data.user.full_name); renderApp(); startSessionSync()
     } catch (err) { done(); toast(err.response?.data?.error || 'Verification failed', false) }
   }
 }
@@ -1128,6 +1218,7 @@ async function logout() {
   // fails (e.g. connection dropped) — never leave the user stuck logged-in.
   try { await api.post('/logout') } catch (_) {}
   try { if (typeof stopLive === 'function') stopLive() } catch (_) {}
+  try { stopSessionSync() } catch (_) {}
   state.user = null
   renderLogin()
 }
@@ -1882,7 +1973,9 @@ window.contractDetail = async (id) => {
   // whether the deposit has been taken or it is awaiting the cash balance.
   const cashBalanceDue = isCash && hasBalance
   // Sales Manual Reconciliation — settle a balance paid directly to the bank.
-  const canReconcile = hasBalance && (state.user.role === 'super_admin' || canDo('sales_manual_reconciliation'))
+  // Manual Reconciliation is EXCLUSIVELY available to users explicitly assigned
+  // the 'sales_manual_reconciliation' permission (no blanket admin override).
+  const canReconcile = hasBalance && hasExplicitPerm('sales_manual_reconciliation')
 
   // Compute the next financing installment + days to due (for reminders).
   let nextDue = null
@@ -5202,7 +5295,7 @@ async function viewUsers() {
         <td class="px-4 py-3 font-medium">${esc(u.full_name)}</td>
         <td class="px-4 py-3">${commButtons('user', u.id)}</td>
         <td class="px-4 py-3">${esc(u.label || '—')}</td>
-        <td class="px-4 py-3">${esc(roleLabel(u.role))}</td>
+        <td class="px-4 py-3">${esc(roleLabel(u.role))}${u.inventory_is_merchant ? ' <span class="badge bg-amber-100 text-amber-700 text-[10px] ml-1"><i class="fas fa-store mr-0.5"></i>Merchant</span>' : ''}</td>
         <td class="px-4 py-3">${esc(u.phone)}</td>
         <td class="px-4 py-3 text-xs text-slate-500">${esc(permsText(u.permissions || {})) || '—'}</td>
         <td class="px-4 py-3">${badge(u.status)}</td>
@@ -5349,11 +5442,13 @@ window.addUserModal = async (opts = {}) => {
       <input id="nu_label" placeholder="Label (for example: Western Cluster Agent)" class="w-full px-3 py-2 border rounded-lg">
       <input id="nu_region" placeholder="Region" class="w-full px-3 py-2 border rounded-lg">
       <input id="nu_pwd" placeholder="Password (optional)" class="w-full px-3 py-2 border rounded-lg">
-      <div><div class="field-label">Permission check-boxes</div><div id="nu_perm_box" class="responsive-grid cols-2">${permissionChecklist('nu_perm', templatePermissions(defaultRole), !allowCustomPerms)}</div><div class="help-text">${allowCustomPerms ? 'Toggle the exact permissions to assign to this user.' : 'Only Super Admin can customize the check-box selection. Admin users see role-based defaults.'}</div></div>
+      <div><div class="field-label">Permission check-boxes</div><div id="nu_perm_box" class="responsive-grid cols-2" onchange="syncMerchantField('nu_perm')">${permissionChecklist('nu_perm', templatePermissions(defaultRole), !allowCustomPerms)}</div><div class="help-text">${allowCustomPerms ? 'Toggle the exact permissions to assign to this user.' : 'Only Super Admin can customize the check-box selection. Admin users see role-based defaults.'}</div></div>
+      ${merchantInventoryField('nu_perm', false, !allowCustomPerms)}
       ${allowCustomPerms ? `<div><div class="field-label">Time-Based Access Control</div>${scheduleEditor('nu', {}, false)}<div class="help-text">Optional. Overrides the role login window for this user.</div></div>` : ''}
     </div>
     <div class="flex gap-2 mt-4"><button onclick="doAddUser()" class="btn flex-1 brand-bg text-white py-2 rounded-lg text-sm">Create User</button><button onclick="closeModal()" class="btn px-4 bg-slate-100 rounded-lg text-sm">Cancel</button></div>`)
   if (!lockRole) $('nu_role').onchange = () => refreshPermissionChecklist('nu_perm', 'nu_role', !allowCustomPerms)
+  syncMerchantField('nu_perm')
 }
 window.doAddUser = async () => {
   try {
@@ -5361,6 +5456,8 @@ window.doAddUser = async () => {
     const body = { full_name: $('nu_name').value, phone: $('nu_phone').value, email: $('nu_email').value, role, label: $('nu_label').value, region: $('nu_region').value }
     if ($('nu_pwd') && $('nu_pwd').value) body.password = $('nu_pwd').value
     if (canAssignUserPerms()) { body.permissions = selectedPermissions('nu_perm'); Object.assign(body, collectSchedule('nu')) }
+    // Merchant inventory source flag (only when Inventory Management is granted).
+    body.inventory_is_merchant = inventoryPermChecked('nu_perm') && !!$('nu_perm_is_merchant')?.checked
     const { data } = await api.post('/users', body)
     closeModal()
     showCredential('User Created', body.full_name, body.phone, data.password, data.password_was_set_by_admin, data.temporary, data.expires_at, data.sms_simulated)
@@ -5382,11 +5479,13 @@ window.editUserModal = async (id) => {
     <select id="eu_role" class="w-full px-3 py-2 border rounded-lg">${userRoleOptions(u.role)}</select>
     <input id="eu_label" value="${esc(u.label || '')}" placeholder="Label" class="w-full px-3 py-2 border rounded-lg">
     <input id="eu_region" value="${esc(u.region || '')}" placeholder="Region" class="w-full px-3 py-2 border rounded-lg">
-    <div><div class="field-label">Permission check-boxes</div><div id="eu_perm_box" class="responsive-grid cols-2">${permissionChecklist('eu_perm', u.permissions || {}, !allowCustomPerms)}</div><div class="help-text">${allowCustomPerms ? 'Update the assigned permission check-boxes, then confirm to save.' : 'Only Super Admin can customize the permission check-boxes.'}</div></div>
+    <div><div class="field-label">Permission check-boxes</div><div id="eu_perm_box" class="responsive-grid cols-2" onchange="syncMerchantField('eu_perm')">${permissionChecklist('eu_perm', u.permissions || {}, !allowCustomPerms)}</div><div class="help-text">${allowCustomPerms ? 'Update the assigned permission check-boxes, then confirm to save.' : 'Only Super Admin can customize the permission check-boxes.'}</div></div>
+    ${merchantInventoryField('eu_perm', !!u.inventory_is_merchant, !allowCustomPerms)}
     ${allowCustomPerms ? `<div><div class="field-label">Time-Based Access Control</div>${scheduleEditor('eu', { schedule_enabled: u.schedule_enabled, access_days: u.access_days, access_start: u.access_start, access_end: u.access_end }, false)}<div class="help-text">Optional. Overrides the role login window for this user.</div></div>` : ''}
     <input id="eu_pwd" placeholder="New password (leave blank to keep)" class="w-full px-3 py-2 border rounded-lg">
   </div><div class="flex gap-2 mt-4"><button onclick="doEditUser(${id})" class="btn flex-1 brand-bg text-white py-2 rounded-lg text-sm">Save Changes</button><button onclick="closeModal()" class="btn px-4 bg-slate-100 rounded-lg text-sm">Cancel</button></div>`)
   $('eu_role').onchange = () => refreshPermissionChecklist('eu_perm', 'eu_role', !allowCustomPerms)
+  syncMerchantField('eu_perm')
 }
 window.doEditUser = async (id) => {
   if (!confirmEdit('Save changes to this user account?')) return
@@ -5394,6 +5493,8 @@ window.doEditUser = async (id) => {
     const body = { full_name: $('eu_name').value, phone: $('eu_phone').value, email: $('eu_email').value, role: $('eu_role').value, label: $('eu_label').value, region: $('eu_region').value }
     if ($('eu_pwd').value) body.password = $('eu_pwd').value
     if (canAssignUserPerms()) { body.permissions = selectedPermissions('eu_perm'); Object.assign(body, collectSchedule('eu')) }
+    // Merchant inventory source flag (only when Inventory Management is granted).
+    body.inventory_is_merchant = inventoryPermChecked('eu_perm') && !!$('eu_perm_is_merchant')?.checked
     await api.put('/users/' + id, body)
     closeModal(); toast('User updated'); viewUsers()
   } catch (err) { toast(err.response?.data?.error || 'Failed', false) }
@@ -6556,7 +6657,11 @@ function showModal(html) {
   $('modal').innerHTML = `<div class="fixed inset-0 modal-overlay flex items-center justify-center p-4 z-40" onclick="if(event.target===this)closeModal()">
     <div class="bg-white rounded-2xl p-6 w-full max-w-lg max-h-[90vh] overflow-y-auto fade-in">${html}</div></div>`
 }
-window.closeModal = () => { stopLive(); $('modal').innerHTML = '' }
+window.closeModal = () => {
+  stopLive(); $('modal').innerHTML = ''
+  // Apply a deferred RBAC nav update that arrived while the modal was open.
+  if (_navDirty) { _navDirty = false; try { renderApp(); toast('Your access has been updated.') } catch (_) {} }
+}
 
 // ---------------------------------------------------------------------------
 // PAYMENT TENANTS (Admin-facing) — dynamic provisioning of client apps

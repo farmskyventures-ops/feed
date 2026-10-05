@@ -50,4 +50,7 @@ export type SessionUser = {
   region?: string
   label?: string
   permissions?: Record<string, boolean>
+  // When true (and the user can manage inventory), products this user creates
+  // are permanently tagged source_platform='merchant'.
+  inventory_is_merchant?: boolean
 }
