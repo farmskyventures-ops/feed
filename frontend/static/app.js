@@ -115,6 +115,19 @@ const payLabel = (t, model) => {
     ? 'Cash'
     : (String(t || '').charAt(0).toUpperCase() + String(t || '').slice(1))
 }
+// Render a financing fact ONLY when it was actually configured. Unset/blank
+// values render as a dash — never a 0 / default placeholder — so newly-added,
+// un-configured products don't show phantom financing terms.
+const finFactValue = (v, suffix = '') => {
+  if (v === null || v === undefined || v === '' || Number.isNaN(Number(v))) return '—'
+  return `${Number(v)}${suffix}`
+}
+// NULL-preserving numeric parse for form fields (blank → null).
+const _numOrNull = (v) => {
+  if (v === null || v === undefined || String(v).trim() === '') return null
+  const n = Number(v)
+  return Number.isFinite(n) ? n : null
+}
 
 let _products = [], _agents = [], _users = [], _customers = [], _walletUsers = []
 let _permMeta = { permissions: [], roles: [] }
@@ -122,6 +135,11 @@ let _permMeta = { permissions: [], roles: [] }
 // checkout targets this farmer (customer_id) and any deposit prompt is directed
 // to the farmer's phone. Shape: { id, name, phone } | null.
 let _buyFor = null
+// Multi-product cart (parity with Equipment). A farmer (or an agent in a Buy-For
+// session) can bundle several Feed products into ONE checkout; each item keeps
+// its OWN payment terms. Item shape: { id, name, cash_price, credit_price, qty,
+// payment_type, term_months }.
+let _cart = []
 // Wallet withdraw-limit / charge / support-contact stash (populated by viewMyWallet
 // from GET /api/wallet so the withdraw modal can show the withdrawable limit
 // without a second round-trip). Aligned with the Equipment central-payment hub.
@@ -1644,11 +1662,12 @@ window.buyForFarmer = (farmerId) => {
 }
 function _enterBuyFor(f) {
   _buyFor = { id: f.id, name: f.full_name, phone: f.mobile || '' }
+  _cart = []  // a fresh basket per farmer — never carry items across farmers
   closeModal()
   toast(`Buying for ${f.full_name}. Add products and check out on their behalf.`)
   state.route = 'shop'; renderApp()
 }
-window.clearBuyFor = () => { _buyFor = null; toast('Buy-For cancelled'); route() }
+window.clearBuyFor = () => { _buyFor = null; _cart = []; toast('Buy-For cancelled'); route() }
 
 // UNIFIED SHOP — one storefront that routes across every marketplace (this app's
 // Feed inventory + the sibling Equipment marketplace) via tabs, replacing the old
@@ -1661,8 +1680,11 @@ async function viewShop() {
   // AGENT "Buy For a Farmer" banner: when an agent has entered buy-for context,
   // surface who the order will be placed for + a way to cancel the session.
   const buyForBanner = _buyFor ? `<div class="mb-4 p-3 rounded-lg bg-emerald-50 border border-emerald-200 flex items-center justify-between flex-wrap gap-2">
-      <div class="text-sm text-emerald-800"><i class="fas fa-cart-plus mr-1"></i>Buying on behalf of <b>${esc(_buyFor.name)}</b>${_buyFor.phone ? ` · ${esc(_buyFor.phone)}` : ''}. Add products and check out for this farmer.</div>
-      <button onclick="clearBuyFor()" class="btn bg-white border border-emerald-300 text-emerald-700 px-3 py-1.5 rounded-lg text-xs"><i class="fas fa-xmark mr-1"></i>Cancel Buy-For</button>
+      <div class="text-sm text-emerald-800"><i class="fas fa-cart-plus mr-1"></i>Buying on behalf of <b>${esc(_buyFor.name)}</b>${_buyFor.phone ? ` · ${esc(_buyFor.phone)}` : ''}. Add multiple products to one order, or use <b>Buy</b> for a single item.</div>
+      <div class="flex gap-2">
+        <button onclick="openCart()" class="btn bg-white border border-emerald-300 text-emerald-700 px-3 py-1.5 rounded-lg text-xs"><i class="fas fa-shopping-cart mr-1"></i>Order (${_cart.length})</button>
+        <button onclick="clearBuyFor()" class="btn bg-white border border-emerald-300 text-emerald-700 px-3 py-1.5 rounded-lg text-xs"><i class="fas fa-xmark mr-1"></i>Cancel Buy-For</button>
+      </div>
     </div>` : ''
   // Marketplace tabs. Equipment items are surfaced only when the cross-app link
   // is configured; otherwise the Shop shows Feed inventory alone.
@@ -1671,12 +1693,17 @@ async function viewShop() {
   if (equipEnabled) markets.push({ k: 'equipment', t: 'Equipment', i: 'fa-tractor' })
   if (_shopMarket === 'equipment' && !equipEnabled) _shopMarket = 'feed'
   const tabBar = markets.map(m => `<button onclick="shopSelectMarket('${m.k}')" class="btn px-4 py-2 rounded-lg text-sm ${_shopMarket === m.k ? 'brand-bg text-white' : 'bg-slate-100 hover:bg-slate-200'}"><i class="fas ${m.i} mr-1"></i>${m.t}</button>`).join('')
+  // Cart button (Feed marketplace only — the Equipment tab uses the cross-app flow).
+  const cartBtn = (_shopMarket === 'feed' && canUseCart()) ? `<button onclick="openCart()" class="btn ml-auto bg-slate-100 hover:bg-slate-200 px-4 py-2 rounded-lg text-sm relative"><i class="fas fa-shopping-cart mr-1"></i>Cart <span id="cartCount" class="badge bg-teal-600 text-white ml-1">${_cart.length}</span></button>` : ''
   $('content').innerHTML = `${buyForBanner}
-    <div class="flex items-center gap-2 mb-4 flex-wrap">${tabBar}</div>
+    <div class="flex items-center gap-2 mb-4 flex-wrap">${tabBar}${cartBtn}</div>
     <div id="shopGrid"><div class="text-sm text-slate-400 p-4">Loading…</div></div>`
   if (_shopMarket === 'equipment') return renderShopEquipment()
   return renderShopFeed()
 }
+// Who may use the multi-product cart: a farmer (customer) or an agent in an
+// active Buy-For session (parity with the Equipment app).
+function canUseCart() { return state.user.role === 'customer' || (state.user.role === 'agent' && !!_buyFor) }
 async function renderShopFeed() {
   const { data } = await api.get('/products?shop=1')
   _products = data.products
@@ -1694,11 +1721,162 @@ async function renderShopFeed() {
           </div>
           <div class="flex gap-2 mt-4">
             <button onclick="productDetail(${p.id})" class="btn flex-1 bg-slate-100 hover:bg-slate-200 py-2 rounded-lg text-sm"><i class="fas fa-circle-info mr-1"></i>Details</button>
-            <button onclick="buyModal(${p.id})" ${p.quantity <= 0 ? 'disabled' : ''} class="btn flex-1 brand-bg text-white py-2 rounded-lg text-sm disabled:opacity-40"><i class="fas fa-cart-plus mr-1"></i>Buy</button>
+            ${canUseCart() ? `<button onclick="addToCart(${p.id})" ${p.quantity <= 0 ? 'disabled' : ''} class="btn bg-slate-100 hover:bg-slate-200 py-2 px-3 rounded-lg text-sm disabled:opacity-40" title="Add to cart"><i class="fas fa-cart-plus"></i></button>` : ''}
+            <button onclick="buyModal(${p.id})" ${p.quantity <= 0 ? 'disabled' : ''} class="btn flex-1 brand-bg text-white py-2 rounded-lg text-sm disabled:opacity-40"><i class="fas fa-bolt mr-1"></i>Buy</button>
           </div>
         </div>
       </div>`).join('') || '<div class="col-span-full text-center py-12 text-slate-400">No products available yet.</div>'}
   </div>`
+}
+// ===========================================================================
+// MULTI-PRODUCT BUNDLED CHECKOUT (Feed) — parity with the Equipment app.
+// The cart lets a farmer (or an agent in a Buy-For session) bundle several Feed
+// products into ONE checkout. Each item carries its OWN terms (payment type +
+// financing term). Backend: POST /api/murabaha/apply-bundle (already present).
+// ===========================================================================
+window.addToCart = (id) => {
+  if (!canUseCart()) return toast('Add products to the cart from your own shop or a Buy-For session.', false)
+  const p = _products.find(x => x.id === id); if (!p) return toast('Product unavailable', false)
+  cartItemModal(id)
+}
+// Configure an individual item's terms before it joins (or while editing) the cart.
+window.cartItemModal = (id, editIndex) => {
+  const p = _products.find(x => x.id === id)
+  if (!p) return toast('Product unavailable', false)
+  const existing = (typeof editIndex === 'number') ? _cart[editIndex] : null
+  const minTerm = Math.max(1, Number(p.financing_term_min_months || 3))
+  const maxTerm = Math.max(minTerm, Number(p.financing_term_max_months || 12))
+  const curTerm = existing ? Number(existing.term_months) : Math.min(6, maxTerm)
+  const termOptions = Array.from({ length: maxTerm - minTerm + 1 }, (_, i) => minTerm + i)
+    .map(m => `<option value="${m}" ${m === Math.max(minTerm, curTerm) ? 'selected' : ''}>${m}</option>`).join('')
+  const curPtype = existing ? existing.payment_type : (p.cash_enabled ? 'cash' : 'financing')
+  const paymentOptions = [
+    p.cash_enabled ? `<option value="cash" ${curPtype === 'cash' ? 'selected' : ''}>Cash purchase</option>` : '',
+    p.financing_enabled ? `<option value="financing" ${curPtype === 'financing' ? 'selected' : ''}>Murabaha financing</option>` : ''
+  ].join('')
+  showModal(`<h3 class="text-lg font-bold mb-1"><i class="fas fa-cart-plus text-emerald-600 mr-2"></i>${existing ? 'Edit item' : 'Add to order'}: ${esc(p.name)}</h3>
+    ${_buyFor ? `<div class="mb-2 p-2 rounded-lg bg-emerald-50 border border-emerald-200 text-xs text-emerald-800"><i class="fas fa-user mr-1"></i>For <b>${esc(_buyFor.name)}</b></div>` : ''}
+    <p class="text-xs text-slate-500 mb-3">Set this item's own terms. Each product in the order keeps its own payment terms.</p>
+    <div class="grid grid-cols-2 gap-3 text-sm">
+      <div><label class="font-medium">Quantity</label><input id="ci_qty" type="number" value="${existing ? existing.qty : 1}" min="1" max="${p.quantity}" class="w-full mt-1 px-3 py-2 border border-slate-300 rounded-lg"></div>
+      <div><label class="font-medium">Payment Type</label><select id="ci_ptype" onchange="ciToggleTerm()" class="w-full mt-1 px-3 py-2 border border-slate-300 rounded-lg">${paymentOptions}</select></div>
+      <div id="ci_termWrap" class="col-span-2 ${curPtype === 'financing' ? '' : 'hidden'}"><label class="font-medium">Financing Term (months)</label><select id="ci_term" class="w-full mt-1 px-3 py-2 border border-slate-300 rounded-lg">${termOptions}</select></div>
+    </div>
+    <div class="grid grid-cols-2 gap-2 mt-3 text-xs">
+      <div class="bg-slate-50 border border-slate-200 rounded-lg p-2"><div class="text-slate-500">Cash price</div><div class="font-semibold">${fmt(p.cash_price)}</div><div class="text-slate-400 mt-0.5">deposit ${Number(p.cash_deposit_pct ?? 100)}%</div></div>
+      <div class="bg-slate-50 border border-slate-200 rounded-lg p-2"><div class="text-slate-500">Financing price</div><div class="font-semibold">${fmt(p.credit_price)}</div><div class="text-slate-400 mt-0.5">deposit ${finFactValue(p.financing_deposit_pct, '%')}</div></div>
+    </div>
+    <div class="flex gap-2 mt-4">
+      <button onclick="saveCartItem(${p.id}, ${typeof editIndex === 'number' ? editIndex : 'null'})" class="btn flex-1 brand-bg text-white py-2.5 rounded-lg text-sm">${existing ? 'Update item' : 'Add to order'}</button>
+      <button onclick="${existing ? 'openCart()' : 'closeModal()'}" class="btn px-4 bg-slate-100 rounded-lg text-sm">Cancel</button>
+    </div>`)
+}
+window.ciToggleTerm = () => { const w = $('ci_termWrap'); if (w) w.classList.toggle('hidden', $('ci_ptype').value !== 'financing') }
+window.saveCartItem = (id, editIndex) => {
+  const p = _products.find(x => x.id === id); if (!p) return
+  const qty = Math.max(1, Number($('ci_qty').value) || 1)
+  const payment_type = $('ci_ptype').value === 'cash' ? 'cash' : 'financing'
+  const term_months = payment_type === 'financing' ? Number($('ci_term')?.value || 0) : 0
+  const item = { id, name: p.name, cash_price: p.cash_price, credit_price: p.credit_price, qty, payment_type, term_months }
+  if (typeof editIndex === 'number' && _cart[editIndex]) { _cart[editIndex] = item; toast(`${p.name} updated`) }
+  else {
+    const dup = _cart.find(x => x.id === id && x.payment_type === payment_type && x.term_months === term_months)
+    if (dup) { dup.qty += qty; toast(`${p.name} quantity updated`) }
+    else { _cart.push(item); toast(`${p.name} added to your order`) }
+  }
+  const cc = $('cartCount'); if (cc) cc.textContent = _cart.length
+  openCart()
+}
+window.removeFromCart = (index) => { _cart.splice(index, 1); openCart() }
+window.openCart = () => {
+  const who = _buyFor ? ` for ${esc(_buyFor.name)}` : ''
+  if (!_cart.length) return showModal(`<h3 class="font-bold mb-3"><i class="fas fa-shopping-cart mr-2"></i>Your Order${who}</h3><p class="text-slate-400 text-sm mb-4">No products added yet. Add items from the shop — each item keeps its own payment terms.</p><button onclick="closeModal()" class="btn bg-slate-100 px-4 py-2 rounded-lg text-sm">Close</button>`)
+  const cashTotal = _cart.filter(x => x.payment_type === 'cash').reduce((s, x) => s + Number(x.cash_price) * x.qty, 0)
+  const finTotal = _cart.filter(x => x.payment_type === 'financing').reduce((s, x) => s + Number(x.credit_price) * x.qty, 0)
+  const rows = _cart.map((x, i) => `<div class="flex items-center justify-between py-2 border-b border-slate-100">
+    <div class="min-w-0">
+      <div class="font-medium text-sm truncate">${esc(x.name)}</div>
+      <div class="text-[11px] text-slate-400">x${x.qty} · ${x.payment_type === 'cash' ? 'Cash' : `Financing ${x.term_months}mo`}</div>
+    </div>
+    <div class="flex items-center gap-3">
+      <span class="font-semibold text-sm">${fmt((x.payment_type === 'cash' ? x.cash_price : x.credit_price) * x.qty)}</span>
+      <button onclick="cartItemModal(${x.id}, ${i})" class="text-slate-500 text-xs hover:underline">edit</button>
+      <button onclick="removeFromCart(${i})" class="text-red-500 text-xs hover:underline">remove</button>
+    </div>
+  </div>`).join('')
+  showModal(`<h3 class="font-bold mb-1"><i class="fas fa-shopping-cart mr-2"></i>Your Order${who}</h3>
+    <p class="text-xs text-slate-400 mb-3">${_cart.length} item(s) · each item keeps its own payment terms</p>
+    ${rows}
+    ${cashTotal ? `<div class="flex justify-between text-sm mt-3"><span class="text-slate-500">Cash items total</span><span class="font-semibold">${fmt(cashTotal)}</span></div>` : ''}
+    ${finTotal ? `<div class="flex justify-between text-sm"><span class="text-slate-500">Financing items total</span><span class="font-semibold">${fmt(finTotal)}</span></div>` : ''}
+    <div class="flex gap-2 mt-4">
+      <button onclick="checkoutCart()" class="btn flex-1 brand-bg text-white py-2 rounded-lg text-sm"><i class="fas fa-cash-register mr-1"></i>Place an Order</button>
+      <button onclick="closeModal()" class="btn px-4 bg-slate-100 rounded-lg text-sm">Close</button>
+    </div>`)
+}
+// Submit the whole cart as ONE bundled order. Each item keeps its own terms; a
+// sequential cash-deposit prompt is raised per cash item (directed to the farmer
+// when an agent is buying on their behalf).
+window.checkoutCart = async () => {
+  if (!_cart.length) return closeModal()
+  const items = _cart.map(x => ({ product_id: x.id, quantity: x.qty, payment_type: x.payment_type, term_months: x.term_months }))
+  const body = { items, delivery_location: '', consent: true }
+  if (_buyFor) body.customer_id = _buyFor.id
+  // KYC gate: placing an order requires the buyer to have completed registration.
+  try {
+    const check = await api.post('/checkout/kyc-check', _buyFor ? { customer_id: _buyFor.id } : {})
+    if (check.data && !check.data.verified) {
+      toast('Complete registration to place your order.', false)
+      closeModal()
+      return completeRegistration(check.data.customer_id, true)
+    }
+  } catch (err) {
+    return toast(err.response?.data?.error || 'Could not verify registration status', false)
+  }
+  try {
+    const { data } = await api.post('/murabaha/apply-bundle', body)
+    _cart = []
+    const cc = $('cartCount'); if (cc) cc.textContent = '0'
+    const who = data.buy_for ? ((data.farmer && data.farmer.name) || (_buyFor && _buyFor.name) || 'the farmer') : 'you'
+    if (data.requires_payment && data.pay_contract_id) {
+      const farmer = data.buy_for ? (data.farmer || _buyFor) : null
+      const ids = data.cash_deposit_contract_ids && data.cash_deposit_contract_ids.length ? data.cash_deposit_contract_ids : [data.pay_contract_id]
+      const cashItems = (data.items || []).filter(it => ids.includes(it.id))
+      toast(`Order ${data.bundle_ref} placed (${data.item_count} item(s)). Authorising the ${fmt(data.deposit_due_now)} deposit${cashItems.length > 1 ? 's' : ''}${data.buy_for ? ` from ${who}` : ''}.`)
+      _bundlePayQueue = cashItems.map(it => ({ id: it.id, amount: it.amount_due_now, outstanding: it.total_payable }))
+      _bundlePayOpts = farmer ? { phone: farmer.phone, name: farmer.name, deposit: true } : { deposit: true }
+      return nextBundlePayment()
+    }
+    closeModal()
+    toast(`Order ${data.bundle_ref} placed for ${who}: ${data.item_count} item(s). No deposit required — advanced to approval / delivery.`)
+    if (_buyFor && state.user.role === 'agent') { state.route = 'shop'; renderApp() }
+    else { state.route = 'contracts'; renderApp() }
+  } catch (err) {
+    const d = err.response?.data
+    if (err.response?.status === 412 && d?.error === 'kyc_required') {
+      return toast(`${d.product_name ? d.product_name + ': ' : ''}${d.message || 'KYC verification required for financing items.'}`, false)
+    }
+    toast(d?.error || 'Could not place the order', false)
+  }
+}
+// Sequential deposit-prompt queue for a bundled checkout (one STK per cash item).
+let _bundlePayQueue = []
+let _bundlePayOpts = {}
+let _payBundleNext = false  // set by payModal when the prompt is a bundle step
+function nextBundlePayment() {
+  const next = _bundlePayQueue.shift()
+  if (!next) {
+    if (_buyFor && state.user.role === 'agent') { state.route = 'shop'; renderApp() }
+    else { state.route = 'contracts'; renderApp() }
+    return
+  }
+  payModal(next.id, next.amount, next.outstanding, 'cash', { ..._bundlePayOpts, bundleNext: true })
+}
+// After a successful payment: advance a bundled-checkout deposit queue if one is
+// in progress; otherwise close + navigate to the purchases list as before.
+function _afterPaySuccess() {
+  if (_payBundleNext) { _payBundleNext = false; return nextBundlePayment() }
+  closeModal(); state.route = 'contracts'; renderApp()
 }
 // Equipment tab: cross-app inventory bought in-session (no sign-out), reusing the
 // existing /cross/inventory feed + crossBuyModal purchase flow.
@@ -1749,23 +1927,42 @@ window.buyModal = async (productId) => {
       </div>
       <div><label class="font-medium">Delivery Location</label><input id="dloc" type="text" placeholder="Village / Ward" class="w-full mt-1 px-3 py-2 border border-slate-300 rounded-lg"></div>
     </div>
-    <!-- Cash-only facts (shown only when Cash is selected) -->
+    <!-- Cash-only facts (shown only when Cash is selected). The "Purchase type:
+         Outright cash" label is intentionally NOT shown to the buyer. -->
     <div id="cashFacts" class="responsive-grid cols-2 mt-3 text-xs hidden">
       <div class="bg-slate-50 border border-slate-200 rounded-lg p-3"><div class="text-slate-500">Cash deposit requirement</div><div class="font-semibold mt-1">${Number(p.cash_deposit_pct ?? 100)}%</div></div>
-      <div class="bg-slate-50 border border-slate-200 rounded-lg p-3"><div class="text-slate-500">Purchase type</div><div class="font-semibold mt-1">Outright cash</div></div>
     </div>
-    <!-- Financing-only facts (shown only when Financing is selected) -->
+    <!-- Financing-only facts (shown only when Financing is selected). Values are
+         only rendered when actually configured on the product — unconfigured
+         fields stay blank (no default placeholders). -->
     <div id="finFacts" class="responsive-grid cols-2 mt-3 text-xs hidden">
-      <div class="bg-slate-50 border border-slate-200 rounded-lg p-3"><div class="text-slate-500">Financing deposit requirement</div><div class="font-semibold mt-1">${Number(p.financing_deposit_pct ?? 10)}%</div></div>
-      <div class="bg-slate-50 border border-slate-200 rounded-lg p-3"><div class="text-slate-500">Financing model</div><div class="font-semibold mt-1">${'Murabaha'}</div></div>
-      <div class="bg-slate-50 border border-slate-200 rounded-lg p-3"><div class="text-slate-500">Profit / markup rate</div><div class="font-semibold mt-1">${Number(p.financing_interest_pct || 0)}%</div></div>
+      <div class="bg-slate-50 border border-slate-200 rounded-lg p-3"><div class="text-slate-500">Financing deposit requirement</div><div class="font-semibold mt-1">${finFactValue(p.financing_deposit_pct, '%')}</div></div>
+      <div class="bg-slate-50 border border-slate-200 rounded-lg p-3"><div class="text-slate-500">Financing model</div><div class="font-semibold mt-1">${p.financing_enabled ? 'Murabaha' : '—'}</div></div>
+      <div class="bg-slate-50 border border-slate-200 rounded-lg p-3"><div class="text-slate-500">Profit / markup rate</div><div class="font-semibold mt-1">${finFactValue(p.financing_interest_pct, '%')}</div></div>
     </div>
     <div id="quoteBox" class="mt-4"></div>
     <div class="flex gap-2 mt-5">
       <button onclick="getQuote(${p.id})" class="btn flex-1 bg-slate-800 text-white py-2.5 rounded-lg text-sm"><i class="fas fa-calculator mr-1"></i>Preview Payment Terms</button>
+      ${canUseCart() ? `<button onclick="addMoreFromBuyModal(${p.id})" class="btn px-4 bg-emerald-600 text-white rounded-lg text-sm" title="Add this item and keep shopping"><i class="fas fa-cart-plus mr-1"></i>Add More Items</button>` : ''}
       <button onclick="closeModal()" class="btn px-4 bg-slate-100 rounded-lg text-sm">Cancel</button>
     </div>`)
   toggleTerm()
+}
+// Add the item currently configured in buyModal into the cart, then return the
+// buyer to the shop to keep adding products (parity with Equipment).
+window.addMoreFromBuyModal = (productId) => {
+  if (!canUseCart()) return toast('Add products to the cart from your own shop or a Buy-For session.', false)
+  const p = _products.find(x => x.id === productId)
+  if (!p) return toast('Product unavailable', false)
+  const qty = Math.max(1, Number($('qty')?.value) || 1)
+  const payment_type = ($('ptype')?.value === 'cash') ? 'cash' : 'financing'
+  const term_months = payment_type === 'financing' ? Number($('term')?.value || 0) : 0
+  const item = { id: productId, name: p.name, cash_price: p.cash_price, credit_price: p.credit_price, qty, payment_type, term_months }
+  const dup = _cart.find(x => x.id === productId && x.payment_type === payment_type && x.term_months === term_months)
+  if (dup) { dup.qty += qty; toast(`${p.name} quantity updated`) }
+  else { _cart.push(item); toast(`${p.name} added — keep shopping, then Place an Order`) }
+  const cc = $('cartCount'); if (cc) cc.textContent = _cart.length
+  closeModal(); state.route = 'shop'; renderApp()
 }
 window.toggleTerm = () => {
   const isFin = $('ptype') && $('ptype').value === 'financing'
@@ -1785,7 +1982,7 @@ window.getQuote = async (productId) => {
     <div class="bg-teal-50 border border-teal-200 rounded-xl p-4">
       <h4 class="font-bold text-teal-800 mb-2"><i class="fas fa-file-invoice-dollar mr-1"></i>Payment Summary</h4>
       <div class="space-y-1 text-sm">
-        <div class="flex justify-between"><span>Purchase type</span><b>${payLabel(data.payment_type, data.financing_model)}</b></div>
+        ${financing ? `<div class="flex justify-between"><span>Purchase type</span><b>${payLabel(data.payment_type, data.financing_model)}</b></div>` : ''}
         ${(data.show_buyer || (state.user && state.user.role !== 'customer')) ? `<div class="flex justify-between"><span>Supplier cost</span><b>${fmt(data.supplier_cost)}</b></div>` : ''}
         <div class="flex justify-between"><span>Deposit required</span><b>${data.deposit_pct}% (${fmt(data.deposit_amount)})</b></div>
         <div class="flex justify-between"><span>Amount due now</span><b>${fmt(data.amount_due_now)}</b></div>
@@ -1802,7 +1999,7 @@ window.getQuote = async (productId) => {
       <p class="text-xs text-teal-700 mt-2 italic">${esc(data.disclosure_note || '')}</p>
       ${data.terms_text ? `<div class="mt-3 text-xs text-slate-600 bg-white/70 rounded-lg p-3 border border-teal-100"><b>Terms summary:</b> ${esc(data.terms_text)}</div>` : ''}
       ${data.terms_document_url ? `<p class="mt-2 text-xs"><a href="${esc(data.terms_document_url)}" target="_blank" class="text-teal-700 underline">Open uploaded agreement</a></p>` : ''}
-      <label class="flex items-center gap-2 mt-3 text-sm"><input type="checkbox" id="consent"> I consent to these cash/financing terms.</label>
+      <label class="flex items-center gap-2 mt-3 text-sm"><input type="checkbox" id="consent"> ${financing ? 'I agree to the following Financing terms.' : 'I agree to the Cash terms.'}</label>
       <button onclick="submitBuy(${productId}, event)" class="btn w-full mt-3 brand-bg text-white py-2.5 rounded-lg text-sm">${financing ? 'Submit Financing Application' : 'Confirm Cash Purchase'}</button>
     </div>`
 }
@@ -2069,6 +2266,9 @@ window.deliverContract = async (id) => {
 window.payModal = async (id, amount, outstanding, kind, opts) => {
   kind = kind || 'repay'
   opts = opts || {}
+  // Remember whether this prompt is a step in a bundled-checkout deposit queue,
+  // so a successful payment advances to the next item instead of navigating away.
+  _payBundleNext = !!opts.bundleNext
   const isCash = kind === 'cash'
   // When set (agent deliver / Buy-For), the prompt is directed to the farmer's phone.
   const targetPhone = opts.phone || state.user.phone
@@ -2572,7 +2772,7 @@ window.doPay = async (id, kind) => {
         if (cd.status === 'success') {
           payStateAlert('success', null, cd.mpesa_receipt, id)
           toast((isCash ? 'Cash purchase complete! Receipt: ' : 'Payment received! Receipt: ') + cd.mpesa_receipt)
-          setTimeout(() => { closeModal(); state.route = 'contracts'; renderApp() }, 4200)
+          setTimeout(() => { _afterPaySuccess() }, _payBundleNext ? 1800 : 4200)
           return
         }
         else if (cd.status === 'failed') { payStateAlert('failed', cd.result_desc || 'Payment failed'); reEnable(); return }
@@ -2617,7 +2817,7 @@ window.doSasaOtp = async (checkoutId, id, kind) => {
         if (cd.status === 'success') {
           payStateAlert('success', null, cd.mpesa_receipt, id)
           toast((isCash ? 'Cash purchase complete! Receipt: ' : 'Payment received! Receipt: ') + cd.mpesa_receipt)
-          setTimeout(() => { closeModal(); state.route = 'contracts'; renderApp() }, 4200)
+          setTimeout(() => { _afterPaySuccess() }, _payBundleNext ? 1800 : 4200)
           return
         }
         else if (cd.status === 'failed') { payStateAlert('failed', cd.result_desc || 'Payment failed'); btnReset('spOtpBtn'); return }
@@ -3019,8 +3219,8 @@ function productForm(prefix, p = {}) {
       <div><label class="field-label">Financing model (legacy)</label><select id="${prefix}_fin_model" ${finDis} class="px-3 py-2 border rounded-lg ${finDis ? 'bg-slate-100 text-slate-400' : ''}">
         <option value="murabaha" selected>Murabaha</option>
       </select></div>
-      <div><label class="field-label">Profit / markup rate %</label><input id="${prefix}_int" ${finDis} type="number" value="${Number(p.financing_interest_pct || 0)}" placeholder="Profit / markup rate %" class="px-3 py-2 border rounded-lg ${finDis ? 'bg-slate-100 text-slate-400' : ''}"></div>
-      <div><label class="field-label">Financing deposit %</label><input id="${prefix}_fin_dep" ${finDis} type="number" value="${Number(p.financing_deposit_pct ?? 10)}" placeholder="Financing deposit %" class="px-3 py-2 border rounded-lg ${finDis ? 'bg-slate-100 text-slate-400' : ''}"></div>
+      <div><label class="field-label">Profit / markup rate %</label><input id="${prefix}_int" ${finDis} type="number" value="${p.financing_interest_pct ?? ''}" placeholder="Profit / markup rate %" class="px-3 py-2 border rounded-lg ${finDis ? 'bg-slate-100 text-slate-400' : ''}"></div>
+      <div><label class="field-label">Financing deposit %</label><input id="${prefix}_fin_dep" ${finDis} type="number" value="${p.financing_deposit_pct ?? ''}" placeholder="Financing deposit %" class="px-3 py-2 border rounded-lg ${finDis ? 'bg-slate-100 text-slate-400' : ''}"></div>
       <div style="grid-column:1 / -1" class="border rounded-xl p-3 bg-white">
         <div class="font-medium text-slate-700 mb-2 text-sm"><i class="fas fa-calendar-days text-teal-600 mr-1"></i>Tenure &amp; repayment schedule</div>
         <div class="responsive-grid cols-2">
@@ -3189,7 +3389,9 @@ function productPayload(prefix) {
     credit_price: Number(($(prefix + '_credit_price') || {}).value || 0),
     financing_model: $(prefix + '_fin_model').value,
     financing_type_key: ($(prefix + '_fin_type') || {}).value || 'murabaha',
-    financing_interest_pct: Number($(prefix + '_int').value || 0),
+    // Blank financing fields persist as NULL (not a 0 / default) so an
+    // un-configured product shows no phantom financing terms downstream.
+    financing_interest_pct: _numOrNull($(prefix + '_int').value),
     financing_frequency: $(prefix + '_freq').value,
     financing_term_min_months: Number($(prefix + '_tmin').value || 3),
     financing_term_max_months: Number($(prefix + '_tmax').value || 12),
@@ -3200,7 +3402,7 @@ function productPayload(prefix) {
     financing_cycle_count: Number(($(prefix + '_cycle_count') || {}).value || 0),
     financing_cycle_length_days: Number(($(prefix + '_cycle_len') || {}).value || 30),
     cash_deposit_pct: Number($(prefix + '_cash_dep').value || 100),
-    financing_deposit_pct: Number($(prefix + '_fin_dep').value || 10),
+    financing_deposit_pct: _numOrNull($(prefix + '_fin_dep').value),
     // Agreement source mode + the matching representation (rich-text from the
     // editor, or the uploaded PDF/Word doc data URL).
     cash_agreement_source: ($(prefix + '_cash_ag_src') || {}).value || 'editor',
