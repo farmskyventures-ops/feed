@@ -1752,20 +1752,45 @@ app.post('/api/customers', requireAuth, requireRole('agent', 'admin', 'super_adm
     { key: 'value_chain', label: 'Value chain', max: 120 }, { key: 'value_chain_type', label: 'Value chain type', max: 120 }
   ])
   if (!tv.ok) return c.json({ error: tv.error }, 400)
+  // Validate + pre-check a unique National ID so onboarding returns a clean 409
+  // instead of an unhandled uq_customers_national_id 500.
+  const onbId = String(b.national_id || '').trim()
+  if (onbId) {
+    if (!/^[0-9]{5,12}$/.test(onbId)) return c.json({ error: 'Enter a valid National ID number (digits only)' }, 400)
+    const clash = await withAdminContext(c, async () => await c.env.DB.prepare(`SELECT id FROM customers WHERE national_id=?`).bind(onbId).first())
+    if (clash) return c.json({ error: 'A customer with this National ID already exists.' }, 409)
+    b.national_id = onbId
+  }
   const saccoMember = ['yes', 'true', '1', 'on'].includes(String(b.sacco_membership || '').toLowerCase())
   const assignedAgent = user.role === 'agent' ? user.id : (b.agent_id || user.id)
-  const r = await c.env.DB.prepare(
-    `INSERT INTO customers (agent_id,onboarded_by,full_name,national_id,date_of_birth,gender,mobile,alt_mobile,county,sub_county,ward,village,latitude,longitude,value_chain_type,value_chain,acreage,herd_size,farm_experience,annual_production,existing_loans,sacco_membership,id_front_url,id_back_url,kyc_status,status)
-     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?, 'pending', 'active')`
-  ).bind(
-    assignedAgent, assignedAgent,
-    b.full_name, b.national_id, b.date_of_birth, b.gender, b.mobile, b.alt_mobile, b.county, b.sub_county,
-    b.ward, b.village, b.latitude || null, b.longitude || null, b.value_chain_type, b.value_chain,
-    b.acreage || null, b.herd_size || null, b.farm_experience || null, b.annual_production || null,
-    b.existing_loans || null,
-    saccoMember ? 'yes' : 'no',
-    b.id_front_url || null, b.id_back_url || null
-  ).run()
+  let r: any
+  try {
+    r = await c.env.DB.prepare(
+      `INSERT INTO customers (agent_id,onboarded_by,full_name,national_id,date_of_birth,gender,mobile,alt_mobile,county,sub_county,ward,village,latitude,longitude,value_chain_type,value_chain,acreage,herd_size,farm_experience,annual_production,existing_loans,sacco_membership,id_front_url,id_back_url,kyc_status,status)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?, 'pending', 'active')`
+    ).bind(
+      assignedAgent, assignedAgent,
+      b.full_name, b.national_id, b.date_of_birth, b.gender, b.mobile, b.alt_mobile, b.county, b.sub_county,
+      b.ward, b.village, b.latitude || null, b.longitude || null, b.value_chain_type, b.value_chain,
+      b.acreage || null, b.herd_size || null, b.farm_experience || null, b.annual_production || null,
+      b.existing_loans || null,
+      saccoMember ? 'yes' : 'no',
+      b.id_front_url || null, b.id_back_url || null
+    ).run()
+  } catch (err: any) {
+    // Graceful duplicate handling: a concurrent/duplicate submission that trips a
+    // UNIQUE constraint (national_id, mobile, …) returns a clean 409 instead of an
+    // unhandled 500. The pkey-desync class is auto-healed in the DB layer; this
+    // catches genuine business-level duplicates.
+    const msg = String(err?.message || err)
+    if (err?.code === '23505' || /duplicate key|unique/i.test(msg)) {
+      if (/national_id/i.test(String(err?.constraint || msg))) return c.json({ error: 'A customer with this National ID already exists.' }, 409)
+      if (/mobile|phone/i.test(String(err?.constraint || msg))) return c.json({ error: 'A customer with this phone number already exists.' }, 409)
+      return c.json({ error: 'A customer with these details already exists.' }, 409)
+    }
+    console.error('Customer create failed:', msg)
+    return c.json({ error: 'Could not save the customer. Please check the details and try again.' }, 500)
+  }
   let customerId: any = r.meta.last_row_id
   if (!customerId && b.national_id) {
     const row = await c.env.DB.prepare(`SELECT id FROM customers WHERE national_id=?`).bind(b.national_id).first<any>()
@@ -2120,7 +2145,17 @@ app.post('/api/murabaha/apply', requireAuth, checkoutApplyHandler)
 // ---------------------------------------------------------------------------
 app.post('/api/checkout/kyc-check', requireAuth, async (c) => {
   const user = c.get('user')
-  const { customer_id } = await c.req.json().catch(() => ({}))
+  const body = await c.req.json().catch(() => ({})) as any
+  const { customer_id } = body
+  // UNIFIED GATEWAY: the client passes the selected payment classification so KYC
+  // is enforced ONLY for financing. Cash purchases (direct or on-behalf) bypass
+  // KYC entirely — only a valid phone is required. Accept either an explicit
+  // payment_type ('cash'|'financing'), a has_financing flag, or an items[] array.
+  const items = Array.isArray(body.items) ? body.items : []
+  const requiresFinancing =
+    body.has_financing === true ||
+    String(body.payment_type || '').toLowerCase() === 'financing' ||
+    items.some((it: any) => String(it?.payment_type || '').toLowerCase() === 'financing')
   let custId = customer_id
   if (user.role === 'customer') {
     const myCust = await withAdminContext(c, async () => await c.env.DB.prepare(`SELECT id FROM customers WHERE user_id=?`).bind(user.id).first<any>())
@@ -2134,9 +2169,13 @@ app.post('/api/checkout/kyc-check', requireAuth, async (c) => {
   if (user.role === 'agent' && String(custRow.agent_id) !== String(user.id)) {
     return c.json({ error: 'You can only place orders for farmers assigned to you.' }, 403)
   }
-  const verified = custRow.kyc_status === 'verified'
+  const kycVerified = custRow.kyc_status === 'verified'
+  // Cash-only orders are always allowed to proceed (KYC bypassed); financing
+  // orders require a VERIFIED farmer.
+  const verified = requiresFinancing ? kycVerified : true
   return c.json({
     verified,
+    requires_financing: requiresFinancing,
     kyc_status: custRow.kyc_status || 'pending',
     customer_id: custRow.id,
     farmer: { id: custRow.id, name: custRow.full_name || 'Farmer', phone: custRow.mobile || '' }

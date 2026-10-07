@@ -182,30 +182,59 @@ async function tableExists(pool: Pool, tableName: string): Promise<boolean> {
   return Boolean(rows[0]?.present)
 }
 
-async function syncSequences(pool: Pool) {
-  // Sequence sync must see EVERY row to compute the true MAX(id). Because the app
-  // connects as a non-superuser with FORCE ROW LEVEL SECURITY, a plain
-  // `SELECT MAX(id)` runs with no session context and RLS returns ZERO rows —
-  // yielding MAX=NULL, resetting the sequence to 1, and causing duplicate-key
-  // errors on the next insert. We therefore run each sync inside a dedicated
-  // connection with admin session context so RLS is satisfied and all rows are
-  // visible. (Admin context here is server-internal, never client-controlled.)
-  for (const table of SERIAL_TABLES) {
-    const client = await pool.connect()
-    try {
-      await client.query(`SELECT set_config('app.current_role', 'admin', false)`)
-      await client.query(`SELECT set_config('app.user_can_finance', 'true', false)`)
-      await client.query(
-        `SELECT setval(pg_get_serial_sequence($1, 'id'), GREATEST(COALESCE((SELECT MAX(id) FROM ${table}), 1), 1), true)`,
-        [table]
-      )
-    } catch (_) {
-      /* table may not exist yet or have no id column — ignore */
-    } finally {
-      try { await client.query(`SELECT set_config('app.current_role', '', false)`) } catch (_) {}
-      client.release()
-    }
+// Realign one table's id sequence to MAX(id). CRITICAL: the app connects as a
+// non-superuser with FORCE ROW LEVEL SECURITY, so a plain `SELECT MAX(id)` runs
+// with no session context and RLS returns ZERO rows — yielding MAX=NULL, which
+// would reset the sequence to 1 and cause duplicate-key errors on the next
+// insert. We therefore run each sync inside a dedicated connection with ADMIN
+// session context so RLS is satisfied and every row is visible. (Admin context
+// here is server-internal, never client-controlled.)
+async function realignSequence(pool: Pool, table: string) {
+  const client = await pool.connect()
+  try {
+    await client.query(`SELECT set_config('app.current_role', 'admin', false)`)
+    await client.query(`SELECT set_config('app.user_can_finance', 'true', false)`)
+    await client.query(
+      `SELECT setval(pg_get_serial_sequence($1, 'id'), GREATEST(COALESCE((SELECT MAX(id) FROM "${table}"), 1), 1), true)`,
+      [table]
+    )
+  } catch (_) {
+    /* table may not exist yet or have no owned id sequence — ignore */
+  } finally {
+    try { await client.query(`SELECT set_config('app.current_role', '', false)`) } catch (_) {}
+    client.release()
   }
+}
+// System-wide sequence realignment. Realigns the explicit core tables first, then
+// DISCOVERS every other sequence owned by an integer "id" column and realigns it
+// too. This eliminates the entire class of "duplicate key value violates unique
+// constraint <table>_pkey" errors (seed/import rows carried explicit ids without
+// advancing the sequence) across EVERY numeric-id table — murabaha_contracts,
+// customers, invoices, transactions, products, orders, etc. Idempotent; runs on
+// every boot. Each realign runs under admin RLS context (see realignSequence).
+async function syncSequences(pool: Pool) {
+  const done = new Set<string>()
+  for (const table of SERIAL_TABLES) {
+    await realignSequence(pool, table)
+    done.add(table)
+  }
+  try {
+    const { rows } = await pool.query(
+      `SELECT DISTINCT tbl.relname AS table_name
+         FROM pg_class seq
+         JOIN pg_depend dep ON dep.objid = seq.oid AND dep.deptype = 'a'
+         JOIN pg_class tbl ON tbl.oid = dep.refobjid
+         JOIN pg_attribute col ON col.attrelid = tbl.oid AND col.attnum = dep.refobjsubid
+         JOIN pg_namespace ns ON ns.oid = seq.relnamespace
+        WHERE seq.relkind = 'S' AND ns.nspname = 'public' AND col.attname = 'id'`
+    )
+    for (const r of rows as any[]) {
+      const table = r.table_name
+      if (!table || done.has(table)) continue
+      await realignSequence(pool, table)
+      done.add(table)
+    }
+  } catch (_) { /* pg_depend sweep unavailable — core list above still applied */ }
 }
 
 export async function initializeDatabase(pool: Pool, projectRoot: string) {

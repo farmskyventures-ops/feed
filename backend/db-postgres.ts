@@ -97,6 +97,39 @@ class PostgresStatement implements D1StatementLike {
     return this.pool.query(sql, this.params)
   }
 
+  // Self-healing INSERT: if a numeric-id INSERT fails with a primary-key unique
+  // violation (23505 on <table>_pkey), the table's auto-increment sequence has
+  // fallen behind MAX(id) (classic desync after seed/import rows carried explicit
+  // ids). We realign that sequence to MAX(id)+1 and retry the INSERT ONCE. This
+  // eliminates the recurring "duplicate key value violates unique constraint
+  // <table>_pkey" class of errors across every numeric-id table at runtime,
+  // without the caller ever supplying an id.
+  private async queryWithPkeyHeal(sqlOverride?: string) {
+    const sql = convertPlaceholders(sqlOverride || this.rawSql)
+    try {
+      return await this.pool.query(sql, this.params)
+    } catch (err: any) {
+      const code = err?.code
+      const constraint = String(err?.constraint || '')
+      const detail = String(err?.message || '')
+      const isInsert = /^\s*insert\s+/i.test(sqlOverride || this.rawSql)
+      const isPkeyDup = code === '23505' && (/_pkey$/i.test(constraint) || /_pkey"/i.test(detail))
+      if (isInsert && isPkeyDup) {
+        const table = tableNameFromInsert(sqlOverride || this.rawSql)
+        if (table && TABLES_WITH_NUMERIC_ID.has(table)) {
+          try {
+            await this.pool.query(
+              `SELECT setval(pg_get_serial_sequence($1, 'id'), GREATEST(COALESCE((SELECT MAX(id) FROM "${table}"), 1), 1), true)`,
+              [table]
+            )
+            return await this.pool.query(sql, this.params)
+          } catch (_) { /* fall through to rethrow original */ }
+        }
+      }
+      throw err
+    }
+  }
+
   async first<T = any>(): Promise<T | null> {
     const result = await this.query()
     return (result.rows[0] as T) ?? null
@@ -114,7 +147,7 @@ class PostgresStatement implements D1StatementLike {
       const table = tableNameFromInsert(sql)
       if (table && TABLES_WITH_NUMERIC_ID.has(table)) sql += ' RETURNING id'
     }
-    const result = await this.query(sql)
+    const result = await this.queryWithPkeyHeal(sql)
     const rawId = result.rows?.[0]?.id
     if (rawId != null) {
       // Normally an INTEGER id → return as a number (D1-compatible). On a shared

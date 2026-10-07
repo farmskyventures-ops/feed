@@ -1822,16 +1822,21 @@ window.checkoutCart = async () => {
   const items = _cart.map(x => ({ product_id: x.id, quantity: x.qty, payment_type: x.payment_type, term_months: x.term_months }))
   const body = { items, delivery_location: '', consent: true }
   if (_buyFor) body.customer_id = _buyFor.id
-  // KYC gate: placing an order requires the buyer to have completed registration.
-  try {
-    const check = await api.post('/checkout/kyc-check', _buyFor ? { customer_id: _buyFor.id } : {})
-    if (check.data && !check.data.verified) {
-      toast('Complete registration to place your order.', false)
-      closeModal()
-      return completeRegistration(check.data.customer_id, true)
+  // KYC GATE (classification-aware): KYC is MANDATORY only when the order contains
+  // a FINANCING item. A pure cash order (direct or on-behalf) bypasses KYC — only
+  // a valid phone is required. We pass the cart's classification upstream.
+  const hasFinancing = _cart.some(x => x.payment_type === 'financing')
+  if (hasFinancing) {
+    try {
+      const check = await api.post('/checkout/kyc-check', { ...(_buyFor ? { customer_id: _buyFor.id } : {}), has_financing: true, items })
+      if (check.data && !check.data.verified) {
+        toast('Complete registration to place a financing order.', false)
+        closeModal()
+        return completeRegistration(check.data.customer_id, true)
+      }
+    } catch (err) {
+      return toast(err.response?.data?.error || 'Could not verify registration status', false)
     }
-  } catch (err) {
-    return toast(err.response?.data?.error || 'Could not verify registration status', false)
   }
   try {
     const { data } = await api.post('/murabaha/apply-bundle', body)
