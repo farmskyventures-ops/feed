@@ -135,7 +135,7 @@ function safeJson<T = any>(value: any, fallback: T): T {
 // Fallback permissions when role catalog has not loaded yet.
 function builtinDefaults(role: string): Record<string, boolean> {
   if (['super_admin', 'admin'].includes(role)) {
-    return { view: true, edit: true, delete: true, deactivate: true, approve: true, dispatch: true, add_farmer: true, add_customer: true, view_farmers: true, view_credit_purchases: true, manage_users: true, request_admin_action: true, can_manage_inventory: true, can_manage_finance_settings: true, view_wallet: true, manage_wallets: true, can_manage_contracts: true, can_delete_users: true }
+    return { view: true, edit: true, delete: true, deactivate: true, approve: true, dispatch: true, add_farmer: true, add_customer: true, view_farmers: true, view_credit_purchases: true, view_all_sales: true, view_cash_sales: true, view_financed_sales: true, manage_users: true, request_admin_action: true, can_manage_inventory: true, can_manage_finance_settings: true, view_wallet: true, manage_wallets: true, can_manage_contracts: true, can_delete_users: true }
   }
   if (role === 'operations_finance') {
     return { view: true, approve: true, dispatch: true, view_farmers: true, view_credit_purchases: true, request_admin_action: true, can_manage_finance_settings: true, can_manage_contracts: true }
@@ -227,6 +227,85 @@ function boolInt(value: any, fallback = true) {
 }
 function roundMoney(value: number) {
   return Math.round((Number(value) || 0) * 100) / 100
+}
+// ----------------------------------------------------------------------------
+// ORDER CONSOLIDATION — group flat contract rows (one per product line item)
+// into parent ORDERS. Items placed in the same bundled checkout share a
+// `bundle_ref`; legacy / single-item orders have no bundle_ref and become a
+// one-item order keyed on their own contract id. The aggregated order is what
+// the UI lists, invoices, settles and receipts as a whole.
+// ----------------------------------------------------------------------------
+function consolidateOrders(rows: any[]): any[] {
+  const groups = new Map<string, any[]>()
+  const order: string[] = []
+  for (const r of rows || []) {
+    const key = r.bundle_ref ? `B:${r.bundle_ref}` : `C:${r.id}`
+    if (!groups.has(key)) { groups.set(key, []); order.push(key) }
+    groups.get(key)!.push(r)
+  }
+  const result: any[] = []
+  for (const key of order) {
+    const items = groups.get(key)!
+    const first = items[0]
+    const total = roundMoney(items.reduce((s, it) => s + numberVal(it.murabaha_price, 0), 0))
+    const paid = roundMoney(items.reduce((s, it) => s + numberVal(it.amount_paid, 0), 0))
+    const outstanding = roundMoney(items.reduce((s, it) => s + numberVal(it.outstanding, 0), 0))
+    const ptypes = new Set(items.map(it => String(it.payment_type || 'financing')))
+    const payment_type = ptypes.size > 1 ? 'mixed' : (items[0].payment_type || 'financing')
+    const allStatuses = items.map(it => String(it.status || ''))
+    let settlement = 'active'
+    if (outstanding <= 0.5 && paid > 0) settlement = 'settled'
+    else if (paid > 0 && outstanding > 0.5) settlement = 'partially_settled'
+    else if (allStatuses.every(s => s === 'pending')) settlement = 'pending'
+    const statusRank = (s: string) => ({ pending: 0, pending_payment: 1, awaiting_cash_balance: 2, active: 3, completed: 4, delivered: 5, rejected: 6, cancelled: 7 } as any)[s] ?? 3
+    const repStatus = items.slice().sort((a, b) => statusRank(a.status) - statusRank(b.status))[0]?.status || first.status
+    const dispatchStates = new Set(items.map(it => String(it.dispatch_status || 'pending')))
+    const dispatch_status = dispatchStates.size === 1 ? [...dispatchStates][0]
+      : (items.every(it => it.dispatch_status === 'delivered') ? 'delivered' : 'partial')
+    result.push({
+      order_key: key,
+      bundle_ref: first.bundle_ref || null,
+      is_bundle: !!first.bundle_ref,
+      contract_id: first.bundle_ref ? null : first.id,
+      order_ref: first.bundle_ref || first.contract_ref,
+      customer_id: first.customer_id,
+      customer_name: first.customer_name,
+      customer_mobile: first.customer_mobile || null,
+      agent_id: first.agent_id || null,
+      created_by: first.created_by || null,
+      created_at: first.created_at,
+      payment_type,
+      financing_model: ptypes.size > 1 ? null : (first.financing_model || null),
+      status: repStatus,
+      dispatch_status,
+      settlement,
+      item_count: items.length,
+      total_quantity: items.reduce((s, it) => s + numberVal(it.quantity, 0), 0),
+      total_payable: total,
+      amount_paid: paid,
+      outstanding,
+      items: items.map(it => ({
+        id: it.id,
+        contract_ref: it.contract_ref,
+        product_id: it.product_id,
+        product_name: it.product_name,
+        product_unit: it.product_unit || null,
+        quantity: it.quantity,
+        payment_type: it.payment_type,
+        financing_model: it.financing_model,
+        status: it.status,
+        dispatch_status: it.dispatch_status,
+        murabaha_price: numberVal(it.murabaha_price, 0),
+        amount_paid: numberVal(it.amount_paid, 0),
+        outstanding: numberVal(it.outstanding, 0),
+        deposit_pct: it.deposit_pct,
+        deposit_amount: it.deposit_amount,
+        term_months: it.term_months,
+        installment_amount: it.installment_amount || it.monthly_payment || 0
+      }))
+    })
+  }
+  return result
 }
 
 // ----------------------------------------------------------------------------
@@ -2309,29 +2388,123 @@ app.post('/api/murabaha/apply-bundle', requireAuth, async (c) => {
   })
 })
 
+// ----------------------------------------------------------------------------
+// PURCHASES & CONTRACTS LIST
+//
+// Returns the flat contract rows (one per product line item) the caller is
+// authorized to see. The client consolidates these into parent ORDERS by
+// `bundle_ref` (single-item / legacy orders key on their own id).
+//
+// VISIBILITY MODEL (fixes the super-admin "grant visibility but nothing shows"
+// bug): the previous implementation built a correct WHERE clause for staff but
+// ran the query under the caller's OWN non-admin Row-Level-Security context, so
+// `ownership_contracts` RLS stripped every row the staff user did not personally
+// own — the granted permission had no visible effect. We now resolve the exact
+// authorized row-set in SQL and execute it under an admin RLS context so the
+// permission actually governs what is returned.
+//
+//   • customer  — only their own contracts.
+//   • agent     — STRICTLY their own network: contracts they placed OR whose
+//                 farmer is assigned to / was onboarded by them. An agent granted
+//                 the broader `view_all_sales` permission additionally sees every
+//                 sale per the cash/financed visibility flags.
+//   • staff     — governed by the Sales Visibility permissions
+//                 (view_cash_sales / view_financed_sales).
+// ----------------------------------------------------------------------------
+async function resolveContractScope(c: any, user: SessionUser): Promise<{ where: string[]; binds: any[] }> {
+  const where: string[] = []
+  const binds: any[] = []
+
+  if (user.role === 'customer') {
+    const myCust = await withAdminContext(c, async () => await c.env.DB.prepare(`SELECT id FROM customers WHERE user_id=?`).bind(user.id).first<any>())
+    where.push(`mc.customer_id = ?`); binds.push(myCust?.id || -1)
+    return { where, binds }
+  }
+
+  const canCash = hasVisibility(user, 'view_cash_sales')
+  const canFin = hasVisibility(user, 'view_financed_sales')
+  const payWhere: string[] = []
+  if (!canCash && !canFin) payWhere.push(`1 = 0`)
+  else if (canCash && !canFin) payWhere.push(`mc.payment_type = 'cash'`)
+  else if (!canCash && canFin) payWhere.push(`mc.payment_type = 'financing'`)
+
+  if (user.role === 'agent') {
+    const network = `(mc.agent_id = ? OR mc.created_by = ? OR mc.customer_id IN (
+                        SELECT id FROM customers WHERE agent_id = ? OR onboarded_by = ?))`
+    if (user.permissions?.view_all_sales === true) {
+      if (payWhere.length) where.push(...payWhere)
+    } else {
+      where.push(network)
+      binds.push(user.id, user.id, user.id, user.id)
+      if (payWhere.length) where.push(...payWhere)
+    }
+    return { where, binds }
+  }
+
+  if (payWhere.length) where.push(...payWhere)
+  return { where, binds }
+}
+
 app.get('/api/murabaha', requireAuth, async (c) => {
-  const user = c.get('user')
+  const user = c.get('user') as SessionUser
+  const { where, binds } = await resolveContractScope(c, user)
   let q = `SELECT mc.*, p.name as product_name, cu.full_name as customer_name
            FROM murabaha_contracts mc JOIN products p ON p.id = mc.product_id JOIN customers cu ON cu.id = mc.customer_id`
-  const binds: any[] = []
-  const where: string[] = []
-  if (user.role === 'agent') { where.push(`mc.agent_id = ?`); binds.push(user.id) }
-  else if (user.role === 'customer') {
-    const myCust = await c.env.DB.prepare(`SELECT id FROM customers WHERE user_id=?`).bind(user.id).first<any>()
-    where.push(`mc.customer_id = ?`); binds.push(myCust?.id || -1)
-  } else {
-    // Staff roles: enforce Sales Visibility permissions (cash vs financed).
-    const canCash = hasVisibility(user, 'view_cash_sales')
-    const canFin = hasVisibility(user, 'view_financed_sales')
-    if (!canCash && !canFin) { where.push(`1 = 0`) }
-    else if (canCash && !canFin) { where.push(`mc.payment_type = 'cash'`) }
-    else if (!canCash && canFin) { where.push(`mc.payment_type = 'financing'`) }
-  }
   if (where.length) q += ` WHERE ` + where.join(' AND ')
   q += ` ORDER BY mc.created_at DESC`
-  const { results } = await c.env.DB.prepare(q).bind(...binds).all()
+  const { results } = await withAdminContext(c, async () => await c.env.DB.prepare(q).bind(...binds).all())
   return c.json({ contracts: results })
 })
+
+// Consolidated orders grouped by bundle_ref (single-item orders key on id).
+app.get('/api/murabaha/orders', requireAuth, async (c) => {
+  const user = c.get('user') as SessionUser
+  const { where, binds } = await resolveContractScope(c, user)
+  let q = `SELECT mc.*, p.name as product_name, p.unit as product_unit, cu.full_name as customer_name, cu.mobile as customer_mobile
+           FROM murabaha_contracts mc JOIN products p ON p.id = mc.product_id JOIN customers cu ON cu.id = mc.customer_id`
+  if (where.length) q += ` WHERE ` + where.join(' AND ')
+  q += ` ORDER BY mc.created_at DESC`
+  const { results } = await withAdminContext(c, async () => await c.env.DB.prepare(q).bind(...binds).all())
+  const orders = consolidateOrders(results as any[])
+  return c.json({ orders })
+})
+
+// Full consolidated ORDER detail + combined repayments / transactions for a
+// whole-order invoice, settlement and receipt.
+app.get('/api/murabaha/order/:ref', requireAuth, async (c) => {
+  const user = c.get('user') as SessionUser
+  const ref = c.req.param('ref')
+  const { where, binds } = await resolveContractScope(c, user)
+  const scope = where.length ? ` AND (${where.join(' AND ')})` : ''
+  const q = `SELECT mc.*, p.name as product_name, p.unit as product_unit, cu.full_name as customer_name,
+                    cu.mobile as customer_mobile, cu.national_id, cu.county
+             FROM murabaha_contracts mc JOIN products p ON p.id = mc.product_id JOIN customers cu ON cu.id = mc.customer_id
+             WHERE (mc.bundle_ref = ? OR (mc.bundle_ref IS NULL AND CAST(mc.id AS TEXT) = ?))${scope}
+             ORDER BY mc.id`
+  const rows = await withAdminContext(c, async () => {
+    const r = await c.env.DB.prepare(q).bind(ref, String(ref), ...binds).all()
+    return r.results as any[]
+  })
+  if (!rows || rows.length === 0) return c.json({ error: 'Order not found' }, 404)
+  const [order] = consolidateOrders(rows)
+  const ids = rows.map(r => r.id)
+  const placeholders = ids.map(() => '?').join(',')
+  const { repayments, transactions } = await withAdminContext(c, async () => {
+    const rep = await c.env.DB.prepare(
+      `SELECT r.*, mc.contract_ref, p.name as product_name
+         FROM repayments r JOIN murabaha_contracts mc ON mc.id = r.contract_id JOIN products p ON p.id = mc.product_id
+        WHERE r.contract_id IN (${placeholders}) ORDER BY mc.id, r.installment_no`
+    ).bind(...ids).all()
+    const tx = await c.env.DB.prepare(
+      `SELECT t.*, mc.contract_ref, p.name as product_name
+         FROM transactions t JOIN murabaha_contracts mc ON mc.id = t.contract_id JOIN products p ON p.id = mc.product_id
+        WHERE t.contract_id IN (${placeholders}) ORDER BY t.id`
+    ).bind(...ids).all()
+    return { repayments: rep.results, transactions: tx.results }
+  })
+  return c.json({ order, repayments, transactions })
+})
+
 app.get('/api/murabaha/:id', requireAuth, async (c) => {
   const id = c.req.param('id')
   const contract = await c.env.DB.prepare(

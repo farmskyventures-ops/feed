@@ -1293,7 +1293,7 @@ function navItems() {
     ...(canDo('view_crm') ? [crm] : []),
     ...(canDo('can_manage_inventory') ? [{ k: 'inventory', i: 'fa-boxes-stacked', t: 'My Inventory' }] : []),
     ...(canDo('manage_transactions') ? [transactions] : []),
-    { k: 'contracts', i: 'fa-file-signature', t: 'Credit Purchases' },
+    { k: 'contracts', i: 'fa-file-signature', t: 'Purchases and Contracts' },
     { k: 'shop', i: 'fa-store', t: 'Shop' },
     myWallet])
   if (r === 'customer') return withAccount([...common,
@@ -2054,35 +2054,32 @@ window.submitBuy = async (productId, ev) => {
 // ---------------------------------------------------------------------------
 // CONTRACTS
 // ---------------------------------------------------------------------------
+// Purchases & Contracts — CONSOLIDATED BY ORDER. Orders with multiple line
+// items (same bundled checkout, shared bundle_ref) are grouped under a single
+// parent row; single-item / legacy orders show as a one-item order. Each parent
+// row expands to reveal its individual product line items, and "View" opens the
+// whole-order invoice/settlement (payments & receipts tracked per ORDER).
+let _orders = []
 async function viewContracts() {
-  const { data } = await api.get('/murabaha')
-  const _contracts = data.contracts || []
-  const statuses = [...new Set(_contracts.map(c => c.status).filter(Boolean))].map(s => ({ v: s, t: s }))
-  const ptypes = [...new Set(_contracts.map(c => c.payment_type).filter(Boolean))].map(s => ({ v: s, t: s }))
+  const { data } = await api.get('/murabaha/orders')
+  _orders = data.orders || []
+  const statuses = [...new Set(_orders.map(o => o.status).filter(Boolean))].map(s => ({ v: s, t: s }))
+  const ptypes = [...new Set(_orders.map(o => o.payment_type).filter(Boolean))].map(s => ({ v: s, t: s }))
   window._rerender_contracts = () => {
-    const rows = _contracts.filter(c => rowMatchesFilters('contracts', c, {
-      text: ['contract_ref', 'customer_name', 'product_name'],
+    const rows = _orders.filter(o => rowMatchesFilters('contracts', o, {
+      text: ['order_ref', 'customer_name', 'product_summary'],
       selects: { status: 'status', ptype: 'payment_type' },
       date: 'created_at'
     }))
-    $('contractsBody').innerHTML = rows.map(c => `<tr class="border-t border-slate-100">
-        <td class="px-4 py-3 font-mono text-xs">${esc(c.contract_ref)}</td>
-        <td class="px-4 py-3">${esc(c.customer_name)}</td>
-        <td class="px-4 py-3">${esc(c.product_name)} ×${c.quantity}</td>
-        <td class="px-4 py-3">${payLabel(c.payment_type, c.financing_model)}</td>
-        <td class="px-4 py-3 text-right">${fmt(c.murabaha_price)}</td>
-        <td class="px-4 py-3 text-right">${fmt(c.outstanding)}</td>
-        <td class="px-4 py-3">${badge(c.status)}</td>
-        <td class="px-4 py-3 whitespace-nowrap text-right">
-          <button onclick="contractDetail(${c.id})" class="text-teal-600 hover:underline text-xs">View</button>
-          ${canManageContracts() ? `<button onclick="editContractModal(${c.id})" class="text-indigo-600 hover:underline text-xs ml-2">Edit</button>${(c.status !== 'cancelled' && c.status !== 'completed') ? `<button onclick="cancelContract(${c.id},'${esc(c.contract_ref)}')" class="text-red-600 hover:underline text-xs ml-2">Cancel</button>` : ''}` : ''}
-        </td>
-      </tr>`).join('') || '<tr><td colspan="8" class="text-center py-8 text-slate-400">No matching contracts</td></tr>'
-    const cnt = $('contractsCount'); if (cnt) cnt.textContent = rows.length + ' contract(s)'
+    $('contractsBody').innerHTML = rows.map(o => orderRowHtml(o)).join('')
+      || '<tr><td colspan="8" class="text-center py-8 text-slate-400">No matching contracts</td></tr>'
+    const cnt = $('contractsCount'); if (cnt) cnt.textContent = rows.length + ' order(s)'
   }
+  // Precompute a searchable product summary on each order.
+  _orders.forEach(o => { o.product_summary = (o.items || []).map(i => i.product_name).join(' ') })
   $('content').innerHTML = `
   <div class="flex items-center justify-between mb-4">
-    <div class="text-sm text-slate-500"><span id="contractsCount">${_contracts.length} contract(s)</span></div>
+    <div class="text-sm text-slate-500"><span id="contractsCount">${_orders.length} order(s)</span></div>
   </div>
   ${filterToolbar('contracts', { search: true, dates: true, selects: [
     { key: 'status', label: 'Status', options: statuses },
@@ -2091,12 +2088,235 @@ async function viewContracts() {
   <div class="card table-card">
     <table class="w-full text-sm">
       <thead class="bg-slate-50 text-slate-500 text-xs uppercase"><tr>
-        <th class="text-left px-4 py-3">Ref</th><th class="text-left px-4 py-3">Customer</th><th class="text-left px-4 py-3">Product</th>
-        <th class="text-left px-4 py-3">Type</th><th class="text-right px-4 py-3">Price</th><th class="text-right px-4 py-3">Outstanding</th>
+        <th class="text-left px-4 py-3">Order Ref</th><th class="text-left px-4 py-3">Customer</th><th class="text-left px-4 py-3">Items</th>
+        <th class="text-left px-4 py-3">Type</th><th class="text-right px-4 py-3">Order Total</th><th class="text-right px-4 py-3">Outstanding</th>
         <th class="text-left px-4 py-3">Status</th><th></th></tr></thead>
       <tbody id="contractsBody"></tbody>
     </table></div>`
   window._rerender_contracts()
+}
+// A parent order row + a collapsed detail row listing each line item.
+function orderRowHtml(o) {
+  const key = String(o.order_key).replace(/[^a-zA-Z0-9]/g, '_')
+  const itemsLabel = o.item_count > 1
+    ? `${o.item_count} items · ${o.total_quantity} unit(s)`
+    : `${esc((o.items[0] || {}).product_name || '')} ×${(o.items[0] || {}).quantity || 1}`
+  const itemRows = (o.items || []).map(it => `<tr class="bg-slate-50/60 text-xs">
+      <td class="pl-10 pr-4 py-2 font-mono text-slate-500">${esc(it.contract_ref)}</td>
+      <td class="px-4 py-2 text-slate-400"></td>
+      <td class="px-4 py-2">${esc(it.product_name)} ×${it.quantity}</td>
+      <td class="px-4 py-2">${payLabel(it.payment_type, it.financing_model)}</td>
+      <td class="px-4 py-2 text-right">${fmt(it.murabaha_price)}</td>
+      <td class="px-4 py-2 text-right">${fmt(it.outstanding)}</td>
+      <td class="px-4 py-2">${badge(it.status)}</td>
+      <td class="px-4 py-2 text-right"><button onclick="contractDetail(${it.id})" class="text-teal-600 hover:underline text-xs">Item</button></td>
+    </tr>`).join('')
+  return `<tr class="border-t border-slate-100">
+      <td class="px-4 py-3 font-mono text-xs">
+        ${o.item_count > 1 ? `<button onclick="toggleOrderItems('${key}')" class="mr-1 text-slate-400 hover:text-slate-700"><i id="chev_${key}" class="fas fa-chevron-right"></i></button>` : ''}
+        ${esc(o.order_ref)}${o.is_bundle ? ' <span class="text-[10px] text-teal-600 font-sans">(bundle)</span>' : ''}
+      </td>
+      <td class="px-4 py-3">${esc(o.customer_name)}</td>
+      <td class="px-4 py-3">${esc(itemsLabel)}</td>
+      <td class="px-4 py-3">${o.payment_type === 'mixed' ? '<span class="text-xs font-medium text-violet-600">Mixed</span>' : payLabel(o.payment_type, o.financing_model)}</td>
+      <td class="px-4 py-3 text-right">${fmt(o.total_payable)}</td>
+      <td class="px-4 py-3 text-right">${fmt(o.outstanding)}</td>
+      <td class="px-4 py-3">${badge(o.status)}</td>
+      <td class="px-4 py-3 whitespace-nowrap text-right">
+        <button onclick="orderDetail('${esc(o.order_ref)}')" class="text-teal-600 hover:underline text-xs">View</button>
+      </td>
+    </tr>
+    ${o.item_count > 1 ? `<tr id="items_${key}" class="hidden"><td colspan="8" class="p-0"><table class="w-full">${itemRows}</table></td></tr>` : ''}`
+}
+window.toggleOrderItems = (key) => {
+  const row = document.getElementById('items_' + key)
+  const chev = document.getElementById('chev_' + key)
+  if (!row) return
+  row.classList.toggle('hidden')
+  if (chev) chev.className = 'fas ' + (row.classList.contains('hidden') ? 'fa-chevron-right' : 'fa-chevron-down')
+}
+// ---------------------------------------------------------------------------
+// ORDER DETAIL — the whole-order invoice + settlement view. Shows every line
+// item grouped under one order, the combined repayment schedule & payment
+// receipts, and settles / invoices / receipts the ORDER as a whole.
+// ---------------------------------------------------------------------------
+window._currentOrder = null
+window.orderDetail = async (ref) => {
+  let data
+  try { data = (await api.get('/murabaha/order/' + encodeURIComponent(ref))).data }
+  catch (err) { return toast(err.response?.data?.error || 'Could not load order', false) }
+  const o = data.order
+  window._currentOrder = { order: o, repayments: data.repayments || [], transactions: data.transactions || [] }
+  // A single-item order just opens the existing contract detail for full actions.
+  if (!o.is_bundle && o.contract_id) return contractDetail(o.contract_id)
+
+  const outstanding = Number(o.outstanding || 0)
+  const paid = Number(o.amount_paid || 0)
+  const total = Number(o.total_payable || 0)
+  const hasBalance = outstanding > 0.5
+  const progress = total > 0 ? Math.min(100, Math.round((paid / total) * 100)) : 0
+  // Cash items in the order that still owe a balance can be settled as a whole.
+  const cashDueItems = (o.items || []).filter(it => it.payment_type === 'cash' && Number(it.outstanding) > 0.5)
+  const cashDue = cashDueItems.reduce((s, it) => s + Number(it.outstanding || 0), 0)
+  const canCollect = state.user.role === 'customer' || canDo('collect_payment') ||
+    ['admin', 'super_admin', 'operations_finance', 'sales_agent'].includes(state.user.role)
+  const isOwningAgent = state.user.role === 'agent' && String(o.agent_id) === String(state.user.id)
+  const canPrompt = canCollect || isOwningAgent
+  const canReconcile = hasBalance && hasExplicitPerm('sales_manual_reconciliation')
+  const canDispatch = ['admin', 'super_admin', 'operations_finance'].includes(state.user.role) &&
+    (o.items || []).some(it => !['dispatched', 'delivered'].includes(it.dispatch_status))
+
+  const itemRows = (o.items || []).map(it => `<tr class="border-t border-slate-100 text-sm">
+      <td class="px-3 py-2">${esc(it.product_name)}</td>
+      <td class="px-3 py-2 text-center">${it.quantity}</td>
+      <td class="px-3 py-2">${payLabel(it.payment_type, it.financing_model)}</td>
+      <td class="px-3 py-2 text-right">${fmt(it.murabaha_price)}</td>
+      <td class="px-3 py-2 text-right">${fmt(it.outstanding)}</td>
+      <td class="px-3 py-2 text-center">${badge(it.status)}</td>
+      <td class="px-3 py-2 text-right"><button onclick="contractDetail(${it.id})" class="text-teal-600 hover:underline text-xs">Open</button></td>
+    </tr>`).join('')
+
+  showModal(`
+    <div class="flex justify-between items-start mb-3">
+      <div><h3 class="text-lg font-bold">${esc(o.order_ref)} <span class="text-[11px] text-teal-600 font-normal">(order · ${o.item_count} items)</span></h3>
+      <p class="text-xs text-slate-500">${esc(o.customer_name)}${o.customer_mobile ? ' · ' + esc(o.customer_mobile) : ''}</p></div>
+      ${badge(o.status)}
+    </div>
+    <div class="grid grid-cols-2 sm:grid-cols-4 gap-3 text-sm mb-4">
+      <div class="bg-slate-50 p-3 rounded-lg"><p class="text-xs text-slate-500">Payment</p><b>${o.payment_type === 'mixed' ? 'Mixed' : payLabel(o.payment_type, o.financing_model)}</b></div>
+      <div class="bg-slate-50 p-3 rounded-lg"><p class="text-xs text-slate-500">Order total</p><b>${fmt(total)}</b></div>
+      <div class="bg-emerald-50 p-3 rounded-lg"><p class="text-xs text-slate-500">Paid</p><b class="text-emerald-700">${fmt(paid)}</b></div>
+      <div class="bg-teal-50 p-3 rounded-lg"><p class="text-xs text-slate-500">Outstanding</p><b>${fmt(outstanding)}</b></div>
+    </div>
+    <div class="mb-4"><div class="h-2 w-full bg-slate-100 rounded-full overflow-hidden"><div class="h-full bg-emerald-500" style="width:${progress}%"></div></div>
+      <div class="text-[10px] text-slate-400 mt-1">${progress}% of the order settled</div></div>
+    <h4 class="font-semibold text-sm mb-2">Order items</h4>
+    <div class="border border-slate-200 rounded-lg overflow-hidden mb-4"><table class="w-full">
+      <thead class="bg-slate-50 text-slate-500 text-xs uppercase"><tr>
+        <th class="text-left px-3 py-2">Product</th><th class="text-center px-3 py-2">Qty</th><th class="text-left px-3 py-2">Type</th>
+        <th class="text-right px-3 py-2">Price</th><th class="text-right px-3 py-2">Outstanding</th><th class="text-center px-3 py-2">Status</th><th></th></tr></thead>
+      <tbody>${itemRows}</tbody></table></div>
+    ${window._currentOrder.repayments.length ? `<h4 class="font-semibold text-sm mb-2">Combined Repayment Schedule</h4>
+    <table class="w-full text-xs mb-4"><thead class="text-slate-400"><tr><th class="text-left">Item</th><th class="text-left">#</th><th class="text-left">Due</th><th class="text-right">Amount</th><th class="text-right">Paid</th><th>Status</th></tr></thead>
+    <tbody>${window._currentOrder.repayments.map(r => `<tr class="border-t border-slate-100"><td class="text-slate-500">${esc(r.product_name || '')}</td><td>${r.installment_no}</td><td>${r.due_date}</td><td class="text-right">${fmt(r.amount_due)}</td><td class="text-right">${fmt(r.amount_paid)}</td><td class="text-center">${badge(r.status)}</td></tr>`).join('')}</tbody></table>` : ''}
+    <div class="flex flex-wrap gap-2">
+      ${cashDue > 0.5 && canPrompt ? `<button onclick="settleOrder('${esc(o.order_ref)}')" class="btn flex-1 bg-amber-500 text-white py-2.5 rounded-lg text-sm"><i class="fas fa-wallet mr-1"></i>Settle Order (${fmt(cashDue)})</button>` : ''}
+      ${canReconcile ? `<button onclick="reconcileOrder('${esc(o.order_ref)}', ${cashDue || outstanding})" class="btn flex-1 bg-purple-600 text-white py-2.5 rounded-lg text-sm"><i class="fas fa-building-columns mr-1"></i>Manual Reconciliation</button>` : ''}
+      ${canDispatch ? `<button onclick="dispatchOrder('${esc(o.order_ref)}')" class="btn flex-1 bg-emerald-600 text-white py-2.5 rounded-lg text-sm"><i class="fas fa-truck mr-1"></i>Dispatch all</button>` : ''}
+      <button onclick="orderInvoice('${esc(o.order_ref)}')" class="btn flex-1 bg-slate-800 text-white py-2.5 rounded-lg text-sm"><i class="fas fa-file-invoice mr-1"></i>Order Invoice</button>
+      <button onclick="orderReceipt('${esc(o.order_ref)}')" class="btn flex-1 bg-slate-700 text-white py-2.5 rounded-lg text-sm"><i class="fas fa-receipt mr-1"></i>Order Receipt</button>
+      <button onclick="closeModal()" class="btn px-4 bg-slate-100 rounded-lg text-sm">Close</button>
+    </div>`)
+}
+// Settle every cash item with an outstanding balance in the order, one prompt
+// chained after another using the existing bundled-payment queue mechanism so
+// a successful payment auto-advances to the next item, then lands on the list.
+window.settleOrder = (ref) => {
+  const oc = window._currentOrder; if (!oc) return
+  const items = (oc.order.items || []).filter(it => it.payment_type === 'cash' && Number(it.outstanding) > 0.5)
+  if (!items.length) return toast('Nothing outstanding to settle on this order.', false)
+  const farmer = { phone: oc.order.customer_mobile, name: oc.order.customer_name }
+  _bundlePayOpts = { phone: farmer.phone, name: farmer.name, balance: true }
+  _bundlePayQueue = items.map(it => ({ id: it.id, amount: Number(it.outstanding), outstanding: Number(it.outstanding) }))
+  // Kick off the first prompt; subsequent ones advance via _afterPaySuccess.
+  const first = _bundlePayQueue.shift()
+  payModal(first.id, first.amount, first.outstanding, 'cash', { ..._bundlePayOpts, bundleNext: _bundlePayQueue.length > 0 })
+}
+window.reconcileOrder = (ref, amount) => {
+  const oc = window._currentOrder; if (!oc) return
+  // Reconcile the FIRST cash item carrying a balance (bank settlements are per
+  // reference); the receipt then reflects the whole order via Order Receipt.
+  const it = (oc.order.items || []).find(x => Number(x.outstanding) > 0.5)
+  if (!it) return toast('Nothing to reconcile.', false)
+  reconcileModal(it.id, Number(it.outstanding))
+}
+window.dispatchOrder = async (ref) => {
+  const oc = window._currentOrder; if (!oc) return
+  const pending = (oc.order.items || []).filter(it => !['dispatched', 'delivered'].includes(it.dispatch_status))
+  try {
+    for (const it of pending) { await api.post(`/murabaha/${it.id}/dispatch`, {}) }
+    toast(`Dispatched ${pending.length} item(s) for order ${ref}`)
+    closeModal(); viewContracts()
+  } catch (err) { toast(err.response?.data?.error || 'Dispatch failed', false) }
+}
+// Whole-order INVOICE — one branded invoice listing every line item.
+window.orderInvoice = (ref) => {
+  const oc = window._currentOrder; if (!oc) return
+  openPrintWindow('Invoice ' + ref, orderInvoiceHtml(oc.order))
+}
+window.orderReceipt = (ref) => {
+  const oc = window._currentOrder; if (!oc) return
+  openPrintWindow('Receipt ' + ref, orderReceiptHtml(oc.order, oc.transactions))
+}
+function orderInvoiceHtml(o) {
+  const rows = (o.items || []).map(it => `<tr>
+      <td style="padding:8px;border:1px solid #cbd5e1;">${esc(it.product_name)}${it.contract_ref ? ` <span style="color:#94a3b8;font-family:monospace;">(${esc(it.contract_ref)})</span>` : ''}</td>
+      <td style="text-align:center;padding:8px;border:1px solid #cbd5e1;">${esc(String(it.quantity || 1))} ${esc(it.product_unit || '')}</td>
+      <td style="text-align:center;padding:8px;border:1px solid #cbd5e1;text-transform:capitalize;">${esc(it.payment_type || '')}</td>
+      <td style="text-align:right;padding:8px;border:1px solid #cbd5e1;">${docMoney(it.murabaha_price)}</td>
+    </tr>`).join('')
+  const statusColor = o.outstanding <= 0.5 ? '#059669' : o.amount_paid > 0 ? '#d97706' : '#dc2626'
+  const statusLabel = o.outstanding <= 0.5 ? 'PAID' : o.amount_paid > 0 ? 'PARTIAL' : 'UNPAID'
+  return `<div style="font-family:Arial,Helvetica,sans-serif;color:#0f172a;">
+    ${brandDocHeader('Tax Invoice — Order')}
+    <div style="display:flex;justify-content:space-between;flex-wrap:wrap;gap:8px;margin-bottom:12px;">
+      <div><div style="font-size:9pt;color:#64748b;text-transform:uppercase;">Billed to</div>
+        <div style="font-weight:700;">${esc(o.customer_name || '—')}</div>
+        <div style="font-size:9pt;color:#64748b;">${o.customer_mobile ? esc(o.customer_mobile) : ''}</div></div>
+      <div style="text-align:right;"><div style="font-size:9pt;color:#64748b;text-transform:uppercase;">Order Ref</div>
+        <div style="font-weight:700;font-family:monospace;">${esc(o.order_ref)}</div>
+        <div style="font-size:9pt;color:#64748b;">Issued ${docDate(o.created_at)}</div>
+        <div style="display:inline-block;margin-top:4px;padding:2px 10px;border-radius:999px;color:#fff;font-size:9pt;font-weight:700;background:${statusColor};">${statusLabel}</div></div>
+    </div>
+    <table style="width:100%;border-collapse:collapse;margin:12px 0;font-size:10pt;">
+      <thead><tr style="background:#f1f5f9;">
+        <th style="text-align:left;padding:8px;border:1px solid #cbd5e1;">Item</th>
+        <th style="text-align:center;padding:8px;border:1px solid #cbd5e1;">Qty</th>
+        <th style="text-align:center;padding:8px;border:1px solid #cbd5e1;">Type</th>
+        <th style="text-align:right;padding:8px;border:1px solid #cbd5e1;">Amount</th>
+      </tr></thead><tbody>${rows}</tbody></table>
+    <div style="margin-left:auto;width:260px;font-size:10pt;">
+      <div style="display:flex;justify-content:space-between;padding:4px 0;"><span style="color:#64748b;">Order total</span><b>${docMoney(o.total_payable)}</b></div>
+      <div style="display:flex;justify-content:space-between;padding:4px 0;"><span style="color:#64748b;">Paid</span><b style="color:#059669;">${docMoney(o.amount_paid)}</b></div>
+      <div style="display:flex;justify-content:space-between;padding:8px 0;border-top:2px solid #0f766e;margin-top:4px;"><span style="font-weight:700;">Balance Due</span><b style="color:${o.outstanding > 0.5 ? '#d97706' : '#059669'};">${docMoney(o.outstanding)}</b></div>
+    </div>
+    <div style="text-align:center;font-size:8.5pt;color:#94a3b8;margin-top:12px;">Consolidated invoice for all ${o.item_count} item(s) in this order · Farmsky Ventures.</div>
+  </div>`
+}
+function orderReceiptHtml(o, transactions) {
+  const pays = (transactions || []).filter(t => Number(t.amount) > 0)
+  const header = brandDocHeader('Payment Receipt — Order')
+  if (!pays.length) return `<div style="font-family:Arial,Helvetica,sans-serif;">${header}<div style="text-align:center;color:#64748b;padding:24px;">No payments have been recorded for this order yet.</div></div>`
+  return `<div style="font-family:Arial,Helvetica,sans-serif;color:#0f172a;">
+    ${header}
+    <div style="display:flex;justify-content:space-between;flex-wrap:wrap;gap:8px;margin-bottom:12px;">
+      <div><div style="font-size:9pt;color:#64748b;text-transform:uppercase;">Received from</div>
+        <div style="font-weight:700;">${esc(o.customer_name || '—')}</div>
+        <div style="font-size:9pt;color:#64748b;">Order ${esc(o.order_ref)} · ${o.item_count} item(s)</div></div>
+      <div style="text-align:right;"><div style="display:inline-block;padding:2px 10px;border-radius:999px;color:#fff;font-size:9pt;font-weight:700;background:${o.outstanding <= 0.5 ? '#059669' : '#d97706'};">${o.outstanding <= 0.5 ? 'PAID IN FULL' : 'PARTIALLY PAID'}</div></div>
+    </div>
+    <table style="width:100%;border-collapse:collapse;margin:12px 0;font-size:9.5pt;">
+      <thead><tr style="background:#f1f5f9;">
+        <th style="text-align:left;padding:7px;border:1px solid #cbd5e1;">Date</th>
+        <th style="text-align:left;padding:7px;border:1px solid #cbd5e1;">Item</th>
+        <th style="text-align:left;padding:7px;border:1px solid #cbd5e1;">Reference</th>
+        <th style="text-align:left;padding:7px;border:1px solid #cbd5e1;">Method</th>
+        <th style="text-align:right;padding:7px;border:1px solid #cbd5e1;">Amount</th>
+      </tr></thead>
+      <tbody>${pays.map(p => `<tr>
+        <td style="padding:7px;border:1px solid #cbd5e1;">${docDate(p.created_at || p.paid_at)}</td>
+        <td style="padding:7px;border:1px solid #cbd5e1;">${esc(p.product_name || '')}</td>
+        <td style="padding:7px;border:1px solid #cbd5e1;font-family:monospace;">${esc(p.mpesa_receipt || p.provider_ref || p.transaction_code || p.contract_ref || '')}</td>
+        <td style="padding:7px;border:1px solid #cbd5e1;text-transform:capitalize;">${esc(String(p.method || p.channel || '').replace(/_/g, ' '))}</td>
+        <td style="text-align:right;padding:7px;border:1px solid #cbd5e1;color:#059669;font-weight:600;">${docMoney(p.amount)}</td>
+      </tr>`).join('')}</tbody></table>
+    <div style="margin-left:auto;width:280px;font-size:10pt;">
+      <div style="display:flex;justify-content:space-between;padding:4px 0;"><span style="color:#64748b;">Order total</span><b>${docMoney(o.total_payable)}</b></div>
+      <div style="display:flex;justify-content:space-between;padding:4px 0;"><span style="color:#64748b;">Total paid</span><b style="color:#059669;">${docMoney(o.amount_paid)}</b></div>
+      <div style="display:flex;justify-content:space-between;padding:8px 0;border-top:2px solid #0f766e;margin-top:4px;"><span style="font-weight:700;">Balance remaining</span><b style="color:${o.outstanding > 0.5 ? '#d97706' : '#059669'};">${docMoney(o.outstanding)}</b></div>
+    </div>
+    <div style="text-align:center;font-size:8.5pt;color:#94a3b8;margin-top:12px;">Consolidated receipt for order ${esc(o.order_ref)} · Farmsky Ventures. Thank you for your business.</div>
+  </div>`
 }
 // FEATURE 1 — contract-management privilege check (admin OR can_manage_contracts).
 function canManageContracts() {
