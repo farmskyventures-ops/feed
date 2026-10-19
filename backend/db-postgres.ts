@@ -117,13 +117,29 @@ class PostgresStatement implements D1StatementLike {
       if (isInsert && isPkeyDup) {
         const table = tableNameFromInsert(sqlOverride || this.rawSql)
         if (table && TABLES_WITH_NUMERIC_ID.has(table)) {
+          // Realign the sequence AND retry on the SAME dedicated connection under
+          // ADMIN RLS context. CRITICAL under FORCE ROW LEVEL SECURITY: (a) a plain
+          // `SELECT MAX(id)` with no context returns ZERO rows → MAX=NULL → the
+          // sequence would reset to 1 and the retry collide again; (b) the retried
+          // INSERT must pass the ownership WITH CHECK policy, which only admin
+          // bypasses. RLS context is per-connection, so realign + retry MUST share
+          // one connection. (Server-internal only; role is cleared before release.)
+          const client = await this.pool.connect()
           try {
-            await this.pool.query(
+            await client.query(`SELECT set_config('app.current_role', 'admin', false)`)
+            await client.query(`SELECT set_config('app.user_can_finance', 'true', false)`)
+            await client.query(
               `SELECT setval(pg_get_serial_sequence($1, 'id'), GREATEST(COALESCE((SELECT MAX(id) FROM "${table}"), 1), 1), true)`,
               [table]
             )
-            return await this.pool.query(sql, this.params)
-          } catch (_) { /* fall through to rethrow original */ }
+            return await client.query(sql, this.params)
+          } catch (_) {
+            /* fall through to rethrow the original error */
+          } finally {
+            try { await client.query(`SELECT set_config('app.current_role', '', false)`) } catch (_e) {}
+            try { await client.query(`SELECT set_config('app.user_can_finance', 'false', false)`) } catch (_e) {}
+            client.release()
+          }
         }
       }
       throw err
