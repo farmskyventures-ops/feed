@@ -36,7 +36,11 @@ const TABLES_WITH_NUMERIC_ID = new Set([
   // Feature 4 — profile amendment requests (need last_row_id after INSERT).
   'profile_amendments',
   // Cross-platform merchant API (Phase 3) — need last_row_id after INSERT.
-  'merchant_keys', 'merchant_checkouts'
+  'merchant_keys', 'merchant_checkouts',
+  // Offtake / traceability / logistics (migration 0044) + governance tables.
+  'offtake_contracts', 'offtake_matches', 'aggregation_batches', 'traceability_events',
+  'logistics_vehicles', 'logistics_shipments', 'telemetry_pings',
+  'feature_flags', 'feature_flag_users', 'payment_channels', 'payment_channel_users'
 ])
 
 function convertPlaceholders(sql: string): string {

@@ -417,10 +417,26 @@ window.submitChangeRequest = async (entityType, entityId) => {
 // ---------------------------------------------------------------------------
 // AUTH
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// FEATURE MANAGEMENT & QA — client-side gate. featureOn(key) is true only when a
+// governed feature is available to the signed-in user per the sandbox/testing/
+// live lifecycle (resolved by /api/features/enabled). Every new capability is
+// wrapped in featureOn() so it stays hidden from end users until a Super-Admin
+// promotes it (sandbox → testing whitelist → live global).
+// ---------------------------------------------------------------------------
+let _featuresEnabled = []
+async function loadFeatures() {
+  try { _featuresEnabled = (await api.get('/features/enabled')).data.enabled || [] }
+  catch (_) { _featuresEnabled = [] }
+  return _featuresEnabled
+}
+function featureOn(key) { return _featuresEnabled.includes(key) }
+
 async function init() {
   try {
     const { data } = await api.get('/me'); state.user = data.user
     try { const cfg = await api.get('/cross/config'); state.crossApp = cfg.data } catch (_) { state.crossApp = null }
+    await loadFeatures()
     renderApp()
     startSessionSync()
   }
@@ -453,8 +469,13 @@ async function refreshSession({ force = false } = {}) {
   if (!data?.user) return false
   const before = permsFingerprint(state.user)
   const after = permsFingerprint(data.user)
+  // Refresh governed-feature availability so a Super-Admin promotion surfaces
+  // within one poll (same live-update behaviour as permissions).
+  const featBefore = _featuresEnabled.join(',')
+  await loadFeatures()
+  const featChanged = _featuresEnabled.join(',') !== featBefore
   state.user = data.user
-  if (force || before !== after) {
+  if (force || before !== after || featChanged) {
     const allowed = navItems().some(it => it.k === state.route) || state.route === 'profile'
     if (!allowed) state.route = 'dashboard'
     const modal = $('modal')
@@ -673,7 +694,7 @@ function authSignIn() {
         return
       }
       if (data.must_change_password) { done(); renderForceChangePassword(data.user); return }
-      state.user = data.user; toast('Welcome, ' + data.user.full_name); renderApp(); startSessionSync()
+      state.user = data.user; toast('Welcome, ' + data.user.full_name); await loadFeatures(); renderApp(); startSessionSync()
     } catch (err) {
       done()
       const resp = err.response?.data || {}
@@ -717,7 +738,7 @@ window.doLoginVerifyOtp = async () => {
     const { data } = await api.post('/login/verify-otp', { phone: _loginOtpCtx.phone, password: _loginOtpCtx.password, code })
     // OTP passed → STEP 3: mandatory password change (change-session token is set).
     if (data.must_change_password) { renderForceChangePassword(data.user); return }
-    state.user = data.user; toast('Welcome, ' + data.user.full_name); renderApp(); startSessionSync()
+    state.user = data.user; toast('Welcome, ' + data.user.full_name); await loadFeatures(); renderApp(); startSessionSync()
   } catch (err) {
     done()
     const resp = err.response?.data || {}
@@ -1256,6 +1277,13 @@ function navItems() {
   const crm = { k: 'crm', i: 'fa-headset', t: 'Sales & Support CRM' }
   const fieldVisits = { k: 'field_visits', i: 'fa-clipboard-user', t: 'Field Visits' }
   const transactions = { k: 'transactions', i: 'fa-building-columns', t: 'Transactions' }
+  // Governed (Feature Management & QA) nav entries — hidden until the feature is
+  // available to this user (sandbox→Super-Admin only; testing→whitelist; live).
+  const offtakeNav = featureOn('offtake_contracting') ? [{ k: 'offtake', i: 'fa-handshake', t: 'Offtake Contracts' }] : []
+  const matchingNav = featureOn('admin_matching_engine') ? [{ k: 'matching', i: 'fa-people-arrows', t: 'Match Buyers & Outgrowers' }] : []
+  const aggregationNav = featureOn('agent_aggregation') ? [{ k: 'aggregation', i: 'fa-weight-scale', t: 'Produce Aggregation' }] : []
+  const logisticsNav = featureOn('logistics_telemetry') ? [{ k: 'logistics', i: 'fa-truck-fast', t: 'Logistics & Tracking' }] : []
+  const traceNav = featureOn('traceability_ledger') ? [{ k: 'traceability', i: 'fa-qrcode', t: 'Traceability' }] : []
   if (r === 'super_admin' || r === 'admin') return withAccount([...common,
     { k: 'approvals', i: 'fa-clipboard-check', t: 'Approvals' },
     { k: 'inventory', i: 'fa-boxes-stacked', t: 'Inventory' },
@@ -1265,6 +1293,7 @@ function navItems() {
     crm,
     transactions,
     { k: 'contracts', i: 'fa-file-signature', t: 'Purchases' },
+    ...offtakeNav, ...matchingNav, ...aggregationNav, ...logisticsNav, ...traceNav,
     { k: 'agents', i: 'fa-user-tie', t: 'Agents' },
     { k: 'users', i: 'fa-user-gear', t: 'User Accounts' },
     { k: 'amendments', i: 'fa-id-card-clip', t: 'Pending Amendments' },
@@ -1294,11 +1323,13 @@ function navItems() {
     ...(canDo('can_manage_inventory') ? [{ k: 'inventory', i: 'fa-boxes-stacked', t: 'My Inventory' }] : []),
     ...(canDo('manage_transactions') ? [transactions] : []),
     { k: 'contracts', i: 'fa-file-signature', t: 'Purchases and Contracts' },
+    ...aggregationNav, ...logisticsNav,
     { k: 'shop', i: 'fa-store', t: 'Shop' },
     myWallet])
   if (r === 'customer') return withAccount([...common,
     { k: 'shop', i: 'fa-store', t: 'Shop' },
     ...(canDo('manage_transactions') ? [transactions] : []),
+    ...offtakeNav, ...traceNav,
     { k: 'contracts', i: 'fa-file-signature', t: 'My Purchases' }])
   if (r === 'support') return withAccount([...common,
     { k: 'customers', i: 'fa-users', t: 'Customers' },
@@ -1353,9 +1384,9 @@ function renderApp() {
 }
 window.go = (r) => { state.route = r; toggleSidebar(false); renderApp() }
 function route() {
-  const titles = { dashboard: 'Dashboard', approvals: 'Financing Approvals', inventory: 'Inventory', finance_queue: 'Finance Approval Queue', customers: 'Customers', field_visits: 'Field Visits & Conversion', transactions: 'Bank Transfers & Transactions', crm: 'Sales & Support CRM', contracts: 'Purchases & Contracts', agents: 'Agent Management', users: 'User Accounts & Access', amendments: 'Pending Profile Amendments', ledger: 'Unified Payment Ledger', repayments: 'Repayment Performance', onboard: 'Farmer Onboarding', shop: 'Shop', marketplace: 'Equipment Marketplace', exports: 'Data Export & Reports', imports: 'Bulk User Data Upload', backups: 'Automated System Backups', settings: 'Financing & Markup Settings', profile: 'My Account', wallet: 'My Wallet', wallets: 'Wallets & Payouts', api_access: 'API Access', api_management: 'API Management', tenants: 'Payment Tenants', channels: 'Payment Channel Management', features: 'Feature Management & QA' }
+  const titles = { dashboard: 'Dashboard', approvals: 'Financing Approvals', inventory: 'Inventory', finance_queue: 'Finance Approval Queue', customers: 'Customers', field_visits: 'Field Visits & Conversion', transactions: 'Bank Transfers & Transactions', crm: 'Sales & Support CRM', contracts: 'Purchases & Contracts', agents: 'Agent Management', users: 'User Accounts & Access', amendments: 'Pending Profile Amendments', ledger: 'Unified Payment Ledger', repayments: 'Repayment Performance', onboard: 'Farmer Onboarding', shop: 'Shop', marketplace: 'Equipment Marketplace', exports: 'Data Export & Reports', imports: 'Bulk User Data Upload', backups: 'Automated System Backups', settings: 'Financing & Markup Settings', profile: 'My Account', wallet: 'My Wallet', wallets: 'Wallets & Payouts', api_access: 'API Access', api_management: 'API Management', tenants: 'Payment Tenants', channels: 'Payment Channel Management', features: 'Feature Management & QA', offtake: 'Offtake Contracts', matching: 'Match Buyers & Outgrowers', aggregation: 'Produce Aggregation', logistics: 'Logistics & Tracking', traceability: 'Traceability' }
   $('pageTitle').textContent = titles[state.route] || 'Dashboard'
-  const map = { dashboard: viewDashboard, approvals: viewApprovals, inventory: viewInventory, finance_queue: viewFinanceQueue, customers: viewCustomers, field_visits: viewFieldVisits, transactions: viewTransactions, crm: viewCrm, contracts: viewContracts, agents: viewAgents, users: viewUsers, amendments: viewAmendments, ledger: viewLedger, repayments: viewRepayments, onboard: viewOnboard, shop: viewShop, marketplace: viewMarketplace, exports: viewExports, imports: viewImports, backups: viewBackups, settings: viewSettings, profile: viewProfile, wallet: viewMyWallet, wallets: viewWallets, api_access: viewApiAccess, api_management: viewApiManagement, tenants: viewTenants, channels: viewChannels, features: viewFeatures }
+  const map = { dashboard: viewDashboard, approvals: viewApprovals, inventory: viewInventory, finance_queue: viewFinanceQueue, customers: viewCustomers, field_visits: viewFieldVisits, transactions: viewTransactions, crm: viewCrm, contracts: viewContracts, agents: viewAgents, users: viewUsers, amendments: viewAmendments, ledger: viewLedger, repayments: viewRepayments, onboard: viewOnboard, shop: viewShop, marketplace: viewMarketplace, exports: viewExports, imports: viewImports, backups: viewBackups, settings: viewSettings, profile: viewProfile, wallet: viewMyWallet, wallets: viewWallets, api_access: viewApiAccess, api_management: viewApiManagement, tenants: viewTenants, channels: viewChannels, features: viewFeatures, offtake: viewOfftake, matching: viewMatching, aggregation: viewAggregation, logistics: viewLogistics, traceability: viewTraceability }
   ;(map[state.route] || viewDashboard)()
 }
 
@@ -7270,3 +7301,290 @@ window.copyTenantSecret = () => {
 }
 
 init()
+
+// ===========================================================================
+// MULTI-TENANT OFFTAKE / TRACEABILITY / LOGISTICS (gated by Feature Mgmt & QA)
+// Every view guards on featureOn() so it is inert if the feature regressed to
+// sandbox. A small banner marks QA-only (non-live) features for admins.
+// ===========================================================================
+let _featuresMeta = []
+async function loadFeaturesMeta() {
+  if (!['admin', 'super_admin'].includes(state.user.role) && !canDo('manage_features')) return
+  try { _featuresMeta = (await api.get('/features')).data.features || [] } catch (_) {}
+}
+function featureQaBanner(key) {
+  const f = (_featuresMeta || []).find(x => x.feature_key === key)
+  if (!f) return ''
+  if (f.stage === 'live' && Number(f.global_enabled)) return ''
+  const label = f.stage === 'sandbox' ? 'SANDBOX — Super-Admin QA only' : f.stage === 'testing' ? 'TESTING — whitelisted users' : 'LIVE — selected users'
+  return `<div class="mb-4 p-2 rounded-lg bg-amber-50 border border-amber-200 text-xs text-amber-800"><i class="fas fa-flask mr-1"></i>${label}. Governed under Feature Management & QA.</div>`
+}
+
+// ---- Offtake Contracts (Buy / Contract list + create) ----------------------
+async function viewOfftake() {
+  if (!featureOn('offtake_contracting')) { $('content').innerHTML = '<div class="card p-6 text-slate-500">This feature is not available.</div>'; return }
+  await loadFeaturesMeta()
+  let contracts = []
+  try { contracts = (await api.get('/offtake/contracts')).data.contracts || [] } catch (_) {}
+  $('content').innerHTML = `${featureQaBanner('offtake_contracting')}
+    <div class="flex items-center justify-between mb-4">
+      <div class="text-sm text-slate-500">${contracts.length} offtake contract(s)</div>
+      <button onclick="newOfftakeModal()" class="btn brand-bg text-white px-4 py-2 rounded-lg text-sm"><i class="fas fa-plus mr-1"></i>New Contract</button>
+    </div>
+    <div class="card table-card"><table class="w-full text-sm">
+      <thead class="bg-slate-50 text-slate-500 text-xs uppercase"><tr>
+        <th class="text-left px-4 py-3">Ref</th><th class="text-left px-4 py-3">Produce</th><th class="text-left px-4 py-3">Mode</th>
+        <th class="text-right px-4 py-3">Volume</th><th class="text-right px-4 py-3">Price</th><th class="text-left px-4 py-3">Milestone</th>
+        <th class="text-left px-4 py-3">Status</th><th></th></tr></thead>
+      <tbody>${contracts.map(o => `<tr class="border-t border-slate-100">
+        <td class="px-4 py-3 font-mono text-xs">${esc(o.contract_ref)}</td>
+        <td class="px-4 py-3">${esc(o.produce_type)} <span class="text-[10px] text-slate-400">(${esc(o.value_chain)})</span></td>
+        <td class="px-4 py-3">${o.procurement_mode === 'spot' ? '<span class="text-emerald-600 text-xs font-medium">Spot (Buy)</span>' : '<span class="text-blue-600 text-xs font-medium">Forward (Contract)</span>'}</td>
+        <td class="px-4 py-3 text-right">${o.target_volume} ${esc(o.volume_unit)}</td>
+        <td class="px-4 py-3 text-right">${esc(o.currency)} ${o.unit_price}/KG</td>
+        <td class="px-4 py-3"><span class="badge bg-slate-100 text-slate-600 text-[10px]">${esc(o.milestone)}</span></td>
+        <td class="px-4 py-3">${badge(o.status)}</td>
+        <td class="px-4 py-3 text-right"><button onclick="offtakeDetail(${o.id})" class="text-teal-600 hover:underline text-xs">View</button></td>
+      </tr>`).join('') || '<tr><td colspan="8" class="text-center py-8 text-slate-400">No offtake contracts yet</td></tr>'}</tbody>
+    </table></div>`
+}
+window.newOfftakeModal = () => {
+  showModal(`<h3 class="text-lg font-bold mb-3"><i class="fas fa-handshake text-teal-600 mr-2"></i>New Offtake Contract</h3>
+    <div class="responsive-grid cols-2 text-sm">
+      <div><label class="field-label">Produce type</label><input id="of_type" placeholder="e.g. Avocado (Hass)" class="px-3 py-2 border rounded-lg w-full"></div>
+      <div><label class="field-label">Value chain</label><select id="of_chain" class="px-3 py-2 border rounded-lg w-full"><option value="crop">Crop</option><option value="livestock">Livestock</option></select></div>
+      <div><label class="field-label">Procurement</label><select id="of_mode" class="px-3 py-2 border rounded-lg w-full"><option value="forward">Forward (Contract)</option><option value="spot">Spot (Buy)</option></select></div>
+      <div><label class="field-label">Target volume</label><input id="of_vol" type="number" class="px-3 py-2 border rounded-lg w-full"></div>
+      <div><label class="field-label">Unit</label><select id="of_unit" class="px-3 py-2 border rounded-lg w-full"><option>KG</option><option>MT</option></select></div>
+      <div><label class="field-label">Price / KG</label><input id="of_price" type="number" class="px-3 py-2 border rounded-lg w-full"></div>
+      <div><label class="field-label">Currency</label><select id="of_cur" class="px-3 py-2 border rounded-lg w-full"><option>KES</option><option>USD</option></select></div>
+      <div><label class="field-label">Delivery by</label><input id="of_end" type="date" class="px-3 py-2 border rounded-lg w-full"></div>
+      <div><label class="field-label">Payment structure</label><select id="of_pay" class="px-3 py-2 border rounded-lg w-full" onchange="document.getElementById('of_up').style.display=this.value==='pre_partial'?'block':'none'"><option value="on_delivery">On-Delivery Clearance</option><option value="pre_full">Fully Pre-Delivery</option><option value="pre_partial">Partially Pre-Delivery (Escrow)</option></select></div>
+      <div id="of_up" style="display:none"><label class="field-label">Upfront %</label><input id="of_upfront" type="number" value="30" class="px-3 py-2 border rounded-lg w-full"></div>
+      <div><label class="field-label">Max moisture %</label><input id="of_moist" type="number" class="px-3 py-2 border rounded-lg w-full"></div>
+      <div><label class="field-label">Allowable defects %</label><input id="of_def" type="number" class="px-3 py-2 border rounded-lg w-full"></div>
+    </div>
+    <div class="flex gap-2 mt-4"><button onclick="createOfftake()" class="btn flex-1 brand-bg text-white py-2.5 rounded-lg text-sm">Create Contract</button>
+    <button onclick="closeModal()" class="btn px-4 bg-slate-100 rounded-lg text-sm">Cancel</button></div>`)
+}
+window.createOfftake = async () => {
+  const body = {
+    produce_type: $('of_type').value, value_chain: $('of_chain').value, procurement_mode: $('of_mode').value,
+    target_volume: $('of_vol').value, volume_unit: $('of_unit').value, unit_price: $('of_price').value, currency: $('of_cur').value,
+    delivery_end: $('of_end').value || null, payment_structure: $('of_pay').value, upfront_pct: $('of_upfront') ? $('of_upfront').value : 0,
+    quality_specs: { max_moisture_pct: $('of_moist').value || null, defects_pct: $('of_def').value || null }
+  }
+  try { await api.post('/offtake/contracts', body); toast('Offtake contract created'); closeModal(); viewOfftake() }
+  catch (err) { toast(err.response?.data?.error || 'Failed to create contract', false) }
+}
+window.offtakeDetail = async (id) => {
+  let d
+  try { d = (await api.get('/offtake/contracts/' + id)).data } catch (err) { return toast('Could not load contract', false) }
+  const o = d.contract
+  const canManage = canDo('manage_offtake') || canDo('match_outgrowers') || ['admin', 'super_admin', 'operations_finance'].includes(state.user.role)
+  const msOpts = ['ORDERED','PLANTED','GROWING','HARVESTED','AGGREGATED','IN_TRANSIT','DELIVERED']
+  showModal(`<div class="flex justify-between items-start mb-3">
+      <div><h3 class="text-lg font-bold">${esc(o.contract_ref)}</h3><p class="text-xs text-slate-500">${esc(o.produce_type)} · ${o.target_volume}${esc(o.volume_unit)} · ${esc(o.currency)} ${o.unit_price}/KG</p></div>${badge(o.status)}</div>
+    <div class="grid grid-cols-2 gap-3 text-sm mb-4">
+      <div class="bg-slate-50 p-3 rounded-lg"><p class="text-xs text-slate-500">Mode</p><b>${o.procurement_mode === 'spot' ? 'Spot (Buy)' : 'Forward (Contract)'}</b></div>
+      <div class="bg-slate-50 p-3 rounded-lg"><p class="text-xs text-slate-500">Payment</p><b>${esc((o.payment_structure||'').replace(/_/g,' '))}</b></div>
+      <div class="bg-slate-50 p-3 rounded-lg"><p class="text-xs text-slate-500">Milestone</p><b>${esc(o.milestone)}</b></div>
+      <div class="bg-teal-50 p-3 rounded-lg"><p class="text-xs text-slate-500">Escrow</p><b>${esc(o.escrow_state)} · ${esc(o.currency)} ${o.escrow_amount||0}</b></div>
+    </div>
+    <div class="text-xs text-slate-500 mb-2"><b>Matches:</b> ${(d.matches||[]).length} · <b>Batches:</b> ${(d.batches||[]).length} · <b>Shipments:</b> ${(d.shipments||[]).length}</div>
+    ${canManage ? `<div class="flex flex-wrap gap-2 mt-3">
+      <select id="of_ms" class="px-3 py-2 border rounded-lg text-sm">${msOpts.map(m=>`<option ${m===o.milestone?'selected':''}>${m}</option>`).join('')}</select>
+      <button onclick="advanceMilestone(${id})" class="btn bg-slate-700 text-white px-3 py-2 rounded-lg text-sm">Set Milestone</button>
+      ${featureOn('escrow_settlement') ? `<button onclick="escrowAction(${id},'lock')" class="btn bg-amber-500 text-white px-3 py-2 rounded-lg text-sm">Lock Escrow</button>
+      <button onclick="escrowAction(${id},'release')" class="btn bg-emerald-600 text-white px-3 py-2 rounded-lg text-sm">Release on Delivery</button>` : ''}
+    </div>` : ''}
+    <button onclick="closeModal()" class="btn w-full mt-3 bg-slate-100 py-2 rounded-lg text-sm">Close</button>`)
+}
+window.advanceMilestone = async (id) => {
+  try { await api.put('/offtake/contracts/' + id + '/milestone', { milestone: $('of_ms').value }); toast('Milestone updated'); closeModal(); viewOfftake() }
+  catch (err) { toast(err.response?.data?.error || 'Failed', false) }
+}
+window.escrowAction = async (id, action) => {
+  try { const { data } = await api.post('/offtake/contracts/' + id + '/escrow', { action }); toast('Escrow ' + data.escrow_state); closeModal(); viewOfftake() }
+  catch (err) { toast(err.response?.data?.error || 'Failed', false) }
+}
+
+// ---- Match Buyers & Outgrowers (admin) -------------------------------------
+async function viewMatching() {
+  if (!featureOn('admin_matching_engine')) { $('content').innerHTML = '<div class="card p-6 text-slate-500">This feature is not available.</div>'; return }
+  await loadFeaturesMeta()
+  let contracts = []
+  try { contracts = (await api.get('/offtake/contracts')).data.contracts || [] } catch (_) {}
+  const open = contracts.filter(o => ['open', 'matching'].includes(o.status))
+  $('content').innerHTML = `${featureQaBanner('admin_matching_engine')}
+    <p class="text-sm text-slate-500 mb-4">Match open offtake contracts to outgrowers across the unified farmer pool (Equipment, Nia, Feed) — externally via SMS/USSD, internally to a block farm, or via agent aggregation.</p>
+    <div class="card table-card"><table class="w-full text-sm">
+      <thead class="bg-slate-50 text-slate-500 text-xs uppercase"><tr><th class="text-left px-4 py-3">Ref</th><th class="text-left px-4 py-3">Produce</th><th class="text-right px-4 py-3">Volume</th><th></th></tr></thead>
+      <tbody>${open.map(o => `<tr class="border-t border-slate-100"><td class="px-4 py-3 font-mono text-xs">${esc(o.contract_ref)}</td><td class="px-4 py-3">${esc(o.produce_type)}</td><td class="px-4 py-3 text-right">${o.target_volume} ${esc(o.volume_unit)}</td>
+        <td class="px-4 py-3 text-right"><button onclick="matchModal(${o.id},'${esc(o.contract_ref)}')" class="btn brand-bg text-white px-3 py-1.5 rounded-lg text-xs">Match</button></td></tr>`).join('') || '<tr><td colspan="4" class="text-center py-8 text-slate-400">No contracts awaiting matching</td></tr>'}</tbody>
+    </table></div>`
+}
+window.matchModal = async (id, ref) => {
+  let candidates = []
+  try { candidates = (await api.post('/offtake/contracts/' + id + '/candidates', {})).data.candidates || [] } catch (_) {}
+  showModal(`<h3 class="text-lg font-bold mb-1"><i class="fas fa-people-arrows text-teal-600 mr-2"></i>Match ${esc(ref)}</h3>
+    <p class="text-xs text-slate-500 mb-3">Choose a fulfillment path.</p>
+    <div class="flex gap-1 mb-3 bg-slate-100 p-1 rounded-lg text-sm">
+      <button id="mt_ext" onclick="matchTab('ext')" class="flex-1 py-2 rounded-md bg-white shadow-sm font-semibold">External (SMS/USSD)</button>
+      <button id="mt_int" onclick="matchTab('int')" class="flex-1 py-2 rounded-md text-slate-500">Internal (Block Farm)</button>
+      <button id="mt_agt" onclick="matchTab('agt')" class="flex-1 py-2 rounded-md text-slate-500">Agent Aggregation</button>
+    </div>
+    <div id="mt_body"></div>`)
+  window._matchCtx = { id, candidates }
+  matchTab('ext')
+}
+window.matchTab = (tab) => {
+  ['ext','int','agt'].forEach(t => { const b = $('mt_'+t); if (b) b.className = 'flex-1 py-2 rounded-md ' + (t===tab?'bg-white shadow-sm font-semibold':'text-slate-500') })
+  const ctx = window._matchCtx
+  const body = $('mt_body')
+  if (tab === 'ext') {
+    body.innerHTML = `<div class="max-h-60 overflow-y-auto border border-slate-200 rounded-lg mb-3">${(ctx.candidates||[]).map(cd => `<label class="flex items-center gap-2 px-3 py-2 border-b border-slate-100 text-sm"><input type="checkbox" class="mt_cand h-4 w-4" data-id="${cd.id}" data-phone="${esc(cd.phone||'')}"><span>${esc(cd.name||'Farmer')} · ${esc(cd.county||'')} ${cd.distance_km!=null?'· '+cd.distance_km+'km':''}</span></label>`).join('') || '<div class="p-3 text-xs text-slate-400">No candidates found</div>'}</div>
+      <select id="mt_chan" class="px-3 py-2 border rounded-lg w-full mb-3 text-sm"><option value="sms">SMS prompt</option><option value="ussd">USSD prompt</option></select>
+      <button onclick="doMatch('external')" class="btn w-full brand-bg text-white py-2.5 rounded-lg text-sm">Dispatch to selected outgrowers</button>`
+  } else if (tab === 'int') {
+    body.innerHTML = `<label class="field-label">Block farm / cooperative</label><input id="mt_block" value="Farmsky Block Farm" class="px-3 py-2 border rounded-lg w-full mb-2"><label class="field-label">Allocated volume</label><input id="mt_vol" type="number" class="px-3 py-2 border rounded-lg w-full mb-3"><button onclick="doMatch('internal')" class="btn w-full brand-bg text-white py-2.5 rounded-lg text-sm">Allocate internally</button>`
+  } else {
+    body.innerHTML = `<label class="field-label">Agent user ids (comma-separated)</label><input id="mt_agents" placeholder="e.g. 2" class="px-3 py-2 border rounded-lg w-full mb-3"><button onclick="doMatch('agent')" class="btn w-full brand-bg text-white py-2.5 rounded-lg text-sm">Assign aggregation work-order</button>`
+  }
+}
+window.doMatch = async (type) => {
+  const id = window._matchCtx.id
+  let body = { match_type: type }
+  if (type === 'external') {
+    const sel = Array.from(document.querySelectorAll('.mt_cand:checked')).map(el => ({ id: el.dataset.id, phone: el.dataset.phone }))
+    if (!sel.length) return toast('Select at least one outgrower', false)
+    body.outgrowers = sel; body.dispatch_channel = $('mt_chan').value
+  } else if (type === 'internal') {
+    body.block_farm = $('mt_block').value; body.allocated_volume = $('mt_vol').value
+  } else {
+    body.agent_ids = ($('mt_agents').value||'').split(',').map(s=>s.trim()).filter(Boolean)
+    if (!body.agent_ids.length) return toast('Enter at least one agent id', false)
+  }
+  try { await api.post('/offtake/contracts/' + id + '/match', body); toast('Match dispatched'); closeModal(); viewMatching() }
+  catch (err) { toast(err.response?.data?.error || 'Failed', false) }
+}
+
+// ---- Agent Produce Aggregation ---------------------------------------------
+async function viewAggregation() {
+  if (!featureOn('agent_aggregation')) { $('content').innerHTML = '<div class="card p-6 text-slate-500">This feature is not available.</div>'; return }
+  await loadFeaturesMeta()
+  $('content').innerHTML = `${featureQaBanner('agent_aggregation')}
+    <div class="card p-6 max-w-lg">
+      <h3 class="font-bold mb-3"><i class="fas fa-weight-scale text-teal-600 mr-2"></i>Record Aggregation Batch</h3>
+      <p class="text-xs text-slate-500 mb-4">First-mile collection: weigh, inspect quality, and generate a QR tag for the crate/bag.</p>
+      <div class="responsive-grid cols-2 text-sm">
+        <div><label class="field-label">Contract id</label><input id="ag_cid" type="number" class="px-3 py-2 border rounded-lg w-full"></div>
+        <div><label class="field-label">Outgrower id</label><input id="ag_oid" type="number" class="px-3 py-2 border rounded-lg w-full"></div>
+        <div><label class="field-label">Gross weight (KG)</label><input id="ag_gross" type="number" class="px-3 py-2 border rounded-lg w-full"></div>
+        <div><label class="field-label">Net weight (KG)</label><input id="ag_net" type="number" class="px-3 py-2 border rounded-lg w-full"></div>
+        <div><label class="field-label">Quality grade</label><input id="ag_grade" placeholder="A / B / C" class="px-3 py-2 border rounded-lg w-full"></div>
+        <div><label class="field-label">Moisture %</label><input id="ag_moist" type="number" class="px-3 py-2 border rounded-lg w-full"></div>
+      </div>
+      <button onclick="submitAggregation()" class="btn w-full mt-4 brand-bg text-white py-2.5 rounded-lg text-sm"><i class="fas fa-qrcode mr-1"></i>Weigh & Generate QR Tag</button>
+      <div id="ag_result" class="mt-3"></div>
+    </div>`
+}
+window.submitAggregation = async () => {
+  const body = { contract_id: $('ag_cid').value || null, outgrower_id: $('ag_oid').value || null, gross_weight: $('ag_gross').value, net_weight: $('ag_net').value, quality_grade: $('ag_grade').value, moisture_pct: $('ag_moist').value }
+  try {
+    const { data } = await api.post('/offtake/aggregation', body)
+    $('ag_result').innerHTML = `<div class="p-3 rounded-lg bg-emerald-50 border border-emerald-200 text-sm"><b>Batch ${esc(data.batch_ref)}</b><div class="text-xs text-slate-600 mt-1 font-mono break-all">QR: ${esc(data.qr_payload)}</div><div class="text-[11px] text-slate-500 mt-1">Open Traceability to view provenance.</div></div>`
+    toast('Batch recorded + QR tagged')
+  } catch (err) { toast(err.response?.data?.error || 'Failed', false) }
+}
+
+// ---- Logistics & Live Tracking ---------------------------------------------
+async function viewLogistics() {
+  if (!featureOn('logistics_telemetry')) { $('content').innerHTML = '<div class="card p-6 text-slate-500">This feature is not available.</div>'; return }
+  await loadFeaturesMeta()
+  let shipments = []
+  try { shipments = (await api.get('/logistics/shipments')).data.shipments || [] } catch (_) {}
+  const canManage = canDo('manage_logistics') || ['admin', 'super_admin', 'operations_finance'].includes(state.user.role)
+  $('content').innerHTML = `${featureQaBanner('logistics_telemetry')}
+    <div class="flex items-center justify-between mb-4"><div class="text-sm text-slate-500">${shipments.length} shipment(s)</div>
+      ${canManage ? `<button onclick="newShipmentModal()" class="btn brand-bg text-white px-4 py-2 rounded-lg text-sm"><i class="fas fa-plus mr-1"></i>New Shipment</button>` : ''}</div>
+    <div class="card table-card"><table class="w-full text-sm">
+      <thead class="bg-slate-50 text-slate-500 text-xs uppercase"><tr><th class="text-left px-4 py-3">Ref</th><th class="text-left px-4 py-3">Driver</th><th class="text-left px-4 py-3">Route</th><th class="text-right px-4 py-3">Temp</th><th class="text-left px-4 py-3">Status</th><th></th></tr></thead>
+      <tbody>${shipments.map(s => `<tr class="border-t border-slate-100"><td class="px-4 py-3 font-mono text-xs">${esc(s.shipment_ref)}</td><td class="px-4 py-3">${esc(s.driver_name||'—')}</td><td class="px-4 py-3 text-xs">${esc(s.origin_hub||'')} → ${esc(s.destination||'')}</td><td class="px-4 py-3 text-right">${s.last_temp_c!=null?s.last_temp_c+'°C':'—'}</td><td class="px-4 py-3">${badge(s.status)}</td>
+        <td class="px-4 py-3 text-right"><button onclick="trackShipment(${s.id})" class="text-teal-600 hover:underline text-xs">Track</button></td></tr>`).join('') || '<tr><td colspan="6" class="text-center py-8 text-slate-400">No shipments</td></tr>'}</tbody>
+    </table></div>`
+}
+window.newShipmentModal = () => {
+  showModal(`<h3 class="text-lg font-bold mb-3"><i class="fas fa-truck-fast text-teal-600 mr-2"></i>New Shipment</h3>
+    <div class="responsive-grid cols-2 text-sm">
+      <div><label class="field-label">Contract id</label><input id="sh_cid" type="number" class="px-3 py-2 border rounded-lg w-full"></div>
+      <div><label class="field-label">Driver name</label><input id="sh_driver" class="px-3 py-2 border rounded-lg w-full"></div>
+      <div><label class="field-label">Origin hub</label><input id="sh_origin" class="px-3 py-2 border rounded-lg w-full"></div>
+      <div><label class="field-label">Destination</label><input id="sh_dest" class="px-3 py-2 border rounded-lg w-full"></div>
+      <div><label class="field-label">ETA (minutes)</label><input id="sh_eta" type="number" class="px-3 py-2 border rounded-lg w-full"></div>
+    </div>
+    <div class="flex gap-2 mt-4"><button onclick="createShipment()" class="btn flex-1 brand-bg text-white py-2.5 rounded-lg text-sm">Create</button><button onclick="closeModal()" class="btn px-4 bg-slate-100 rounded-lg text-sm">Cancel</button></div>`)
+}
+window.createShipment = async () => {
+  try { await api.post('/logistics/shipments', { contract_id: $('sh_cid').value||null, driver_name: $('sh_driver').value, origin_hub: $('sh_origin').value, destination: $('sh_dest').value, eta_minutes: $('sh_eta').value||null }); toast('Shipment created'); closeModal(); viewLogistics() }
+  catch (err) { toast(err.response?.data?.error || 'Failed', false) }
+}
+let _trackTimer = null
+window.trackShipment = async (id) => {
+  const render = async () => {
+    let d; try { d = (await api.get('/logistics/shipments/' + id + '/track')).data } catch (_) { return }
+    const s = d.shipment, last = (d.pings||[])[0] || {}
+    const eta = s.eta_minutes ? `${Math.floor(s.eta_minutes/60)}h ${s.eta_minutes%60}m` : '—'
+    const box = $('trk_box')
+    if (!box) return
+    box.innerHTML = `<div class="font-mono text-xs bg-slate-900 text-emerald-300 p-4 rounded-lg leading-relaxed">
+      Driver: ${esc(s.driver_name||'—')}  |  Speed: ${last.speed_kmh!=null?last.speed_kmh+' km/h':'—'}  |  Cold Chain: ${last.temp_c!=null?last.temp_c+'°C':'—'}<br>
+      Route: ${esc(s.origin_hub||'origin')} ---[======>------]---> ${esc(s.destination||'destination')}<br>
+      Status: ${esc((s.status||'').toUpperCase())}  |  ETA: ${eta}  |  Last ping: ${last.recorded_at?esc(String(last.recorded_at)):'—'}</div>
+      <div class="text-[11px] text-slate-400 mt-2">${(d.pings||[]).length} telemetry ping(s) · live GPS + BLE cold-chain stream (10s cadence)</div>`
+  }
+  showModal(`<h3 class="text-lg font-bold mb-3"><i class="fas fa-location-crosshairs text-teal-600 mr-2"></i>In-Transit Freight Tracking</h3>
+    <div id="trk_box" class="mb-3"><div class="text-sm text-slate-400 py-6 text-center"><i class="fas fa-spinner fa-spin mr-1"></i>Loading telemetry…</div></div>
+    ${(canDo('manage_logistics') || ['admin','super_admin','operations_finance'].includes(state.user.role)) ? `<div class="flex gap-2">
+      <button onclick="simulatePing(${id})" class="btn bg-slate-700 text-white px-3 py-2 rounded-lg text-sm"><i class="fas fa-satellite-dish mr-1"></i>Send Test Ping</button>
+      <button onclick="signPod(${id})" class="btn bg-emerald-600 text-white px-3 py-2 rounded-lg text-sm"><i class="fas fa-signature mr-1"></i>Sign PoD</button></div>` : ''}
+    <button onclick="closeTrack()" class="btn w-full mt-3 bg-slate-100 py-2 rounded-lg text-sm">Close</button>`)
+  await render()
+  if (_trackTimer) clearInterval(_trackTimer)
+  _trackTimer = setInterval(render, 5000)
+}
+window.closeTrack = () => { if (_trackTimer) { clearInterval(_trackTimer); _trackTimer = null } closeModal() }
+window.simulatePing = async (id) => {
+  const lat = -1.05 + (Math.random()-0.5)*0.2, lng = 36.9 + (Math.random()-0.5)*0.2
+  try { await api.post('/logistics/shipments/' + id + '/ping', { lat, lng, speed_kmh: Math.round(40+Math.random()*30), heading: 190, temp_c: Math.round((3.5+Math.random())*10)/10, humidity_pct: 85 }); toast('Ping sent') }
+  catch (err) { toast(err.response?.data?.error || 'Failed', false) }
+}
+window.signPod = async (id) => {
+  try { await api.post('/logistics/shipments/' + id + '/pod', {}); toast('Proof of Delivery signed'); closeTrack(); viewLogistics() }
+  catch (err) { toast(err.response?.data?.error || 'Failed', false) }
+}
+
+// ---- Traceability (public QR provenance lookup) ----------------------------
+async function viewTraceability() {
+  if (!featureOn('traceability_ledger')) { $('content').innerHTML = '<div class="card p-6 text-slate-500">This feature is not available.</div>'; return }
+  await loadFeaturesMeta()
+  $('content').innerHTML = `${featureQaBanner('traceability_ledger')}
+    <div class="card p-6 max-w-xl">
+      <h3 class="font-bold mb-2"><i class="fas fa-qrcode text-teal-600 mr-2"></i>Traceability & Provenance</h3>
+      <p class="text-xs text-slate-500 mb-4">Scan or enter a batch/animal QR key to view its immutable provenance record (crop or livestock value chain).</p>
+      <div class="flex gap-2"><input id="tr_ref" placeholder="e.g. FARMSKY:BATCH:BATCH-123456" class="px-3 py-2 border rounded-lg flex-1 text-sm"><button onclick="lookupTrace()" class="btn brand-bg text-white px-4 py-2 rounded-lg text-sm">Lookup</button></div>
+      <div id="tr_result" class="mt-4"></div>
+    </div>`
+}
+window.lookupTrace = async () => {
+  const ref = $('tr_ref').value.trim()
+  if (!ref) return
+  try {
+    const { data } = await api.get('/traceability/public/' + encodeURIComponent(ref))
+    $('tr_result').innerHTML = `<div class="text-xs text-slate-500 mb-2">Value chain: <b>${esc(data.value_chain)}</b> · ${(data.events||[]).length} event(s)</div>
+      <ol class="relative border-l-2 border-teal-200 ml-2">${(data.events||[]).map(e => `<li class="ml-4 mb-3"><div class="absolute -left-[7px] w-3 h-3 bg-teal-500 rounded-full"></div>
+        <div class="text-sm font-semibold">${esc(e.stage)} <span class="text-[10px] text-slate-400 font-normal">· ${esc(e.event_type)} · ${esc(e.source_app||'')}</span></div>
+        <div class="text-[11px] text-slate-400">${esc(String(e.recorded_at||''))}</div>
+        ${e.payload ? `<div class="text-[11px] text-slate-500 mt-0.5 font-mono break-all">${esc(typeof e.payload==='string'?e.payload:JSON.stringify(e.payload))}</div>` : ''}</li>`).join('')}</ol>`
+  } catch (err) { $('tr_result').innerHTML = `<div class="text-sm text-red-600">${esc(err.response?.data?.error || 'No provenance record found')}</div>` }
+}

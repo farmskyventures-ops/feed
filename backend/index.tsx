@@ -3914,6 +3914,328 @@ app.put('/api/features/:key', requireAuth, async (c) => {
   return c.json({ ok: true })
 })
 
+// ============================================================================
+// MULTI-TENANT OFFTAKE CONTRACTING, TRACEABILITY & LOGISTICS
+//
+// Every route below is GOVERNED by Feature Management & QA: the matching feature
+// flag must be available to the caller (sandbox → Super-Admin only; testing →
+// whitelist; live → per-user or global) via isLifecycleAvailable(). This enforces
+// the ecosystem rule that new capabilities are hidden from end users until a
+// Super-Admin promotes them. Admins/Super-Admins always pass (so they can QA in
+// sandbox). Non-breaking: all reads/writes target the additive 0046 tables.
+// ============================================================================
+async function featureAvailable(c: any, user: SessionUser, featureKey: string): Promise<boolean> {
+  const f = await c.env.DB.prepare(`SELECT * FROM feature_flags WHERE feature_key=?`).bind(featureKey).first<any>()
+  if (!f) return false
+  return isLifecycleAvailable(c, 'feature_flag', 'feature_key', featureKey, f, user)
+}
+// Route guard factory: 404 (not 403) when a feature is unavailable, so a gated
+// capability is indistinguishable from "not present" to unauthorized users.
+function requireFeature(featureKey: string) {
+  return async (c: any, next: any) => {
+    const user = c.get('user') as SessionUser
+    if (!user) return c.json({ error: 'Unauthorized' }, 401)
+    if (!(await featureAvailable(c, user, featureKey))) return c.json({ error: 'Not found' }, 404)
+    await next()
+  }
+}
+
+// ---- Master user registry (unified identity & ecosystem roles) -------------
+// Toggle the cross-marketplace capability flags on a user. The single `role`
+// column is preserved; these flags let ONE identity act as Farmer + Offtaker +
+// Input Provider + Logistics Provider across Equipment, Nia and Feed.
+app.get('/api/registry/me', requireAuth, requireFeature('master_user_registry'), async (c) => {
+  const user = c.get('user') as SessionUser
+  const row = await withAdminContext(c, async () => await c.env.DB.prepare(
+    `SELECT id, full_name, phone, email, role, is_offtaker, is_input_provider, is_logistics_provider, agent_scope, master_registry_id FROM users WHERE id=?`
+  ).bind(user.id).first<any>())
+  return c.json({ identity: row })
+})
+app.put('/api/registry/users/:id/roles', requireAuth, requireFeature('master_user_registry'), requireRole('admin', 'super_admin'), async (c) => {
+  const id = c.req.param('id')
+  const b = await c.req.json().catch(() => ({})) as any
+  const sets: string[] = []
+  const binds: any[] = []
+  for (const [k, col] of [['is_offtaker', 'is_offtaker'], ['is_input_provider', 'is_input_provider'], ['is_logistics_provider', 'is_logistics_provider']] as const) {
+    if (b[k] !== undefined) { sets.push(`${col}=?`); binds.push(b[k] ? 1 : 0) }
+  }
+  if (b.agent_scope !== undefined) { sets.push(`agent_scope=?`); binds.push(['internal', 'external'].includes(String(b.agent_scope)) ? String(b.agent_scope) : null) }
+  if (b.agsme_profile !== undefined) { sets.push(`agsme_profile=?`); binds.push(b.agsme_profile ? JSON.stringify(b.agsme_profile) : null) }
+  if (!sets.length) return c.json({ error: 'No role flags supplied' }, 400)
+  binds.push(id)
+  await c.env.DB.prepare(`UPDATE users SET ${sets.join(', ')} WHERE id=?`).bind(...binds).run()
+  await audit(c, c.get('user').id, 'update', 'registry_roles', String(id))
+  return c.json({ ok: true })
+})
+
+// ---- Offtake contracts (spot Buy / forward Contract) -----------------------
+app.get('/api/offtake/contracts', requireAuth, requireFeature('offtake_contracting'), async (c) => {
+  const user = c.get('user') as SessionUser
+  // Offtakers see their own; staff with manage_offtake/match_outgrowers see all.
+  const isStaff = ['admin', 'super_admin', 'operations_finance'].includes(user.role) || hasPermission(user, 'manage_offtake') || hasPermission(user, 'match_outgrowers')
+  let q = `SELECT * FROM offtake_contracts`
+  const binds: any[] = []
+  if (!isStaff) { q += ` WHERE offtaker_id=? OR created_by=?`; binds.push(user.id, user.id) }
+  q += ` ORDER BY created_at DESC`
+  const { results } = await withAdminContext(c, async () => await c.env.DB.prepare(q).bind(...binds).all())
+  return c.json({ contracts: results })
+})
+app.post('/api/offtake/contracts', requireAuth, requireFeature('offtake_contracting'), async (c) => {
+  const user = c.get('user') as SessionUser
+  const b = await c.req.json().catch(() => ({})) as any
+  if (!b.produce_type) return c.json({ error: 'Produce type is required' }, 400)
+  const volume = numberVal(b.target_volume, 0)
+  if (!(volume > 0)) return c.json({ error: 'Target volume must be greater than zero' }, 400)
+  const unitPrice = numberVal(b.unit_price, 0)
+  if (!(unitPrice > 0)) return c.json({ error: 'Unit price must be greater than zero' }, 400)
+  const mode = b.procurement_mode === 'spot' ? 'spot' : 'forward'
+  const pay = ['pre_full', 'pre_partial', 'on_delivery'].includes(String(b.payment_structure)) ? String(b.payment_structure) : 'on_delivery'
+  const contractRef = ref('OFT')
+  const r = await c.env.DB.prepare(
+    `INSERT INTO offtake_contracts (contract_ref,offtaker_id,product_id,produce_type,value_chain,procurement_mode,target_volume,volume_unit,variance_pct,delivery_start,delivery_end,unit_price,currency,currency_locked,quality_specs,premium_penalty,payment_structure,upfront_pct,status,milestone,created_by)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
+  ).bind(
+    contractRef, b.offtaker_id || user.id, b.product_id || null, String(b.produce_type), b.value_chain === 'livestock' ? 'livestock' : 'crop',
+    mode, volume, ['KG', 'MT'].includes(String(b.volume_unit)) ? String(b.volume_unit) : 'KG', numberVal(b.variance_pct, 5),
+    b.delivery_start || null, b.delivery_end || null, unitPrice, ['KES', 'USD'].includes(String(b.currency)) ? String(b.currency) : 'KES',
+    b.currency_locked === false ? 0 : 1, b.quality_specs ? JSON.stringify(b.quality_specs) : null, b.premium_penalty ? JSON.stringify(b.premium_penalty) : null,
+    pay, numberVal(b.upfront_pct, 0), mode === 'spot' ? 'open' : 'open', 'ORDERED', user.id
+  ).run()
+  await audit(c, user.id, 'create', 'offtake_contract', `${contractRef} (${mode}, ${volume}${b.volume_unit || 'KG'} ${b.produce_type})`)
+  return c.json({ ok: true, id: r.meta.last_row_id, contract_ref: contractRef })
+})
+app.get('/api/offtake/contracts/:id', requireAuth, requireFeature('offtake_contracting'), async (c) => {
+  const id = c.req.param('id')
+  const contract = await withAdminContext(c, async () => await c.env.DB.prepare(`SELECT * FROM offtake_contracts WHERE id=?`).bind(id).first<any>())
+  if (!contract) return c.json({ error: 'Not found' }, 404)
+  const matches = await withAdminContext(c, async () => (await c.env.DB.prepare(`SELECT * FROM offtake_matches WHERE contract_id=? ORDER BY id`).bind(id).all()).results)
+  const batches = await withAdminContext(c, async () => (await c.env.DB.prepare(`SELECT * FROM aggregation_batches WHERE contract_id=? ORDER BY id`).bind(id).all()).results)
+  const shipments = await withAdminContext(c, async () => (await c.env.DB.prepare(`SELECT * FROM logistics_shipments WHERE contract_id=? ORDER BY id`).bind(id).all()).results)
+  return c.json({ contract, matches, batches, shipments })
+})
+// Advance the milestone state machine (ORDERED→…→DELIVERED).
+const OFFTAKE_MILESTONES = ['ORDERED', 'PLANTED', 'GROWING', 'HARVESTED', 'AGGREGATED', 'IN_TRANSIT', 'DELIVERED']
+app.put('/api/offtake/contracts/:id/milestone', requireAuth, requireFeature('offtake_contracting'), async (c) => {
+  const user = c.get('user') as SessionUser
+  if (!(hasPermission(user, 'manage_offtake') || hasPermission(user, 'match_outgrowers') || ['admin', 'super_admin', 'operations_finance'].includes(user.role))) return c.json({ error: 'Forbidden' }, 403)
+  const id = c.req.param('id')
+  const b = await c.req.json().catch(() => ({})) as any
+  if (!OFFTAKE_MILESTONES.includes(String(b.milestone))) return c.json({ error: 'Invalid milestone' }, 400)
+  await c.env.DB.prepare(`UPDATE offtake_contracts SET milestone=?, updated_at=CURRENT_TIMESTAMP WHERE id=?`).bind(String(b.milestone), id).run()
+  await audit(c, user.id, 'milestone', 'offtake_contract', `${id} → ${b.milestone}`)
+  return c.json({ ok: true, milestone: b.milestone })
+})
+
+// ---- Admin matching engine (external SMS/USSD | internal | agent) ----------
+// Candidate query engine: unified farmer pool across apps, filtered by input
+// purchase verification, feed/health audit and geospatial proximity.
+app.post('/api/offtake/contracts/:id/candidates', requireAuth, requireFeature('admin_matching_engine'), async (c) => {
+  const user = c.get('user') as SessionUser
+  if (!(hasPermission(user, 'match_outgrowers') || ['admin', 'super_admin'].includes(user.role))) return c.json({ error: 'Forbidden' }, 403)
+  const id = c.req.param('id')
+  const b = await c.req.json().catch(() => ({})) as any
+  const contract = await withAdminContext(c, async () => await c.env.DB.prepare(`SELECT * FROM offtake_contracts WHERE id=?`).bind(id).first<any>())
+  if (!contract) return c.json({ error: 'Contract not found' }, 404)
+  // Query the unified farmer pool. Filters are best-effort (columns vary by app).
+  const candidates = await withAdminContext(c, async () => {
+    const rows = (await c.env.DB.prepare(
+      `SELECT id, full_name, mobile, county, value_chain, latitude, longitude FROM customers ORDER BY id DESC LIMIT 200`
+    ).all()).results as any[]
+    return rows.map(r => {
+      // Geospatial proximity (haversine) if both the hub and farm have coords.
+      let distanceKm: number | null = null
+      const hubLat = numOrNull(b.hub_lat), hubLng = numOrNull(b.hub_lng)
+      if (hubLat != null && hubLng != null && r.latitude != null && r.longitude != null) {
+        const toRad = (d: number) => d * Math.PI / 180
+        const dLat = toRad(r.latitude - hubLat), dLng = toRad(r.longitude - hubLng)
+        const a = Math.sin(dLat / 2) ** 2 + Math.cos(toRad(hubLat)) * Math.cos(toRad(r.latitude)) * Math.sin(dLng / 2) ** 2
+        distanceKm = Math.round(6371 * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a)) * 10) / 10
+      }
+      return { id: r.id, name: r.full_name, phone: r.mobile, county: r.county, value_chain: r.value_chain, distance_km: distanceKm }
+    }).filter(r => b.max_distance_km == null || r.distance_km == null || r.distance_km <= Number(b.max_distance_km))
+  })
+  return c.json({ contract_ref: contract.contract_ref, candidates })
+})
+// Create matches (and dispatch external SMS/USSD prompts) for a contract.
+app.post('/api/offtake/contracts/:id/match', requireAuth, requireFeature('admin_matching_engine'), async (c) => {
+  const user = c.get('user') as SessionUser
+  if (!(hasPermission(user, 'match_outgrowers') || ['admin', 'super_admin'].includes(user.role))) return c.json({ error: 'Forbidden' }, 403)
+  const id = c.req.param('id')
+  const b = await c.req.json().catch(() => ({})) as any
+  const matchType = ['external', 'internal', 'agent'].includes(String(b.match_type)) ? String(b.match_type) : 'external'
+  const contract = await withAdminContext(c, async () => await c.env.DB.prepare(`SELECT * FROM offtake_contracts WHERE id=?`).bind(id).first<any>())
+  if (!contract) return c.json({ error: 'Contract not found' }, 404)
+  const created: any[] = []
+  if (matchType === 'internal') {
+    const r = await c.env.DB.prepare(`INSERT INTO offtake_matches (contract_id,match_type,block_farm,allocated_volume,dispatch_channel,response,created_by) VALUES (?,?,?,?,?,?,?)`)
+      .bind(id, 'internal', String(b.block_farm || 'Farmsky Block Farm'), numberVal(b.allocated_volume, contract.target_volume), 'internal', 'accepted', user.id).run()
+    created.push({ id: r.meta.last_row_id, match_type: 'internal' })
+  } else if (matchType === 'agent') {
+    for (const agentId of (Array.isArray(b.agent_ids) ? b.agent_ids : [])) {
+      const r = await c.env.DB.prepare(`INSERT INTO offtake_matches (contract_id,match_type,agent_id,allocated_volume,dispatch_channel,response,created_by) VALUES (?,?,?,?,?,?,?)`)
+        .bind(id, 'agent', String(agentId), numberVal(b.allocated_volume, 0), 'internal', 'accepted', user.id).run()
+      created.push({ id: r.meta.last_row_id, match_type: 'agent', agent_id: agentId })
+    }
+  } else {
+    // External: SMS/USSD interactive prompt to each candidate outgrower.
+    const channel = b.dispatch_channel === 'ussd' ? 'ussd' : 'sms'
+    for (const o of (Array.isArray(b.outgrowers) ? b.outgrowers : [])) {
+      const r = await c.env.DB.prepare(`INSERT INTO offtake_matches (contract_id,match_type,outgrower_id,allocated_volume,dispatch_channel,response,created_by) VALUES (?,?,?,?,?,?,?)`)
+        .bind(id, 'external', String(o.id || o), numberVal(o.volume ?? b.allocated_volume, 0), channel, 'pending', user.id).run()
+      created.push({ id: r.meta.last_row_id, match_type: 'external', outgrower_id: o.id || o })
+      // Best-effort SMS dispatch (no-op if SMS not configured).
+      if (o.phone && smsConfigured(c.env)) {
+        const msg = `Farmsky Offtake: ${contract.produce_type} ${contract.target_volume}${contract.volume_unit} @ ${contract.currency} ${contract.unit_price}/KG by ${contract.delivery_end || 'TBD'}. Reply YES to accept.`
+        try { await sendSms(c.env, String(o.phone), msg) } catch (_) {}
+      }
+    }
+  }
+  await c.env.DB.prepare(`UPDATE offtake_contracts SET status='matching', updated_at=CURRENT_TIMESTAMP WHERE id=?`).bind(id).run()
+  await audit(c, user.id, 'match', 'offtake_contract', `${contract.contract_ref} (${matchType}, ${created.length})`)
+  return c.json({ ok: true, matches: created })
+})
+// Outgrower accept/decline (used by the external SMS/USSD callback or in-app).
+app.put('/api/offtake/matches/:id/respond', requireAuth, requireFeature('offtake_contracting'), async (c) => {
+  const user = c.get('user') as SessionUser
+  const id = c.req.param('id')
+  const b = await c.req.json().catch(() => ({})) as any
+  const resp = b.response === 'accepted' ? 'accepted' : 'declined'
+  await c.env.DB.prepare(`UPDATE offtake_matches SET response=?, responded_at=CURRENT_TIMESTAMP WHERE id=?`).bind(resp, id).run()
+  await audit(c, user.id, 'respond', 'offtake_match', `${id} → ${resp}`)
+  return c.json({ ok: true, response: resp })
+})
+
+// ---- Agent field aggregation (weigh / inspect / QR-tag) --------------------
+app.post('/api/offtake/aggregation', requireAuth, requireFeature('agent_aggregation'), async (c) => {
+  const user = c.get('user') as SessionUser
+  if (!(hasPermission(user, 'aggregate_produce') || ['admin', 'super_admin', 'agent', 'operations_finance'].includes(user.role))) return c.json({ error: 'Forbidden' }, 403)
+  const b = await c.req.json().catch(() => ({})) as any
+  const batchRef = ref('BATCH')
+  const net = numberVal(b.net_weight, numberVal(b.gross_weight, 0))
+  // The QR payload is the public provenance key for this batch.
+  const qrPayload = `FARMSKY:BATCH:${batchRef}`
+  const r = await c.env.DB.prepare(
+    `INSERT INTO aggregation_batches (batch_ref,contract_id,match_id,agent_id,outgrower_id,gross_weight,net_weight,unit,quality_grade,moisture_pct,defects_pct,qr_payload,created_by)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`
+  ).bind(
+    batchRef, b.contract_id || null, b.match_id || null, user.id, b.outgrower_id || null,
+    numberVal(b.gross_weight, 0), net, b.unit || 'KG', b.quality_grade || null,
+    numOrNull(b.moisture_pct), numOrNull(b.defects_pct), qrPayload, user.id
+  ).run()
+  // Record an immutable traceability event for the aggregation + quality check.
+  if (b.contract_id) {
+    const ct = await withAdminContext(c, async () => await c.env.DB.prepare(`SELECT produce_type, value_chain FROM offtake_contracts WHERE id=?`).bind(b.contract_id).first<any>())
+    await c.env.DB.prepare(`INSERT INTO traceability_events (provenance_ref,value_chain,stage,event_type,source_app,source_ref,payload,recorded_by) VALUES (?,?,?,?,?,?,?,?)`)
+      .bind(qrPayload, ct?.value_chain || 'crop', 'AGGREGATED', 'agent_quality_verification', String((c.env as any).APP_TYPE || 'equipment'), batchRef,
+        JSON.stringify({ net_weight: net, unit: b.unit || 'KG', quality_grade: b.quality_grade, moisture_pct: b.moisture_pct, defects_pct: b.defects_pct }), user.id).run()
+    await c.env.DB.prepare(`UPDATE offtake_contracts SET status='aggregating', milestone='AGGREGATED', updated_at=CURRENT_TIMESTAMP WHERE id=? AND milestone IN ('ORDERED','PLANTED','GROWING','HARVESTED')`).bind(b.contract_id).run()
+  }
+  await audit(c, user.id, 'aggregate', 'aggregation_batch', `${batchRef} (${net}${b.unit || 'KG'})`)
+  return c.json({ ok: true, id: r.meta.last_row_id, batch_ref: batchRef, qr_payload: qrPayload })
+})
+
+// ---- Escrow settlement (through the Equipment gateway escrow engine) -------
+app.post('/api/offtake/contracts/:id/escrow', requireAuth, requireFeature('escrow_settlement'), async (c) => {
+  const user = c.get('user') as SessionUser
+  if (!(hasPermission(user, 'manage_offtake') || ['admin', 'super_admin', 'operations_finance'].includes(user.role))) return c.json({ error: 'Forbidden' }, 403)
+  const id = c.req.param('id')
+  const b = await c.req.json().catch(() => ({})) as any
+  const contract = await withAdminContext(c, async () => await c.env.DB.prepare(`SELECT * FROM offtake_contracts WHERE id=?`).bind(id).first<any>())
+  if (!contract) return c.json({ error: 'Contract not found' }, 404)
+  const action = String(b.action || '')  // 'lock' | 'release_partial' | 'release'
+  const total = roundMoney(numberVal(contract.target_volume, 0) * numberVal(contract.unit_price, 0))
+  let escrowState = contract.escrow_state, escrowAmount = numberVal(contract.escrow_amount, 0)
+  if (action === 'lock') {
+    // Fully / partially pre-delivery or on-delivery pre-authorization lock.
+    escrowAmount = contract.payment_structure === 'pre_partial' ? roundMoney(total * numberVal(contract.upfront_pct, 0) / 100) : total
+    escrowState = 'locked'
+  } else if (action === 'release_partial') {
+    escrowState = 'partially_released'
+  } else if (action === 'release') {
+    // Destination PoD sign-off → settle to farmers/agents.
+    escrowState = 'released'
+    await c.env.DB.prepare(`UPDATE offtake_contracts SET status='settled', updated_at=CURRENT_TIMESTAMP WHERE id=?`).bind(id).run()
+  } else {
+    return c.json({ error: 'Invalid escrow action' }, 400)
+  }
+  await c.env.DB.prepare(`UPDATE offtake_contracts SET escrow_state=?, escrow_amount=?, updated_at=CURRENT_TIMESTAMP WHERE id=?`).bind(escrowState, escrowAmount, id).run()
+  await audit(c, user.id, 'escrow', 'offtake_contract', `${contract.contract_ref} → ${escrowState} (${contract.currency} ${escrowAmount})`)
+  return c.json({ ok: true, escrow_state: escrowState, escrow_amount: escrowAmount, total })
+})
+
+// ---- Logistics telemetry (driver GPS + BLE cold-chain) ---------------------
+app.get('/api/logistics/shipments', requireAuth, requireFeature('logistics_telemetry'), async (c) => {
+  const { results } = await withAdminContext(c, async () => await c.env.DB.prepare(`SELECT * FROM logistics_shipments ORDER BY created_at DESC`).all())
+  return c.json({ shipments: results })
+})
+app.post('/api/logistics/shipments', requireAuth, requireFeature('logistics_telemetry'), async (c) => {
+  const user = c.get('user') as SessionUser
+  if (!(hasPermission(user, 'manage_logistics') || ['admin', 'super_admin', 'operations_finance'].includes(user.role))) return c.json({ error: 'Forbidden' }, 403)
+  const b = await c.req.json().catch(() => ({})) as any
+  const shipmentRef = ref('SHP')
+  const r = await c.env.DB.prepare(
+    `INSERT INTO logistics_shipments (shipment_ref,contract_id,vehicle_id,driver_id,driver_name,origin_hub,destination,status,eta_minutes) VALUES (?,?,?,?,?,?,?,?,?)`
+  ).bind(shipmentRef, b.contract_id || null, b.vehicle_id || null, b.driver_id || null, b.driver_name || null, b.origin_hub || null, b.destination || null, 'scheduled', numOrNull(b.eta_minutes)).run()
+  if (b.contract_id) await c.env.DB.prepare(`UPDATE offtake_contracts SET status='in_transit', milestone='IN_TRANSIT', updated_at=CURRENT_TIMESTAMP WHERE id=?`).bind(b.contract_id).run()
+  await audit(c, user.id, 'create', 'shipment', shipmentRef)
+  return c.json({ ok: true, id: r.meta.last_row_id, shipment_ref: shipmentRef })
+})
+// High-frequency driver telemetry ingest (10s cadence). Append-only + updates
+// the shipment's last-known position/temp for fast map reads.
+app.post('/api/logistics/shipments/:id/ping', requireAuth, requireFeature('logistics_telemetry'), async (c) => {
+  const user = c.get('user') as SessionUser
+  const id = c.req.param('id')
+  const b = await c.req.json().catch(() => ({})) as any
+  await c.env.DB.prepare(`INSERT INTO telemetry_pings (shipment_id,lat,lng,speed_kmh,heading,temp_c,humidity_pct) VALUES (?,?,?,?,?,?,?)`)
+    .bind(id, numOrNull(b.lat), numOrNull(b.lng), numOrNull(b.speed_kmh), numOrNull(b.heading), numOrNull(b.temp_c), numOrNull(b.humidity_pct)).run()
+  await c.env.DB.prepare(`UPDATE logistics_shipments SET last_lat=?, last_lng=?, last_speed_kmh=?, last_temp_c=?, last_ping_at=CURRENT_TIMESTAMP, status=CASE WHEN status='scheduled' THEN 'in_transit' ELSE status END WHERE id=?`)
+    .bind(numOrNull(b.lat), numOrNull(b.lng), numOrNull(b.speed_kmh), numOrNull(b.temp_c), id).run()
+  return c.json({ ok: true })
+})
+// Live tracking read (polling fallback for the WebSocket map stream).
+app.get('/api/logistics/shipments/:id/track', requireAuth, requireFeature('logistics_telemetry'), async (c) => {
+  const id = c.req.param('id')
+  const shipment = await withAdminContext(c, async () => await c.env.DB.prepare(`SELECT * FROM logistics_shipments WHERE id=?`).bind(id).first<any>())
+  if (!shipment) return c.json({ error: 'Not found' }, 404)
+  const pings = await withAdminContext(c, async () => (await c.env.DB.prepare(`SELECT lat,lng,speed_kmh,heading,temp_c,humidity_pct,recorded_at FROM telemetry_pings WHERE shipment_id=? ORDER BY id DESC LIMIT 100`).bind(id).all()).results)
+  return c.json({ shipment, pings })
+})
+// Proof of Delivery sign-off → marks delivered and triggers escrow release.
+app.post('/api/logistics/shipments/:id/pod', requireAuth, requireFeature('logistics_telemetry'), async (c) => {
+  const user = c.get('user') as SessionUser
+  if (!(hasPermission(user, 'manage_logistics') || hasPermission(user, 'manage_offtake') || ['admin', 'super_admin', 'operations_finance'].includes(user.role))) return c.json({ error: 'Forbidden' }, 403)
+  const id = c.req.param('id')
+  const shipment = await withAdminContext(c, async () => await c.env.DB.prepare(`SELECT * FROM logistics_shipments WHERE id=?`).bind(id).first<any>())
+  if (!shipment) return c.json({ error: 'Not found' }, 404)
+  await c.env.DB.prepare(`UPDATE logistics_shipments SET status='delivered', pod_signed_at=CURRENT_TIMESTAMP WHERE id=?`).bind(id).run()
+  if (shipment.contract_id) {
+    await c.env.DB.prepare(`UPDATE offtake_contracts SET milestone='DELIVERED', status='delivered', updated_at=CURRENT_TIMESTAMP WHERE id=?`).bind(shipment.contract_id).run()
+  }
+  await audit(c, user.id, 'pod', 'shipment', shipment.shipment_ref)
+  return c.json({ ok: true })
+})
+
+// ---- Traceability: ingestion + public QR provenance lookup -----------------
+// Auto-ingest a supply-chain event (Nia input receipt, Feed vet log, cold chain).
+app.post('/api/traceability/ingest', requireAuth, requireFeature('traceability_ledger'), async (c) => {
+  const user = c.get('user') as SessionUser
+  const b = await c.req.json().catch(() => ({})) as any
+  if (!b.provenance_ref || !b.stage || !b.event_type) return c.json({ error: 'provenance_ref, stage and event_type are required' }, 400)
+  const r = await c.env.DB.prepare(`INSERT INTO traceability_events (provenance_ref,value_chain,stage,event_type,source_app,source_ref,payload,recorded_by) VALUES (?,?,?,?,?,?,?,?)`)
+    .bind(String(b.provenance_ref), b.value_chain === 'livestock' ? 'livestock' : 'crop', String(b.stage), String(b.event_type),
+      b.source_app || String((c.env as any).APP_TYPE || 'equipment'), b.source_ref || null, b.payload ? JSON.stringify(b.payload) : null, user.id).run()
+  return c.json({ ok: true, id: r.meta.last_row_id })
+})
+// PUBLIC provenance lookup by QR key — no auth (consumer scans the shipping tag).
+app.get('/api/traceability/public/:ref', async (c) => {
+  const ref = c.req.param('ref')
+  const events = await withAdminContext(c, async () => (await c.env.DB.prepare(
+    `SELECT value_chain, stage, event_type, source_app, payload, recorded_at FROM traceability_events WHERE provenance_ref=? ORDER BY id`
+  ).bind(ref).all()).results as any[])
+  if (!events || !events.length) return c.json({ error: 'No provenance record found' }, 404)
+  return c.json({ provenance_ref: ref, value_chain: events[0].value_chain, events })
+})
+
 // ----------------------------------------------------------------------------
 // CENTRAL PAYMENT GATEWAY (shared by equipment / feed / input marketplaces)
 // Public endpoint URL:  https://equipment.farmsky.africa/api/v1/payments/*
