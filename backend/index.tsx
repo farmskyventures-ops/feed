@@ -3068,6 +3068,99 @@ app.post('/api/payments/incoming', rateLimit('ipn', 120, 60_000), async (c) => {
   // (2)/(3) Instant acknowledgment — closes the connection immediately.
   return c.json({ ok: true })
 })
+
+// ============================================================================
+// UNIFIED MULTI-ITEM BUNDLE PAYMENT & RECONCILIATION
+//
+// FIX: multi-item bundle checkouts / ledger reconciliation must settle the
+// AGGREGATED total across ALL bundled items — not just the first item
+// (items[0].cost). A single invoice computes:
+//   Total = Σ (ItemCost_i × Quantity_i) + Markups + Taxes
+// and is processed as ONE transaction (one STK push) across checkout, the
+// payment gateway and reconciliation. On confirmation the single received
+// amount is distributed (FIFO) across every contract in the bundle.
+// ============================================================================
+// Aggregate the outstanding (invoice) total for a bundle. `murabaha_price`
+// already embeds each item's (cost × qty) + markup; outstanding is the unpaid
+// portion. Summing across ALL rows yields the single consolidated invoice.
+async function bundleContracts(c: any, bundleRef: string) {
+  const { results } = await c.env.DB.prepare(
+    `SELECT * FROM murabaha_contracts WHERE bundle_ref=? ORDER BY id`
+  ).bind(bundleRef).all<any>()
+  return (results || []) as any[]
+}
+function bundleOutstandingTotal(rows: any[]): number {
+  return roundMoney(rows.reduce((s, r) => s + numberVal(r.outstanding, 0), 0))
+}
+// Build/initiate ONE STK push for the whole bundle's aggregated outstanding.
+app.post('/api/mpesa/bundle-stkpush', requireAuth, async (c) => {
+  const { bundle_ref, phone, amount } = await c.req.json().catch(() => ({})) as any
+  if (!bundle_ref) return c.json({ error: 'bundle_ref is required' }, 400)
+  const rows = await bundleContracts(c, String(bundle_ref))
+  if (!rows.length) return c.json({ error: 'Bundle not found' }, 404)
+  // Single consolidated invoice amount = Σ outstanding across every item.
+  const aggregated = bundleOutstandingTotal(rows)
+  // Caller may pay the full aggregated invoice (default) or a partial amount
+  // (e.g. a configured upfront deposit) — but never more than the invoice.
+  const amt = amount != null ? Number(amount) : aggregated
+  if (!(amt > 0)) return c.json({ error: 'Nothing outstanding on this bundle' }, 400)
+  if (amt > aggregated + 0.01) return c.json({ error: 'Amount exceeds the bundle invoice total' }, 400)
+  const first = rows[0]
+  const desc = `Farmsky Bundle ${bundle_ref} (${rows.length} item${rows.length > 1 ? 's' : ''})`
+  const result = await stkPush(c.env, { phone: phone || c.get('user').phone, amount: amt, account: String(bundle_ref), description: desc })
+  if (!result.success) return c.json({ error: result.error || 'STK push failed' }, 502)
+  // ONE intent correlates to the WHOLE bundle (is_bundle=1, bundle_ref set).
+  await c.env.DB.prepare(`INSERT INTO payment_intents (checkout_request_id,merchant_request_id,contract_id,customer_id,amount,phone,method,status,bundle_ref,is_bundle) VALUES (?,?,?,?,?,?,?, 'pending', ?, 1)`)
+    .bind(result.checkout_request_id, result.merchant_request_id, first.id, first.customer_id, amt, normalizePhone(phone || c.get('user').phone), 'mpesa', String(bundle_ref)).run()
+  await audit(c, c.get('user').id, 'stk_push_bundle', 'mpesa', `KES ${amt} to bundle ${bundle_ref} (${rows.length} items, ${result.simulated ? 'sim' : 'live'})`)
+  return c.json({ ok: true, simulated: result.simulated, checkout_request_id: result.checkout_request_id, customer_message: result.customer_message, bundle_total: aggregated, charged: amt, item_count: rows.length })
+})
+// Distribute ONE received bundle payment across its constituent contracts (FIFO
+// by outstanding) so the ledger reconciles against a single transaction.
+async function settleBundlePayment(c: any, bundleRef: string, amount: number, receipt: string, method: string, phone: string) {
+  const rows = await bundleContracts(c, bundleRef)
+  let remaining = roundMoney(Number(amount))
+  const applied: any[] = []
+  for (const r of rows) {
+    if (remaining <= 0) break
+    const out = numberVal(r.outstanding, 0)
+    if (out <= 0) continue
+    const pay = roundMoney(Math.min(out, remaining))
+    const res = await applyPayment(c, r, pay, receipt, method, phone)
+    // Tag the per-item transaction with the bundle_ref for reconciliation.
+    await c.env.DB.prepare(`UPDATE transactions SET bundle_ref=? WHERE mpesa_receipt=? AND contract_id=?`).bind(bundleRef, receipt, r.id).run().catch?.(() => {})
+    applied.push({ contract_id: r.id, contract_ref: r.contract_ref, applied: pay, outstanding: res?.outstanding })
+    remaining = roundMoney(remaining - pay)
+  }
+  return { applied, unallocated: remaining }
+}
+app.post('/api/mpesa/bundle-confirm', requireAuth, async (c) => {
+  const { checkout_request_id } = await c.req.json().catch(() => ({})) as any
+  const intent = await c.env.DB.prepare(`SELECT * FROM payment_intents WHERE checkout_request_id=?`).bind(checkout_request_id).first<any>()
+  if (!intent) return c.json({ error: 'Payment intent not found' }, 404)
+  if (!intent.bundle_ref) return c.json({ error: 'Not a bundle intent' }, 400)
+  if (intent.status === 'success') return c.json({ ok: true, status: 'success', mpesa_receipt: intent.mpesa_receipt })
+  let success = false, receipt = ''
+  if (!mpesaConfigured(c.env) || String(checkout_request_id).includes('SIM')) {
+    success = true; receipt = 'SLE' + Math.random().toString(36).slice(2, 9).toUpperCase()
+  } else {
+    const q = await stkQuery(c.env, checkout_request_id)
+    const rc = q?.ResultCode
+    const isSuccess = rc === '0' || rc === 0
+    const descRaw = String(q?.ResultDesc || q?.errorMessage || q?.CustomerMessage || '')
+    const looksPending = /process|being processed|under processing|pending|not.*found|try again|wait/i.test(descRaw)
+    if (isSuccess) { success = true; receipt = 'LIVE' + Date.now().toString().slice(-7) }
+    else if (rc !== undefined && rc !== null && rc !== '' && !looksPending) return c.json({ ok: false, status: 'failed', result_desc: descRaw || 'Payment was not completed.' })
+    else return c.json({ ok: false, status: 'pending' })
+  }
+  if (success) {
+    const dist = await settleBundlePayment(c, String(intent.bundle_ref), numberVal(intent.amount, 0), receipt, 'mpesa', intent.phone)
+    await c.env.DB.prepare(`UPDATE payment_intents SET status='success', mpesa_receipt=? WHERE checkout_request_id=?`).bind(receipt, checkout_request_id).run()
+    return c.json({ ok: true, status: 'success', mpesa_receipt: receipt, bundle_ref: intent.bundle_ref, distributed: dist.applied, unallocated: dist.unallocated })
+  }
+  return c.json({ ok: false, status: 'pending' })
+})
+
 app.post('/api/mpesa/callback', async (c) => {
   try {
     const body: any = await c.req.json()
@@ -3080,8 +3173,12 @@ app.post('/api/mpesa/callback', async (c) => {
         const items = cb.CallbackMetadata?.Item || []
         const receiptItem = items.find((i: any) => i.Name === 'MpesaReceiptNumber')
         const receipt = receiptItem?.Value || 'LIVE' + Date.now()
-        const contract = await c.env.DB.prepare(`SELECT * FROM murabaha_contracts WHERE id=?`).bind(intent.contract_id).first<any>()
-        if (contract) await applyPayment(c, contract, intent.amount, String(receipt), 'mpesa', intent.phone)
+        if (intent.bundle_ref) {
+          await settleBundlePayment(c, String(intent.bundle_ref), numberVal(intent.amount, 0), String(receipt), 'mpesa', intent.phone)
+        } else {
+          const contract = await c.env.DB.prepare(`SELECT * FROM murabaha_contracts WHERE id=?`).bind(intent.contract_id).first<any>()
+          if (contract) await applyPayment(c, contract, intent.amount, String(receipt), 'mpesa', intent.phone)
+        }
         await c.env.DB.prepare(`UPDATE payment_intents SET status='success', mpesa_receipt=?, result_desc=? WHERE checkout_request_id=?`).bind(String(receipt), cb.ResultDesc || '', checkout).run()
       } else {
         await c.env.DB.prepare(`UPDATE payment_intents SET status='failed', result_desc=? WHERE checkout_request_id=?`).bind(cb.ResultDesc || 'Failed', checkout).run()
@@ -3968,11 +4065,51 @@ app.put('/api/registry/users/:id/roles', requireAuth, requireFeature('master_use
   return c.json({ ok: true })
 })
 
+// Resolve an ACTIVE offtaker for a contract. An offtake contract must belong to
+// an onboarded Offtaker. Resolution order:
+//   1. explicit offtaker_id (must be an active user in the Offtaker category)
+//   2. the caller themselves, if they are in the Offtaker category
+//   3. auto-match: the single active Offtaker-category user (when unambiguous)
+// Users are "in the Offtaker category" if role='offtaker' OR is_offtaker=1.
+function isOfftakerUser(u: any): boolean {
+  return !!u && u.status !== 'inactive' && u.status !== 'suspended' && (String(u.role) === 'offtaker' || Number(u.is_offtaker) === 1)
+}
+async function resolveOfftaker(c: any, explicitId: any, caller: SessionUser): Promise<{ id: number } | { error: string }> {
+  const db = c.env.DB
+  if (explicitId != null && String(explicitId) !== '') {
+    const u = await withAdminContext(c, async () => await db.prepare(`SELECT id, role, is_offtaker, status FROM users WHERE id=?`).bind(explicitId).first<any>())
+    if (!u) return { error: 'Selected offtaker not found' }
+    if (!isOfftakerUser(u)) return { error: 'Selected user is not an active Offtaker' }
+    return { id: Number(u.id) }
+  }
+  // Caller is themselves an offtaker → contract belongs to them.
+  const me = await withAdminContext(c, async () => await db.prepare(`SELECT id, role, is_offtaker, status FROM users WHERE id=?`).bind(caller.id).first<any>())
+  if (isOfftakerUser(me)) return { id: Number(caller.id) }
+  // Auto-match among active Offtaker-category users (Ag-SME module). Unambiguous
+  // only when exactly one exists; otherwise the admin must pick explicitly.
+  const { results } = await withAdminContext(c, async () => await db.prepare(
+    `SELECT id FROM users WHERE (role='offtaker' OR is_offtaker=1) AND COALESCE(status,'active') NOT IN ('inactive','suspended') ORDER BY id`
+  ).all<any>())
+  const list = (results || []) as any[]
+  if (list.length === 1) return { id: Number(list[0].id) }
+  if (list.length === 0) return { error: 'No active Offtaker is onboarded. Create an Offtaker account (or assign the Offtaker category) first.' }
+  return { error: 'Multiple Offtakers exist — specify offtaker_id to match this contract to one.' }
+}
+
+// ---- Offtake contracts (spot Buy / forward Contract) -----------------------
+// List assignable, active Offtakers (for the match/create UI).
+app.get('/api/offtake/offtakers', requireAuth, requireFeature('offtake_contracting'), async (c) => {
+  const { results } = await withAdminContext(c, async () => await c.env.DB.prepare(
+    `SELECT id, full_name, phone, role, is_offtaker FROM users WHERE (role='offtaker' OR is_offtaker=1) AND COALESCE(status,'active') NOT IN ('inactive','suspended') ORDER BY full_name`
+  ).all<any>())
+  return c.json({ offtakers: results || [] })
+})
+
 // ---- Offtake contracts (spot Buy / forward Contract) -----------------------
 app.get('/api/offtake/contracts', requireAuth, requireFeature('offtake_contracting'), async (c) => {
   const user = c.get('user') as SessionUser
   // Offtakers see their own; staff with manage_offtake/match_outgrowers see all.
-  const isStaff = ['admin', 'super_admin', 'operations_finance'].includes(user.role) || hasPermission(user, 'manage_offtake') || hasPermission(user, 'match_outgrowers')
+  const isStaff = ['admin', 'super_admin', 'operations_finance'].includes(user.role) || hasPermission(user, 'match_outgrowers')
   let q = `SELECT * FROM offtake_contracts`
   const binds: any[] = []
   if (!isStaff) { q += ` WHERE offtaker_id=? OR created_by=?`; binds.push(user.id, user.id) }
@@ -3990,12 +4127,15 @@ app.post('/api/offtake/contracts', requireAuth, requireFeature('offtake_contract
   if (!(unitPrice > 0)) return c.json({ error: 'Unit price must be greater than zero' }, 400)
   const mode = b.procurement_mode === 'spot' ? 'spot' : 'forward'
   const pay = ['pre_full', 'pre_partial', 'on_delivery'].includes(String(b.payment_structure)) ? String(b.payment_structure) : 'on_delivery'
+  const offRes = await resolveOfftaker(c, b.offtaker_id, user)
+  if ('error' in offRes) return c.json({ error: offRes.error }, 400)
+  const offtakerId = offRes.id
   const contractRef = ref('OFT')
   const r = await c.env.DB.prepare(
     `INSERT INTO offtake_contracts (contract_ref,offtaker_id,product_id,produce_type,value_chain,procurement_mode,target_volume,volume_unit,variance_pct,delivery_start,delivery_end,unit_price,currency,currency_locked,quality_specs,premium_penalty,payment_structure,upfront_pct,status,milestone,created_by)
      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
   ).bind(
-    contractRef, b.offtaker_id || user.id, b.product_id || null, String(b.produce_type), b.value_chain === 'livestock' ? 'livestock' : 'crop',
+    contractRef, offtakerId, b.product_id || null, String(b.produce_type), b.value_chain === 'livestock' ? 'livestock' : 'crop',
     mode, volume, ['KG', 'MT'].includes(String(b.volume_unit)) ? String(b.volume_unit) : 'KG', numberVal(b.variance_pct, 5),
     b.delivery_start || null, b.delivery_end || null, unitPrice, ['KES', 'USD'].includes(String(b.currency)) ? String(b.currency) : 'KES',
     b.currency_locked === false ? 0 : 1, b.quality_specs ? JSON.stringify(b.quality_specs) : null, b.premium_penalty ? JSON.stringify(b.premium_penalty) : null,
@@ -4165,7 +4305,17 @@ app.post('/api/offtake/contracts/:id/escrow', requireAuth, requireFeature('escro
 
 // ---- Logistics telemetry (driver GPS + BLE cold-chain) ---------------------
 app.get('/api/logistics/shipments', requireAuth, requireFeature('logistics_telemetry'), async (c) => {
-  const { results } = await withAdminContext(c, async () => await c.env.DB.prepare(`SELECT * FROM logistics_shipments ORDER BY created_at DESC`).all())
+  const user = c.get('user') as SessionUser
+  const systemwide = ['admin', 'super_admin', 'operations_finance'].includes(user.role) || hasPermission(user, 'manage_logistics')
+  let q = `SELECT ls.* FROM logistics_shipments ls`
+  const binds: any[] = []
+  if (!systemwide) {
+    q += ` LEFT JOIN offtake_contracts oc ON oc.id = ls.contract_id
+           WHERE ls.driver_id = ? OR oc.offtaker_id = ? OR oc.created_by = ?`
+    binds.push(user.id, user.id, user.id)
+  }
+  q += ` ORDER BY ls.created_at DESC`
+  const { results } = await withAdminContext(c, async () => await c.env.DB.prepare(q).bind(...binds).all())
   return c.json({ shipments: results })
 })
 app.post('/api/logistics/shipments', requireAuth, requireFeature('logistics_telemetry'), async (c) => {
@@ -5038,6 +5188,13 @@ app.post('/api/users', requireAuth, requireRole('admin', 'super_admin'), async (
     ? await c.env.DB.prepare(`INSERT INTO users (full_name, phone, email, password, role, label, permissions, status, region, password_set, schedule_enabled, access_days, access_start, access_end, created_by, org_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).bind(b.full_name, p, email, await hashPassword(pwd), b.role, label, JSON.stringify(perms), b.status || 'active', b.region || null, provided, schedEnabled, schedDays, b.access_start || null, b.access_end || null, creatorId, usrOrgId).run()
     : await c.env.DB.prepare(`INSERT INTO users (full_name, phone, email, password, role, label, permissions, status, region, password_set, schedule_enabled, access_days, access_start, access_end, created_by) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).bind(b.full_name, p, email, await hashPassword(pwd), b.role, label, JSON.stringify(perms), b.status || 'active', b.region || null, provided, schedEnabled, schedDays, b.access_start || null, b.access_end || null, creatorId).run()
   if (b.role === 'agent') await c.env.DB.prepare(`INSERT INTO agents (user_id,region,permissions) VALUES (?,?,?)`).bind(r.meta.last_row_id, b.region || null, JSON.stringify(perms)).run()
+  if (b.role === 'offtaker' || boolInt(b.is_offtaker, false)) {
+    await c.env.DB.prepare(`UPDATE users SET is_offtaker=1 WHERE id=?`).bind(r.meta.last_row_id).run()
+  }
+  if (boolInt(b.is_offtaker, false) && b.role !== 'offtaker') {
+    const merged = { ...perms, manage_offtake: true, spot_buy: true, view_traceability: true }
+    await c.env.DB.prepare(`UPDATE users SET permissions=? WHERE id=?`).bind(JSON.stringify(merged), r.meta.last_row_id).run()
+  }
   // Merchant inventory source flag — only honoured when can_manage_inventory is set.
   const isMerchantInv = (boolInt(b.inventory_is_merchant, false) && !!perms.can_manage_inventory) ? 1 : 0
   await c.env.DB.prepare(`UPDATE users SET inventory_is_merchant=? WHERE id=?`).bind(isMerchantInv, r.meta.last_row_id).run()

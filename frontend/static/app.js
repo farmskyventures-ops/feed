@@ -149,7 +149,7 @@ let _p2p = { step: 1, recipient: null, amount: 0, reason: '' }
 function getRoleTemplate(role) {
   return (_permMeta.roles || []).find((r) => r.role_key === role)
 }
-const roleLabel = (r) => getRoleTemplate(r)?.label || ({ super_admin: 'Super Admin', admin: 'Admin', operations_finance: 'Operations & Finance', agent: 'Agent', customer: 'Farmer', support: 'Support', lender: 'Lender', investor: 'Investor', mne: 'M & E', partner: 'Partner' }[r] || r)
+const roleLabel = (r) => getRoleTemplate(r)?.label || ({ super_admin: 'Super Admin', admin: 'Admin', operations_finance: 'Operations & Finance', agent: 'Agent', offtaker: 'Offtaker (Produce Buyer)', customer: 'Farmer', support: 'Support', lender: 'Lender', investor: 'Investor', mne: 'M & E', partner: 'Partner' }[r] || r)
 const permsText = (perms) => Object.entries(perms || {}).filter(([, v]) => v).map(([k]) => k.replace(/_/g, ' ')).join(', ')
 async function ensurePermissionMeta() {
   if (!_permMeta.permissions.length && state.user) {
@@ -5475,7 +5475,7 @@ window.doEditAgent = async (id) => {
 function userRoleOptions(selected) {
   const roles = (_permMeta.roles || []).length
     ? (_permMeta.roles || []).map((r) => ({ key: r.role_key, label: r.label }))
-    : ['super_admin', 'admin', 'operations_finance', 'agent', 'lender', 'investor', 'mne', 'partner', 'customer', 'support'].map((r) => ({ key: r, label: roleLabel(r) }))
+    : ['super_admin', 'admin', 'operations_finance', 'agent', 'offtaker', 'lender', 'investor', 'mne', 'partner', 'customer', 'support'].map((r) => ({ key: r, label: roleLabel(r) }))
   return roles.map((r) => `<option value="${r.key}" ${selected === r.key ? 'selected' : ''}>${esc(r.label)}</option>`).join('')
 }
 const TICKET_STATUS_BADGE = { open: 'bg-sky-100 text-sky-700', in_progress: 'bg-amber-100 text-amber-700', escalated: 'bg-red-100 text-red-700', resolved: 'bg-emerald-100 text-emerald-700', closed: 'bg-slate-100 text-slate-500' }
