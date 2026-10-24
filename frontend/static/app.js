@@ -2177,7 +2177,7 @@ window.orderDetail = async (ref) => {
   try { data = (await api.get('/murabaha/order/' + encodeURIComponent(ref))).data }
   catch (err) { return toast(err.response?.data?.error || 'Could not load order', false) }
   const o = data.order
-  window._currentOrder = { order: o, repayments: data.repayments || [], transactions: data.transactions || [] }
+  window._currentOrder = { order: o, repayments: data.repayments || [], transactions: data.transactions || [], invoice_config: data.invoice_config || {} }
   // A single-item order just opens the existing contract detail for full actions.
   if (!o.is_bundle && o.contract_id) return contractDetail(o.contract_id)
 
@@ -2255,9 +2255,13 @@ window.settleOrder = (ref) => {
 }
 window.reconcileOrder = (ref, amount) => {
   const oc = window._currentOrder; if (!oc) return
-  // Reconcile the FIRST cash item carrying a balance (bank settlements are per
-  // reference); the receipt then reflects the whole order via Order Receipt.
-  const it = (oc.order.items || []).find(x => Number(x.outstanding) > 0.5)
+  const o = oc.order
+  if (o.is_bundle && o.bundle_ref) {
+    const outstanding = Number(o.outstanding || amount || 0)
+    if (outstanding <= 0.5) return toast('Nothing to reconcile.', false)
+    return reconcileModal(null, outstanding, null, o.bundle_ref)
+  }
+  const it = (o.items || []).find(x => Number(x.outstanding) > 0.5)
   if (!it) return toast('Nothing to reconcile.', false)
   reconcileModal(it.id, Number(it.outstanding))
 }
@@ -2273,60 +2277,113 @@ window.dispatchOrder = async (ref) => {
 // Whole-order INVOICE — one branded invoice listing every line item.
 window.orderInvoice = (ref) => {
   const oc = window._currentOrder; if (!oc) return
-  openPrintWindow('Invoice ' + ref, orderInvoiceHtml(oc.order))
+  openPrintWindow('Invoice ' + ref, orderInvoiceHtml(oc.order, oc.invoice_config))
 }
 window.orderReceipt = (ref) => {
   const oc = window._currentOrder; if (!oc) return
-  openPrintWindow('Receipt ' + ref, orderReceiptHtml(oc.order, oc.transactions))
+  openPrintWindow('Receipt ' + ref, orderReceiptHtml(oc.order, oc.transactions, oc.invoice_config))
 }
-function orderInvoiceHtml(o) {
-  const rows = (o.items || []).map(it => `<tr>
-      <td style="padding:8px;border:1px solid #cbd5e1;">${esc(it.product_name)}${it.contract_ref ? ` <span style="color:#94a3b8;font-family:monospace;">(${esc(it.contract_ref)})</span>` : ''}</td>
-      <td style="text-align:center;padding:8px;border:1px solid #cbd5e1;">${esc(String(it.quantity || 1))} ${esc(it.product_unit || '')}</td>
-      <td style="text-align:center;padding:8px;border:1px solid #cbd5e1;text-transform:capitalize;">${esc(it.payment_type || '')}</td>
-      <td style="text-align:right;padding:8px;border:1px solid #cbd5e1;">${docMoney(it.murabaha_price)}</td>
-    </tr>`).join('')
-  const statusColor = o.outstanding <= 0.5 ? '#059669' : o.amount_paid > 0 ? '#d97706' : '#dc2626'
-  const statusLabel = o.outstanding <= 0.5 ? 'PAID' : o.amount_paid > 0 ? 'PARTIAL' : 'UNPAID'
+// Canonical invoice/receipt summary. Prefers the server-computed `order.summary`
+// (subtotal → tax → grand total → amount paid → amount due); falls back to a
+// local computation using the supplied invoice config if absent.
+function docSummary(o, cfg) {
+  if (o && o.summary) return o.summary
+  const lineSum = (o.items || []).reduce((s, it) => s + Number(it.line_total ?? it.murabaha_price ?? 0), 0)
+  const showTax = !!(cfg && cfg.show_tax)
+  const taxRate = showTax ? Number(cfg.tax_rate || 0) : 0
+  const inclusive = !cfg || cfg.tax_inclusive !== false
+  let subtotal, taxAmount, grand
+  if (taxRate > 0 && inclusive) {
+    grand = lineSum
+    subtotal = Math.round((lineSum / (1 + taxRate / 100)) * 100) / 100
+    taxAmount = Math.round((grand - subtotal) * 100) / 100
+  } else {
+    subtotal = lineSum
+    taxAmount = Math.round(subtotal * (taxRate / 100) * 100) / 100
+    grand = Math.round((subtotal + taxAmount) * 100) / 100
+  }
+  const paid = Number(o.amount_paid || 0)
+  return { subtotal, tax_rate: taxRate, tax_label: (cfg && cfg.tax_label) || 'VAT', show_tax: showTax, tax_inclusive: inclusive, tax_amount: taxAmount, grand_total: grand, amount_paid: paid, amount_due: Math.max(0, grand - paid) }
+}
+// Itemized table per spec: Item Description | Unit | Price | Quantity | Total Amount.
+function docItemsTable(o) {
+  const rows = (o.items || []).map(it => {
+    const qty = Number(it.quantity || 1) || 1
+    const unitPrice = it.unit_price != null ? Number(it.unit_price) : (Number(it.line_total ?? it.murabaha_price ?? 0) / qty)
+    const lineTotal = Number(it.line_total ?? it.murabaha_price ?? 0)
+    return `<tr>
+      <td style="padding:8px;border:1px solid #cbd5e1;">${esc(it.item_description || it.product_name || '')}${it.contract_ref ? ` <span style="color:#94a3b8;font-family:monospace;font-size:8.5pt;">(${esc(it.contract_ref)})</span>` : ''}</td>
+      <td style="text-align:center;padding:8px;border:1px solid #cbd5e1;">${esc(it.unit || it.product_unit || '—')}</td>
+      <td style="text-align:right;padding:8px;border:1px solid #cbd5e1;">${docMoney(unitPrice)}</td>
+      <td style="text-align:center;padding:8px;border:1px solid #cbd5e1;">${esc(String(it.quantity || 1))}</td>
+      <td style="text-align:right;padding:8px;border:1px solid #cbd5e1;">${docMoney(lineTotal)}</td>
+    </tr>`
+  }).join('')
+  return `<table style="width:100%;border-collapse:collapse;margin:12px 0;font-size:10pt;">
+      <thead><tr style="background:#f1f5f9;">
+        <th style="text-align:left;padding:8px;border:1px solid #cbd5e1;">Item Description</th>
+        <th style="text-align:center;padding:8px;border:1px solid #cbd5e1;">Unit</th>
+        <th style="text-align:right;padding:8px;border:1px solid #cbd5e1;">Price</th>
+        <th style="text-align:center;padding:8px;border:1px solid #cbd5e1;">Quantity</th>
+        <th style="text-align:right;padding:8px;border:1px solid #cbd5e1;">Total Amount</th>
+      </tr></thead><tbody>${rows}</tbody></table>`
+}
+// Summary footer in the mandated order: Subtotal → Taxes → Grand Total →
+// Amount Paid → Amount Due.
+function docSummaryFooter(s) {
+  const taxLine = s.show_tax
+    ? `<div style="display:flex;justify-content:space-between;padding:4px 0;"><span style="color:#64748b;">${esc(s.tax_label || 'Tax')} (${Number(s.tax_rate || 0)}%)</span><b>${docMoney(s.tax_amount)}</b></div>`
+    : ''
+  return `<div style="margin-left:auto;width:300px;font-size:10pt;">
+      <div style="display:flex;justify-content:space-between;padding:4px 0;"><span style="color:#64748b;">Subtotal</span><b>${docMoney(s.subtotal)}</b></div>
+      ${taxLine}
+      <div style="display:flex;justify-content:space-between;padding:6px 0;border-top:1px solid #cbd5e1;margin-top:2px;"><span style="font-weight:700;">Grand Total</span><b>${docMoney(s.grand_total)}</b></div>
+      <div style="display:flex;justify-content:space-between;padding:4px 0;"><span style="color:#64748b;">Amount Paid</span><b style="color:#059669;">${docMoney(s.amount_paid)}</b></div>
+      <div style="display:flex;justify-content:space-between;padding:8px 0;border-top:2px solid #0f766e;margin-top:2px;"><span style="font-weight:700;">Amount Due</span><b style="color:${s.amount_due > 0.5 ? '#d97706' : '#059669'};">${docMoney(s.amount_due)}</b></div>
+    </div>`
+}
+function orderInvoiceHtml(o, cfg) {
+  const s = docSummary(o, cfg)
+  const statusColor = s.amount_due <= 0.5 ? '#059669' : s.amount_paid > 0 ? '#d97706' : '#dc2626'
+  const statusLabel = s.amount_due <= 0.5 ? 'PAID' : s.amount_paid > 0 ? 'PARTIAL' : 'UNPAID'
+  const pay = (cfg && cfg.payment_details) ? String(cfg.payment_details) : ''
+  const payBlock = pay ? `<div style="margin-top:14px;padding:10px 12px;border:1px solid #cbd5e1;border-radius:6px;background:#f8fafc;">
+      <div style="font-size:9pt;color:#64748b;text-transform:uppercase;font-weight:700;margin-bottom:4px;">Payment Details</div>
+      <div style="font-size:9.5pt;color:#334155;white-space:pre-wrap;">${esc(pay)}</div></div>` : ''
   return `<div style="font-family:Arial,Helvetica,sans-serif;color:#0f172a;">
     ${brandDocHeader('Tax Invoice — Order')}
     <div style="display:flex;justify-content:space-between;flex-wrap:wrap;gap:8px;margin-bottom:12px;">
       <div><div style="font-size:9pt;color:#64748b;text-transform:uppercase;">Billed to</div>
         <div style="font-weight:700;">${esc(o.customer_name || '—')}</div>
         <div style="font-size:9pt;color:#64748b;">${o.customer_mobile ? esc(o.customer_mobile) : ''}</div></div>
-      <div style="text-align:right;"><div style="font-size:9pt;color:#64748b;text-transform:uppercase;">Order Ref</div>
+      <div style="text-align:right;"><div style="font-size:9pt;color:#64748b;text-transform:uppercase;">Invoice No.</div>
         <div style="font-weight:700;font-family:monospace;">${esc(o.order_ref)}</div>
         <div style="font-size:9pt;color:#64748b;">Issued ${docDate(o.created_at)}</div>
         <div style="display:inline-block;margin-top:4px;padding:2px 10px;border-radius:999px;color:#fff;font-size:9pt;font-weight:700;background:${statusColor};">${statusLabel}</div></div>
     </div>
-    <table style="width:100%;border-collapse:collapse;margin:12px 0;font-size:10pt;">
-      <thead><tr style="background:#f1f5f9;">
-        <th style="text-align:left;padding:8px;border:1px solid #cbd5e1;">Item</th>
-        <th style="text-align:center;padding:8px;border:1px solid #cbd5e1;">Qty</th>
-        <th style="text-align:center;padding:8px;border:1px solid #cbd5e1;">Type</th>
-        <th style="text-align:right;padding:8px;border:1px solid #cbd5e1;">Amount</th>
-      </tr></thead><tbody>${rows}</tbody></table>
-    <div style="margin-left:auto;width:260px;font-size:10pt;">
-      <div style="display:flex;justify-content:space-between;padding:4px 0;"><span style="color:#64748b;">Order total</span><b>${docMoney(o.total_payable)}</b></div>
-      <div style="display:flex;justify-content:space-between;padding:4px 0;"><span style="color:#64748b;">Paid</span><b style="color:#059669;">${docMoney(o.amount_paid)}</b></div>
-      <div style="display:flex;justify-content:space-between;padding:8px 0;border-top:2px solid #0f766e;margin-top:4px;"><span style="font-weight:700;">Balance Due</span><b style="color:${o.outstanding > 0.5 ? '#d97706' : '#059669'};">${docMoney(o.outstanding)}</b></div>
-    </div>
+    ${docItemsTable(o)}
+    ${docSummaryFooter(s)}
+    ${payBlock}
     <div style="text-align:center;font-size:8.5pt;color:#94a3b8;margin-top:12px;">Consolidated invoice for all ${o.item_count} item(s) in this order · Farmsky Ventures.</div>
   </div>`
 }
-function orderReceiptHtml(o, transactions) {
+function orderReceiptHtml(o, transactions, cfg) {
   const pays = (transactions || []).filter(t => Number(t.amount) > 0)
   const header = brandDocHeader('Payment Receipt — Order')
   if (!pays.length) return `<div style="font-family:Arial,Helvetica,sans-serif;">${header}<div style="text-align:center;color:#64748b;padding:24px;">No payments have been recorded for this order yet.</div></div>`
+  const s = docSummary(o, cfg)
   return `<div style="font-family:Arial,Helvetica,sans-serif;color:#0f172a;">
     ${header}
     <div style="display:flex;justify-content:space-between;flex-wrap:wrap;gap:8px;margin-bottom:12px;">
       <div><div style="font-size:9pt;color:#64748b;text-transform:uppercase;">Received from</div>
         <div style="font-weight:700;">${esc(o.customer_name || '—')}</div>
-        <div style="font-size:9pt;color:#64748b;">Order ${esc(o.order_ref)} · ${o.item_count} item(s)</div></div>
-      <div style="text-align:right;"><div style="display:inline-block;padding:2px 10px;border-radius:999px;color:#fff;font-size:9pt;font-weight:700;background:${o.outstanding <= 0.5 ? '#059669' : '#d97706'};">${o.outstanding <= 0.5 ? 'PAID IN FULL' : 'PARTIALLY PAID'}</div></div>
+        <div style="font-size:9pt;color:#64748b;">Receipt No. ${esc(o.order_ref)} · ${o.item_count} item(s)</div>
+        <div style="font-size:9pt;color:#64748b;">Issued ${docDate(o.created_at)}</div></div>
+      <div style="text-align:right;"><div style="display:inline-block;padding:2px 10px;border-radius:999px;color:#fff;font-size:9pt;font-weight:700;background:${s.amount_due <= 0.5 ? '#059669' : '#d97706'};">${s.amount_due <= 0.5 ? 'PAID IN FULL' : 'PARTIALLY PAID'}</div></div>
     </div>
-    <table style="width:100%;border-collapse:collapse;margin:12px 0;font-size:9.5pt;">
+    ${docItemsTable(o)}
+    <h4 style="font-size:9.5pt;color:#334155;margin:14px 0 4px;">Payments received</h4>
+    <table style="width:100%;border-collapse:collapse;margin:4px 0 12px;font-size:9.5pt;">
       <thead><tr style="background:#f1f5f9;">
         <th style="text-align:left;padding:7px;border:1px solid #cbd5e1;">Date</th>
         <th style="text-align:left;padding:7px;border:1px solid #cbd5e1;">Item</th>
@@ -2341,11 +2398,7 @@ function orderReceiptHtml(o, transactions) {
         <td style="padding:7px;border:1px solid #cbd5e1;text-transform:capitalize;">${esc(String(p.method || p.channel || '').replace(/_/g, ' '))}</td>
         <td style="text-align:right;padding:7px;border:1px solid #cbd5e1;color:#059669;font-weight:600;">${docMoney(p.amount)}</td>
       </tr>`).join('')}</tbody></table>
-    <div style="margin-left:auto;width:280px;font-size:10pt;">
-      <div style="display:flex;justify-content:space-between;padding:4px 0;"><span style="color:#64748b;">Order total</span><b>${docMoney(o.total_payable)}</b></div>
-      <div style="display:flex;justify-content:space-between;padding:4px 0;"><span style="color:#64748b;">Total paid</span><b style="color:#059669;">${docMoney(o.amount_paid)}</b></div>
-      <div style="display:flex;justify-content:space-between;padding:8px 0;border-top:2px solid #0f766e;margin-top:4px;"><span style="font-weight:700;">Balance remaining</span><b style="color:${o.outstanding > 0.5 ? '#d97706' : '#059669'};">${docMoney(o.outstanding)}</b></div>
-    </div>
+    ${docSummaryFooter(s)}
     <div style="text-align:center;font-size:8.5pt;color:#94a3b8;margin-top:12px;">Consolidated receipt for order ${esc(o.order_ref)} · Farmsky Ventures. Thank you for your business.</div>
   </div>`
 }
@@ -3338,19 +3391,20 @@ window.downloadAgreementPdf = () => { const dc = window._docCenter; if (dc.agree
 // ---------------------------------------------------------------------------
 // SALES MANUAL RECONCILIATION — settle a balance paid directly to the bank.
 // ---------------------------------------------------------------------------
-window.reconcileModal = (id, outstanding) => {
-  showModal(`<h3 class="text-lg font-bold mb-1"><i class="fas fa-building-columns text-purple-600 mr-2"></i>Sales Manual Reconciliation</h3>
-    <p class="text-xs text-slate-500 mb-3">Settle a cash sale paid directly into the bank. Outstanding balance: <b>${fmt(outstanding)}</b>.</p>
+window.reconcileModal = (id, outstanding, _unused, bundleRef) => {
+  const isBundle = !!bundleRef
+  showModal(`<h3 class="text-lg font-bold mb-1"><i class="fas fa-building-columns text-purple-600 mr-2"></i>${isBundle ? 'Order' : 'Sales'} Manual Reconciliation</h3>
+    <p class="text-xs text-slate-500 mb-3">Settle ${isBundle ? `the whole order (${esc(bundleRef)})` : 'a cash sale'} paid directly into the bank. Outstanding balance: <b>${fmt(outstanding)}</b>.${isBundle ? ' The single bank payment is distributed across every item in the order.' : ''}</p>
     <label class="text-sm font-medium">Bank transaction code / reference</label>
     <input id="recRef" placeholder="e.g. FT25A1B2C3" class="w-full mt-1 mb-3 px-3 py-2 border border-slate-300 rounded-lg uppercase">
     <label class="text-sm font-medium">Amount paid (KES)</label>
     <input id="recAmt" type="number" min="1" step="0.01" max="${Number(outstanding) || ''}" value="${Number(outstanding) || ''}" class="w-full mt-1 mb-2 px-3 py-2 border border-slate-300 rounded-lg">
     <p class="text-[11px] text-slate-400 mb-3">The amount is deducted from the due balance and an official receipt — identical to the automated checkout receipt — is generated.</p>
     <div id="recStatus"></div>
-    <div class="flex gap-2"><button id="recBtn" onclick="doReconcile(${id}, ${Number(outstanding) || 0})" class="btn flex-1 bg-purple-600 text-white py-2.5 rounded-lg text-sm">Reconcile &amp; Generate Receipt</button>
+    <div class="flex gap-2"><button id="recBtn" onclick="doReconcile(${id}, ${Number(outstanding) || 0}, ${bundleRef ? `'${bundleRef}'` : 'null'})" class="btn flex-1 bg-purple-600 text-white py-2.5 rounded-lg text-sm">Reconcile &amp; Generate Receipt</button>
     <button onclick="closeModal()" class="btn px-4 bg-slate-100 rounded-lg text-sm">Cancel</button></div>`)
 }
-window.doReconcile = async (id, outstanding) => {
+window.doReconcile = async (id, outstanding, bundleRef) => {
   const ref = $('recRef')?.value?.trim()
   const amt = Number($('recAmt')?.value)
   if (!ref) { $('recStatus').innerHTML = `<div class="bg-red-50 border border-red-200 rounded-lg p-2 text-xs text-red-700 mb-3">Enter the unique bank transaction reference.</div>`; return }
@@ -3359,11 +3413,12 @@ window.doReconcile = async (id, outstanding) => {
   const btn = $('recBtn'); if (btn) { btn.disabled = true; btn.classList.add('opacity-50') }
   $('recStatus').innerHTML = `<div class="text-xs text-slate-500 mb-3"><i class="fas fa-spinner fa-spin mr-1"></i>Reconciling…</div>`
   try {
-    const { data } = await api.post(`/murabaha/${id}/manual-reconcile`, { transaction_code: ref, amount: amt })
-    toast(`Reconciled. Balance: ${fmt(data.outstanding)}${data.status === 'completed' ? ' — Paid in full' : ''}`)
+    const { data } = bundleRef
+      ? await api.post(`/murabaha/bundle/${encodeURIComponent(bundleRef)}/manual-reconcile`, { transaction_code: ref, amount: amt })
+      : await api.post(`/murabaha/${id}/manual-reconcile`, { transaction_code: ref, amount: amt })
+    toast(`Reconciled. Balance: ${fmt(data.outstanding)}${Number(data.outstanding) <= 0.5 ? ' — Paid in full' : ''}`)
     closeModal()
-    // Open the freshly-generated receipt for download.
-    viewDoc(id, 'receipt')
+    if (bundleRef) { orderDetail(bundleRef) } else { viewDoc(id, 'receipt') }
     if (typeof viewContracts === 'function') viewContracts()
   } catch (err) {
     $('recStatus').innerHTML = `<div class="bg-red-50 border border-red-200 rounded-lg p-2 text-xs text-red-700 mb-3">${esc(err.response?.data?.error || 'Reconciliation failed')}</div>`
@@ -6235,6 +6290,7 @@ let _canManageFees = false, _canManageMarkup = false
 let _wdCfg = { enabled: true, percentage_rate: 0, flat_fee: 0, min_charge: 0, max_charge: 0, min_withdrawal: 0 }
 let _supportCfg = { phone: '', email: '' }
 let _canManageWithdrawal = false
+let _invoiceCfg = { tax_rate: 0, tax_label: 'VAT', show_tax: false, tax_inclusive: true, payment_details: '' }
 async function viewSettings() {
   let data
   try { data = (await api.get('/settings/financing')).data }
@@ -6255,6 +6311,9 @@ async function viewSettings() {
   _inventory = Array.isArray(data.products) ? data.products : []
   _canManageFees = !!data.can_manage_processing_fees
   _canManageMarkup = !!data.can_manage_markup
+  try { _invoiceCfg = Object.assign({ tax_rate: 0, tax_label: 'VAT', show_tax: false, tax_inclusive: true, payment_details: '' }, (await api.get('/settings/invoice-config')).data.invoice_config || {}) }
+  catch (_) { _invoiceCfg = { tax_rate: 0, tax_label: 'VAT', show_tax: false, tax_inclusive: true, payment_details: '' } }
+  const _canManageInvoice = state.user.role === 'super_admin'
   $('content').innerHTML = `
     <div class="space-y-6 max-w-3xl">
       <!-- ============ MARKUP ============ -->
@@ -6342,8 +6401,31 @@ async function viewSettings() {
           ? `<div class="flex gap-2 mt-5"><button onclick="saveSupportContact()" class="btn brand-bg text-white px-5 py-2 rounded-lg text-sm"><i class="fas fa-save mr-1"></i>Save Support Contact</button></div>`
           : `<p class="text-xs text-amber-600 mt-4"><i class="fas fa-lock mr-1"></i>Only Admin / Super-Admin can change this — read-only.</p>`}
       </div>
+
+      <!-- ============ INVOICE & TAX CONFIGURATION (Super-Admin) ============ -->
+      ${_canManageInvoice ? `<div class="card p-6">
+        <h3 class="font-bold text-slate-800 mb-1"><i class="fas fa-file-invoice text-teal-600 mr-2"></i>Invoice &amp; Tax Configuration</h3>
+        <p class="text-xs text-slate-500 mb-4">Configure the tax applied to invoices &amp; receipts and the payment details printed on invoices. Taxes compute as <b>Subtotal × (Tax Rate ÷ 100)</b>; the invoice shows Subtotal → Taxes → Grand Total → Amount Paid → Amount Due.</p>
+        <label class="flex items-center gap-2 text-sm mb-4 cursor-pointer">
+          <input type="checkbox" id="inv_show_tax" ${_invoiceCfg.show_tax ? 'checked' : ''}> Apply tax on invoices &amp; receipts
+        </label>
+        <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+          <div><label class="field-label">Tax rate (%)</label><input id="inv_tax_rate" type="number" step="0.01" min="0" max="100" value="${Number(_invoiceCfg.tax_rate || 0)}" class="w-full px-3 py-2 border rounded-lg"></div>
+          <div><label class="field-label">Tax label</label><input id="inv_tax_label" type="text" placeholder="e.g. VAT" value="${esc(_invoiceCfg.tax_label || 'VAT')}" class="w-full px-3 py-2 border rounded-lg"></div>
+          <div><label class="field-label">Tax mode</label><select id="inv_tax_inclusive" class="w-full px-3 py-2 border rounded-lg">
+            <option value="inclusive" ${_invoiceCfg.tax_inclusive !== false ? 'selected' : ''}>Prices include tax (extract tax)</option>
+            <option value="exclusive" ${_invoiceCfg.tax_inclusive === false ? 'selected' : ''}>Add tax on top of prices</option>
+          </select></div>
+        </div>
+        <div class="mt-4"><label class="field-label">Payment details (printed on invoices)</label>
+          <textarea id="inv_payment_details" rows="4" placeholder="e.g. Bank: Equity Bank, A/C 1234567890&#10;M-Pesa Paybill: 123456, Account: your order ref" class="w-full px-3 py-2 border rounded-lg text-sm">${esc(_invoiceCfg.payment_details || '')}</textarea>
+          <p class="text-xs text-slate-400 mt-1">Shown only on invoices (not receipts) so customers know where to pay.</p>
+        </div>
+        <div class="flex gap-2 mt-5"><button onclick="saveInvoiceConfig()" class="btn brand-bg text-white px-5 py-2 rounded-lg text-sm"><i class="fas fa-save mr-1"></i>Save Invoice &amp; Tax Settings</button></div>
+      </div>` : ''}
     </div>`
   renderMarkupBuilder()
+
   renderFeeBuilder()
   renderFinancingTypes()
   renderAgreementTemplates()

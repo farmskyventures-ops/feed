@@ -284,25 +284,33 @@ function consolidateOrders(rows: any[]): any[] {
       total_payable: total,
       amount_paid: paid,
       outstanding,
-      items: items.map(it => ({
-        id: it.id,
-        contract_ref: it.contract_ref,
-        product_id: it.product_id,
-        product_name: it.product_name,
-        product_unit: it.product_unit || null,
-        quantity: it.quantity,
-        payment_type: it.payment_type,
-        financing_model: it.financing_model,
-        status: it.status,
-        dispatch_status: it.dispatch_status,
-        murabaha_price: numberVal(it.murabaha_price, 0),
-        amount_paid: numberVal(it.amount_paid, 0),
-        outstanding: numberVal(it.outstanding, 0),
-        deposit_pct: it.deposit_pct,
-        deposit_amount: it.deposit_amount,
-        term_months: it.term_months,
-        installment_amount: it.installment_amount || it.monthly_payment || 0
-      }))
+      items: items.map(it => {
+        const qty = numberVal(it.quantity, 1) || 1
+        const lineTotal = numberVal(it.murabaha_price, 0)
+        return {
+          id: it.id,
+          contract_ref: it.contract_ref,
+          product_id: it.product_id,
+          product_name: it.product_name,
+          item_description: it.product_name,
+          unit: it.product_unit || null,
+          product_unit: it.product_unit || null,
+          quantity: it.quantity,
+          unit_price: roundMoney(lineTotal / qty),
+          line_total: lineTotal,
+          payment_type: it.payment_type,
+          financing_model: it.financing_model,
+          status: it.status,
+          dispatch_status: it.dispatch_status,
+          murabaha_price: lineTotal,
+          amount_paid: numberVal(it.amount_paid, 0),
+          outstanding: numberVal(it.outstanding, 0),
+          deposit_pct: it.deposit_pct,
+          deposit_amount: it.deposit_amount,
+          term_months: it.term_months,
+          installment_amount: it.installment_amount || it.monthly_payment || 0
+        }
+      })
     })
   }
   return result
@@ -2502,8 +2510,51 @@ app.get('/api/murabaha/order/:ref', requireAuth, async (c) => {
     ).bind(...ids).all()
     return { repayments: rep.results, transactions: tx.results }
   })
-  return c.json({ order, repayments, transactions })
+  // Invoice/Receipt summary (per spec): subtotal -> tax -> grand total ->
+  // amount paid -> amount due, using the Super-Admin-configured tax rate.
+  const invoiceCfg = await getInvoiceConfig(c)
+  order.summary = buildDocumentSummary(order, invoiceCfg)
+  return c.json({ order, repayments, transactions, invoice_config: invoiceCfg })
 })
+// Compute the canonical invoice/receipt summary from an order's line items.
+//   Tax-EXCLUSIVE (tax_inclusive=false):
+//     subtotal    = SUM(line_total)
+//     tax_amount  = subtotal × (tax_rate/100)
+//     grand_total = subtotal + tax_amount
+//   Tax-INCLUSIVE (default): the listed price already includes tax, so the
+//   amount actually owed (grand_total) = SUM(line_total) and the tax is
+//   extracted for display → subtotal = grand_total / (1 + rate).
+//   amount_due = grand_total − amount_paid  (always matches the collectible
+//   balance so a full settlement reconciles to zero).
+function buildDocumentSummary(order: any, cfg: any) {
+  const lineSum = roundMoney((order.items || []).reduce((s: number, it: any) => s + numberVal(it.line_total ?? it.murabaha_price, 0), 0))
+  const taxRate = cfg?.show_tax ? numberVal(cfg.tax_rate, 0) : 0
+  const inclusive = cfg?.tax_inclusive !== false
+  let subtotal: number, taxAmount: number, grandTotal: number
+  if (taxRate > 0 && inclusive) {
+    grandTotal = lineSum
+    subtotal = roundMoney(lineSum / (1 + taxRate / 100))
+    taxAmount = roundMoney(grandTotal - subtotal)
+  } else {
+    subtotal = lineSum
+    taxAmount = roundMoney(subtotal * (taxRate / 100))
+    grandTotal = roundMoney(subtotal + taxAmount)
+  }
+  const amountPaid = roundMoney(numberVal(order.amount_paid, 0))
+  const amountDue = roundMoney(Math.max(0, grandTotal - amountPaid))
+  return {
+    subtotal,
+    tax_rate: taxRate,
+    tax_label: cfg?.tax_label || 'VAT',
+    show_tax: !!cfg?.show_tax,
+    tax_inclusive: inclusive,
+    tax_amount: taxAmount,
+    grand_total: grandTotal,
+    amount_paid: amountPaid,
+    amount_due: amountDue
+  }
+}
+
 
 app.get('/api/murabaha/:id', requireAuth, async (c) => {
   const id = c.req.param('id')
@@ -5401,6 +5452,48 @@ app.put('/api/settings/processing-fee', requireAuth, requirePermission('manage_p
   await audit(c, c.get('user').id, 'update', 'settings', `processing_fee:${cfg.enabled ? cfg.mode : 'disabled'} products:${cfg.product_ids.length || 'all'}`)
   return c.json({ ok: true, processing_fee: cfg })
 })
+
+// ---------------------------------------------------------------------------
+// INVOICE / RECEIPT CONFIGURATION  (Super-Admin configurable)
+//   tax_rate     — percentage applied to the subtotal (e.g. 16 for 16% VAT)
+//   tax_label    — label shown on the document (e.g. "VAT (16%)")
+//   show_tax     — toggle the tax line on/off
+//   payment_details — free-text block inserted on INVOICES (bank/M-Pesa paybill
+//                     details customers pay into). NOT shown on receipts.
+// Consumed by the document builder so invoices/receipts compute and render
+// subtotal → tax → grand total → amount paid → amount due consistently.
+// ---------------------------------------------------------------------------
+const DEFAULT_INVOICE_CONFIG = { tax_rate: 0, tax_label: 'VAT', show_tax: false, tax_inclusive: true, payment_details: '' }
+function normalizeInvoiceConfig(b: any) {
+  const rate = Math.max(0, Math.min(100, numberVal(b?.tax_rate, 0)))
+  return {
+    tax_rate: rate,
+    tax_label: cleanText(b?.tax_label, 40) || 'VAT',
+    show_tax: b?.show_tax === false ? false : (b?.show_tax === true ? true : rate > 0),
+    // tax_inclusive (default): listed prices already INCLUDE tax, so the grand
+    // total equals Σ(line_total) and tax is extracted for display. When false,
+    // tax is added ON TOP of the subtotal (grand total = subtotal + tax).
+    tax_inclusive: b?.tax_inclusive === false ? false : true,
+    payment_details: cleanText(b?.payment_details, 1200) || ''
+  }
+}
+async function getInvoiceConfig(c: any) {
+  return normalizeInvoiceConfig(await getSetting(c, 'invoice_config', DEFAULT_INVOICE_CONFIG))
+}
+app.get('/api/settings/invoice-config', requireAuth, async (c) => {
+  // Readable by any authenticated user (the SPA needs it to render documents);
+  // the payment_details are intentionally only surfaced on invoices in the UI.
+  return c.json({ invoice_config: await getInvoiceConfig(c) })
+})
+app.put('/api/settings/invoice-config', requireAuth, async (c) => {
+  const user = c.get('user') as SessionUser
+  // Configurable ONLY on the Super-Admin dashboard (per spec).
+  if (!isSuperAdmin(user)) return c.json({ error: 'Only a Super Admin may configure invoice & tax settings' }, 403)
+  const cfg = normalizeInvoiceConfig(await c.req.json().catch(() => ({})))
+  await setSetting(c, 'invoice_config', cfg)
+  await audit(c, user.id, 'update', 'settings', `invoice_config: tax ${cfg.show_tax ? cfg.tax_rate + '%' : 'off'}${cfg.payment_details ? ' +payment_details' : ''}`)
+  return c.json({ ok: true, invoice_config: cfg })
+})
 async function saveFinancingMarkup(c: any) {
   const b = await c.req.json()
   const cfg = normalizeFinancingMarkup(b)
@@ -6347,6 +6440,40 @@ app.post('/api/murabaha/:id/manual-reconcile', requireAuth, requireExplicitPermi
   const res = await applyPayment(c, contract, amt, txnCode, 'bank_manual', contract.phone || '')
   await audit(c, c.get('user').id, 'manual_reconcile', 'contract', `${contract.contract_ref} · ref ${txnCode} · KES ${amt}`)
   return c.json({ ok: true, receipt: txnCode, amount_paid: res?.amount_paid, outstanding: res?.outstanding, status: res?.status })
+})
+
+// ----------------------------------------------------------------------------
+// BUNDLE MANUAL RECONCILIATION
+//
+// Mirrors the unified bundle CHECKOUT: lets a Super-Admin (or holder of the
+// delegable `sales_manual_reconciliation` permission) manually settle a WHOLE
+// multi-item bundle from a single bank payment. The amount defaults to the
+// aggregated outstanding across ALL items (Σ outstanding) and is distributed
+// FIFO across the bundle's contracts through the SAME settleBundlePayment
+// engine used by the automated bundle gateway — so one bank reference settles
+// the entire order and the ledger reconciles against a single transaction.
+// ----------------------------------------------------------------------------
+app.post('/api/murabaha/bundle/:bundleRef/manual-reconcile', requireAuth, requireExplicitPermission('sales_manual_reconciliation'), async (c) => {
+  const bundleRef = c.req.param('bundleRef')
+  const body = await c.req.json().catch(() => ({})) as any
+  const txnCode = String(body.transaction_code || body.reference || '').trim()
+  if (!txnCode) return c.json({ error: 'A unique bank transaction code / reference is required' }, 400)
+  const rows = await bundleContracts(c, bundleRef)
+  if (!rows.length) return c.json({ error: 'Order / bundle not found' }, 404)
+  const aggregated = bundleOutstandingTotal(rows)
+  if (aggregated <= 0) return c.json({ error: 'This order is already fully settled' }, 400)
+  // Amount defaults to the full aggregated outstanding; a partial amount is
+  // allowed (e.g. a part-payment) but never more than the invoice total.
+  const amt = body.amount != null ? roundMoney(Number(body.amount)) : aggregated
+  if (!Number.isFinite(amt) || amt <= 0) return c.json({ error: 'Enter a valid amount greater than zero' }, 400)
+  if (amt > aggregated + 0.01) return c.json({ error: `Amount exceeds the order's outstanding balance of KES ${aggregated.toLocaleString()}` }, 400)
+  // Unique reference guard (idempotency / no double-posting).
+  const dup = await c.env.DB.prepare(`SELECT id FROM transactions WHERE mpesa_receipt=?`).bind(txnCode).first<any>()
+  if (dup) return c.json({ error: 'That transaction reference has already been recorded' }, 409)
+  const dist = await settleBundlePayment(c, bundleRef, amt, txnCode, 'bank_manual', rows[0].phone || '')
+  await audit(c, c.get('user').id, 'manual_reconcile_bundle', 'order', `${bundleRef} · ref ${txnCode} · KES ${amt} across ${dist.applied.length} item(s)`)
+  const after = await bundleContracts(c, bundleRef)
+  return c.json({ ok: true, receipt: txnCode, bundle_ref: bundleRef, charged: amt, distributed: dist.applied, unallocated: dist.unallocated, outstanding: bundleOutstandingTotal(after) })
 })
 
 // ----------------------------------------------------------------------------
