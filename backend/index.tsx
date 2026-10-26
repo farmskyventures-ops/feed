@@ -4437,6 +4437,337 @@ app.get('/api/traceability/public/:ref', async (c) => {
   return c.json({ provenance_ref: ref, value_chain: events[0].value_chain, events })
 })
 
+
+// ============================================================================
+// PRODUCE SOURCING & CONTRACTING MODULE (migration 0048) — framework upgrade.
+//
+// Every route is GOVERNED by Feature Management & QA via requireFeature(): the
+// matching flag is sandbox by default (Super-Admin-only) until promoted. All
+// reads/writes target the additive 0048 tables, so the existing offtake
+// capability is untouched (zero regression). Admin/Super-Admin always pass the
+// gate (so they can QA in sandbox); other roles follow the lifecycle stage.
+// ============================================================================
+
+// ---- Buyer Enterprise tenants (multi-tenant Buyer Portal) ------------------
+app.get('/api/produce/buyer-tenants', requireAuth, requireFeature('buyer_portal'), async (c) => {
+  const user = c.get('user') as SessionUser
+  const systemwide = ['admin', 'super_admin'].includes(user.role) || hasPermission(user, 'manage_buyer_tenant')
+  let q = `SELECT * FROM buyer_tenants`
+  const binds: any[] = []
+  if (!systemwide) { q += ` WHERE admin_user_id=? OR created_by=?`; binds.push(String(user.id), String(user.id)) }
+  q += ` ORDER BY created_at DESC`
+  const { results } = await withAdminContext(c, async () => await c.env.DB.prepare(q).bind(...binds).all())
+  return c.json({ tenants: results || [] })
+})
+app.post('/api/produce/buyer-tenants', requireAuth, requireFeature('buyer_portal'), async (c) => {
+  const user = c.get('user') as SessionUser
+  if (!(hasPermission(user, 'manage_buyer_tenant') || ['admin', 'super_admin'].includes(user.role))) return c.json({ error: 'Forbidden' }, 403)
+  const b = await c.req.json().catch(() => ({})) as any
+  if (!b.name) return c.json({ error: 'Buyer enterprise name is required' }, 400)
+  const tenantRef = ref('BUY')
+  const r = await c.env.DB.prepare(
+    `INSERT INTO buyer_tenants (tenant_ref,name,admin_user_id,contact_phone,contact_email,logo_url,settings,status,created_by) VALUES (?,?,?,?,?,?,?, 'active', ?)`
+  ).bind(tenantRef, String(b.name), b.admin_user_id ? String(b.admin_user_id) : String(user.id), b.contact_phone || null, b.contact_email || null, b.logo_url || null, b.settings ? JSON.stringify(b.settings) : null, String(user.id)).run()
+  await audit(c, user.id, 'create', 'buyer_tenant', `${tenantRef} (${b.name})`)
+  return c.json({ ok: true, id: r.meta.last_row_id, tenant_ref: tenantRef })
+})
+
+// ---- Intake sites / weighbridges -------------------------------------------
+app.get('/api/produce/intake-sites', requireAuth, requireFeature('buyer_portal'), async (c) => {
+  const tenantId = c.req.query('buyer_tenant_id')
+  let q = `SELECT * FROM intake_sites`
+  const binds: any[] = []
+  if (tenantId) { q += ` WHERE buyer_tenant_id=?`; binds.push(tenantId) }
+  q += ` ORDER BY created_at DESC`
+  const { results } = await withAdminContext(c, async () => await c.env.DB.prepare(q).bind(...binds).all())
+  return c.json({ sites: results || [] })
+})
+app.post('/api/produce/intake-sites', requireAuth, requireFeature('buyer_portal'), async (c) => {
+  const user = c.get('user') as SessionUser
+  if (!(hasPermission(user, 'manage_intake_sites') || ['admin', 'super_admin'].includes(user.role))) return c.json({ error: 'Forbidden' }, 403)
+  const b = await c.req.json().catch(() => ({})) as any
+  if (!b.name) return c.json({ error: 'Site name is required' }, 400)
+  const siteRef = ref('SITE')
+  const r = await c.env.DB.prepare(
+    `INSERT INTO intake_sites (site_ref,buyer_tenant_id,name,location,latitude,longitude,open_hours,load_types,requires_slot,status,created_by) VALUES (?,?,?,?,?,?,?,?,?, 'active', ?)`
+  ).bind(siteRef, numOrNull(b.buyer_tenant_id), String(b.name), b.location || null, numOrNull(b.latitude), numOrNull(b.longitude), b.open_hours ? JSON.stringify(b.open_hours) : null, b.load_types ? JSON.stringify(b.load_types) : null, b.requires_slot === false ? 0 : 1, String(user.id)).run()
+  await audit(c, user.id, 'create', 'intake_site', `${siteRef} (${b.name})`)
+  return c.json({ ok: true, id: r.meta.last_row_id, site_ref: siteRef })
+})
+
+// ---- Time slotting (inload/outload scheduling) -----------------------------
+app.get('/api/produce/slots', requireAuth, requireFeature('time_slotting'), async (c) => {
+  const user = c.get('user') as SessionUser
+  const siteId = c.req.query('intake_site_id')
+  const systemwide = ['admin', 'super_admin'].includes(user.role) || hasPermission(user, 'manage_slots') || hasPermission(user, 'manage_intake_sites')
+  let q = `SELECT * FROM delivery_slots`
+  const binds: any[] = []
+  const wh: string[] = []
+  if (siteId) { wh.push(`intake_site_id=?`); binds.push(siteId) }
+  if (!systemwide) { wh.push(`(booked_by=? OR created_by=?)`); binds.push(String(user.id), String(user.id)) }
+  if (wh.length) q += ` WHERE ` + wh.join(' AND ')
+  q += ` ORDER BY slot_start`
+  const { results } = await withAdminContext(c, async () => await c.env.DB.prepare(q).bind(...binds).all())
+  return c.json({ slots: results || [] })
+})
+app.post('/api/produce/slots', requireAuth, requireFeature('time_slotting'), async (c) => {
+  const user = c.get('user') as SessionUser
+  const b = await c.req.json().catch(() => ({})) as any
+  // Creating slot rules needs manage_slots; booking an open slot needs book_slots.
+  const slotRef = ref('SLOT')
+  const r = await c.env.DB.prepare(
+    `INSERT INTO delivery_slots (slot_ref,intake_site_id,contract_id,booked_by,commodity,grade,load_type,slot_start,slot_end,status,truck_rego,notes,created_by) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`
+  ).bind(slotRef, numOrNull(b.intake_site_id), numOrNull(b.contract_id), b.booked_by ? String(b.booked_by) : String(user.id), b.commodity || null, b.grade || null, b.load_type === 'outload' ? 'outload' : 'inload', b.slot_start || null, b.slot_end || null, b.status || 'booked', b.truck_rego || null, b.notes || null, String(user.id)).run()
+  await audit(c, user.id, 'create', 'delivery_slot', `${slotRef}`)
+  return c.json({ ok: true, id: r.meta.last_row_id, slot_ref: slotRef })
+})
+app.put('/api/produce/slots/:id', requireAuth, requireFeature('time_slotting'), async (c) => {
+  const user = c.get('user') as SessionUser
+  const id = c.req.param('id')
+  const b = await c.req.json().catch(() => ({})) as any
+  const status = ['open', 'booked', 'arrived', 'tipped', 'cancelled'].includes(String(b.status)) ? String(b.status) : null
+  if (!status) return c.json({ error: 'Invalid slot status' }, 400)
+  await c.env.DB.prepare(`UPDATE delivery_slots SET status=? WHERE id=?`).bind(status, id).run()
+  await audit(c, user.id, 'update', 'delivery_slot', `${id} → ${status}`)
+  return c.json({ ok: true, status })
+})
+
+// ---- Orders (freight / call-on-grain / request / pack) ---------------------
+app.get('/api/produce/orders', requireAuth, requireFeature('order_management'), async (c) => {
+  const user = c.get('user') as SessionUser
+  const systemwide = ['admin', 'super_admin'].includes(user.role) || hasPermission(user, 'manage_orders') || hasPermission(user, 'manage_freight')
+  let q = `SELECT * FROM freight_orders`
+  const binds: any[] = []
+  if (!systemwide) { q += ` WHERE created_by=? OR seller_id=? OR buyer_id=? OR freight_provider_id=?`; binds.push(String(user.id), String(user.id), String(user.id), String(user.id)) }
+  q += ` ORDER BY created_at DESC`
+  const { results } = await withAdminContext(c, async () => await c.env.DB.prepare(q).bind(...binds).all())
+  return c.json({ orders: results || [] })
+})
+app.post('/api/produce/orders', requireAuth, requireFeature('order_management'), async (c) => {
+  const user = c.get('user') as SessionUser
+  if (!(hasPermission(user, 'manage_orders') || ['admin', 'super_admin'].includes(user.role))) return c.json({ error: 'Forbidden' }, 403)
+  const b = await c.req.json().catch(() => ({})) as any
+  const otype = ['freight', 'call_on_grain', 'request', 'pack'].includes(String(b.order_type)) ? String(b.order_type) : 'freight'
+  const orderRef = ref('ORD')
+  const r = await c.env.DB.prepare(
+    `INSERT INTO freight_orders (order_ref,order_type,contract_id,buyer_tenant_id,seller_id,buyer_id,freight_provider_id,origin,destination,commodity,tonnage,pickup_instructions,status,created_by) VALUES (?,?,?,?,?,?,?,?,?,?,?,?, 'open', ?)`
+  ).bind(orderRef, otype, numOrNull(b.contract_id), numOrNull(b.buyer_tenant_id), b.seller_id || null, b.buyer_id || null, b.freight_provider_id || null, b.origin || null, b.destination || null, b.commodity || null, numberVal(b.tonnage, 0), b.pickup_instructions || null, String(user.id)).run()
+  await audit(c, user.id, 'create', 'freight_order', `${orderRef} (${otype})`)
+  return c.json({ ok: true, id: r.meta.last_row_id, order_ref: orderRef })
+})
+
+// ---- Commodity movements (farm-gate → site) --------------------------------
+app.get('/api/produce/movements', requireAuth, requireFeature('movement_tracking'), async (c) => {
+  const user = c.get('user') as SessionUser
+  const systemwide = ['admin', 'super_admin'].includes(user.role) || hasPermission(user, 'log_movements') || hasPermission(user, 'manage_orders')
+  let q = `SELECT * FROM commodity_movements`
+  const binds: any[] = []
+  if (!systemwide) { q += ` WHERE created_by=?`; binds.push(String(user.id)) }
+  q += ` ORDER BY created_at DESC`
+  const { results } = await withAdminContext(c, async () => await c.env.DB.prepare(q).bind(...binds).all())
+  return c.json({ movements: results || [] })
+})
+app.post('/api/produce/movements', requireAuth, requireFeature('movement_tracking'), async (c) => {
+  const user = c.get('user') as SessionUser
+  if (!(hasPermission(user, 'log_movements') || ['admin', 'super_admin', 'agent'].includes(user.role) || hasPermission(user, 'aggregate_produce'))) return c.json({ error: 'Forbidden' }, 403)
+  const b = await c.req.json().catch(() => ({})) as any
+  const gross = numberVal(b.gross_weight, 0), tare = numberVal(b.tare_weight, 0)
+  const net = b.net_weight != null ? numberVal(b.net_weight, 0) : Math.max(0, roundMoney(gross - tare))
+  const mref = ref('MOV')
+  const r = await c.env.DB.prepare(
+    `INSERT INTO commodity_movements (movement_ref,movement_type,contract_id,order_id,slot_id,commodity,gross_weight,tare_weight,net_weight,moisture_pct,quality_grade,pickup_lat,pickup_lng,delivery_lat,delivery_lng,logged_at,status,created_by) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
+  ).bind(mref, ['contracted', 'standalone', 'order_linked'].includes(String(b.movement_type)) ? String(b.movement_type) : 'standalone', numOrNull(b.contract_id), numOrNull(b.order_id), numOrNull(b.slot_id), b.commodity || null, gross, tare, net, numOrNull(b.moisture_pct), b.quality_grade || null, numOrNull(b.pickup_lat), numOrNull(b.pickup_lng), numOrNull(b.delivery_lat), numOrNull(b.delivery_lng), b.logged_at || new Date().toISOString(), b.status || 'delivered', String(user.id)).run()
+  await audit(c, user.id, 'create', 'commodity_movement', `${mref} (${net}KG)`)
+  return c.json({ ok: true, id: r.meta.last_row_id, movement_ref: mref, net_weight: net })
+})
+
+// ---- Freight scheduling (truck & mass management) --------------------------
+app.get('/api/produce/trucks', requireAuth, requireFeature('freight_scheduling'), async (c) => {
+  const user = c.get('user') as SessionUser
+  const systemwide = ['admin', 'super_admin'].includes(user.role) || hasPermission(user, 'manage_freight') || hasPermission(user, 'manage_trucks')
+  let q = `SELECT * FROM freight_trucks`
+  const binds: any[] = []
+  if (!systemwide) { q += ` WHERE provider_id=? OR driver_id=? OR created_by=?`; binds.push(String(user.id), String(user.id), String(user.id)) }
+  q += ` ORDER BY created_at DESC`
+  const { results } = await withAdminContext(c, async () => await c.env.DB.prepare(q).bind(...binds).all())
+  return c.json({ trucks: results || [] })
+})
+app.post('/api/produce/trucks', requireAuth, requireFeature('freight_scheduling'), async (c) => {
+  const user = c.get('user') as SessionUser
+  if (!(hasPermission(user, 'manage_trucks') || hasPermission(user, 'manage_freight') || ['admin', 'super_admin'].includes(user.role))) return c.json({ error: 'Forbidden' }, 403)
+  const b = await c.req.json().catch(() => ({})) as any
+  const truckRef = ref('TRK')
+  const r = await c.env.DB.prepare(
+    `INSERT INTO freight_trucks (truck_ref,provider_id,rego,config,max_mass_kg,permit_ref,driver_id,status,created_by) VALUES (?,?,?,?,?,?,?, 'available', ?)`
+  ).bind(truckRef, b.provider_id ? String(b.provider_id) : String(user.id), b.rego || null, b.config || null, numberVal(b.max_mass_kg, 0), b.permit_ref || null, b.driver_id || null, String(user.id)).run()
+  await audit(c, user.id, 'create', 'freight_truck', `${truckRef} (${b.rego || ''})`)
+  return c.json({ ok: true, id: r.meta.last_row_id, truck_ref: truckRef })
+})
+
+// ---- Chain of Responsibility (CoR) — mass check + declaration --------------
+app.post('/api/produce/cor/check', requireAuth, requireFeature('cor_compliance'), async (c) => {
+  const user = c.get('user') as SessionUser
+  const b = await c.req.json().catch(() => ({})) as any
+  const mass = numberVal(b.mass_kg, 0)
+  const limit = numberVal(b.mass_limit_kg, 0)
+  const overweight = limit > 0 && mass > limit ? 1 : 0
+  const decRef = ref('COR')
+  const r = await c.env.DB.prepare(
+    `INSERT INTO cor_declarations (declaration_ref,movement_id,truck_id,mass_kg,mass_limit_kg,overweight,template_kind,driver_signed,manager_signed,created_by) VALUES (?,?,?,?,?,?,?,?,?,?)`
+  ).bind(decRef, numOrNull(b.movement_id), numOrNull(b.truck_id), mass, limit, overweight, b.template_kind === 'MLA' ? 'MLA' : 'GTA', b.driver_signed ? 1 : 0, b.manager_signed ? 1 : 0, String(user.id)).run()
+  await audit(c, user.id, 'cor_check', 'cor_declaration', `${decRef} ${overweight ? 'OVERWEIGHT' : 'OK'} (${mass}/${limit}kg)`)
+  return c.json({ ok: true, id: r.meta.last_row_id, declaration_ref: decRef, overweight: !!overweight })
+})
+app.get('/api/produce/cor', requireAuth, requireFeature('cor_compliance'), async (c) => {
+  const { results } = await withAdminContext(c, async () => await c.env.DB.prepare(`SELECT * FROM cor_declarations ORDER BY created_at DESC LIMIT 200`).all())
+  return c.json({ declarations: results || [] })
+})
+
+// ---- Stocks & transfers (multi-site ledger) --------------------------------
+app.get('/api/produce/stock', requireAuth, requireFeature('stock_ledger'), async (c) => {
+  const user = c.get('user') as SessionUser
+  const systemwide = ['admin', 'super_admin'].includes(user.role) || hasPermission(user, 'manage_stock_ledger')
+  let q = `SELECT * FROM stock_ledger`
+  const binds: any[] = []
+  if (!systemwide) { q += ` WHERE owner_id=? OR created_by=?`; binds.push(String(user.id), String(user.id)) }
+  q += ` ORDER BY created_at DESC LIMIT 500`
+  const { results } = await withAdminContext(c, async () => await c.env.DB.prepare(q).bind(...binds).all())
+  return c.json({ ledger: results || [] })
+})
+app.post('/api/produce/stock', requireAuth, requireFeature('stock_ledger'), async (c) => {
+  const user = c.get('user') as SessionUser
+  if (!(hasPermission(user, 'manage_stock_ledger') || ['admin', 'super_admin'].includes(user.role))) return c.json({ error: 'Forbidden' }, 403)
+  const b = await c.req.json().catch(() => ({})) as any
+  const ledgerRef = ref('STK')
+  const r = await c.env.DB.prepare(
+    `INSERT INTO stock_ledger (ledger_ref,intake_site_id,owner_id,commodity,grade,season,quantity_kg,movement_kind,reference,created_by) VALUES (?,?,?,?,?,?,?,?,?,?)`
+  ).bind(ledgerRef, numOrNull(b.intake_site_id), b.owner_id ? String(b.owner_id) : String(user.id), b.commodity || null, b.grade || null, b.season || null, numberVal(b.quantity_kg, 0), ['inload', 'outload', 'regrade', 'reseason', 'fee'].includes(String(b.movement_kind)) ? String(b.movement_kind) : 'inload', b.reference || null, String(user.id)).run()
+  await audit(c, user.id, 'create', 'stock_ledger', `${ledgerRef} (${b.commodity || ''} ${b.quantity_kg || 0}KG)`)
+  return c.json({ ok: true, id: r.meta.last_row_id, ledger_ref: ledgerRef })
+})
+
+// ---- Cashboards & live bidding ---------------------------------------------
+app.get('/api/produce/cashboard', requireAuth, requireFeature('cashboards_bidding'), async (c) => {
+  // Live bids are visible to buyers who posted them and to the farmers/coops
+  // they target; admins see all. Private-target bids filter to the caller.
+  const user = c.get('user') as SessionUser
+  const systemwide = ['admin', 'super_admin'].includes(user.role) || hasPermission(user, 'manage_cashboards')
+  const { results } = await withAdminContext(c, async () => await c.env.DB.prepare(`SELECT * FROM cashboard_bids WHERE status='live' ORDER BY created_at DESC LIMIT 200`).all())
+  let bids = (results || []) as any[]
+  if (!systemwide) {
+    bids = bids.filter((bid: any) => {
+      if (!bid.private_target) return true // public bid
+      try { const t = JSON.parse(bid.private_target); return Array.isArray(t) && t.map(String).includes(String(user.id)) } catch { return false }
+    })
+  }
+  return c.json({ bids })
+})
+app.post('/api/produce/cashboard', requireAuth, requireFeature('cashboards_bidding'), async (c) => {
+  const user = c.get('user') as SessionUser
+  if (!(hasPermission(user, 'manage_cashboards') || ['admin', 'super_admin'].includes(user.role))) return c.json({ error: 'Forbidden' }, 403)
+  const b = await c.req.json().catch(() => ({})) as any
+  if (!b.commodity || !(numberVal(b.price, 0) > 0)) return c.json({ error: 'Commodity and a price greater than zero are required' }, 400)
+  const bidRef = ref('BID')
+  const r = await c.env.DB.prepare(
+    `INSERT INTO cashboard_bids (bid_ref,buyer_tenant_id,intake_site_id,commodity,grade,price,price_max,currency,bid_type,private_target,valid_until,status,created_by) VALUES (?,?,?,?,?,?,?,?,?,?,?, 'live', ?)`
+  ).bind(bidRef, numOrNull(b.buyer_tenant_id), numOrNull(b.intake_site_id), String(b.commodity), b.grade || null, numberVal(b.price, 0), numOrNull(b.price_max), ['KES', 'USD'].includes(String(b.currency)) ? String(b.currency) : 'KES', b.bid_type === 'range' ? 'range' : 'fixed', Array.isArray(b.private_target) && b.private_target.length ? JSON.stringify(b.private_target.map(String)) : null, b.valid_until || null, String(user.id)).run()
+  await audit(c, user.id, 'create', 'cashboard_bid', `${bidRef} (${b.commodity} @ ${b.price})`)
+  return c.json({ ok: true, id: r.meta.last_row_id, bid_ref: bidRef })
+})
+// Accepting a live bid auto-converts it into an executed offtake contract.
+app.post('/api/produce/cashboard/:id/accept', requireAuth, requireFeature('cashboards_bidding'), async (c) => {
+  const user = c.get('user') as SessionUser
+  const id = c.req.param('id')
+  const b = await c.req.json().catch(() => ({})) as any
+  const bid = await withAdminContext(c, async () => await c.env.DB.prepare(`SELECT * FROM cashboard_bids WHERE id=?`).bind(id).first<any>())
+  if (!bid) return c.json({ error: 'Bid not found' }, 404)
+  if (bid.status !== 'live') return c.json({ error: 'This bid is no longer live' }, 409)
+  // Only the targeted farmers/coops (for private bids) or an authorised
+  // accepter may accept. Farmers accept for themselves; agents/coops need accept_bids.
+  if (bid.private_target) {
+    try { const t = JSON.parse(bid.private_target); if (!(Array.isArray(t) && t.map(String).includes(String(user.id)))) return c.json({ error: 'This private bid is not addressed to you' }, 403) } catch {}
+  }
+  if (user.role === 'agent' || user.role === 'coop') {
+    if (!hasPermission(user, 'accept_bids')) return c.json({ error: 'You are not authorised to accept bids on behalf of a farmer' }, 403)
+  }
+  const volume = numberVal(b.target_volume, 0)
+  if (!(volume > 0)) return c.json({ error: 'A target volume (KG/MT) is required to execute the contract' }, 400)
+  const contractRef = ref('OFT')
+  const r = await c.env.DB.prepare(
+    `INSERT INTO offtake_contracts (contract_ref,offtaker_id,produce_type,value_chain,procurement_mode,target_volume,volume_unit,unit_price,currency,payment_structure,status,milestone,buyer_tenant_id,intake_site_id,created_by) VALUES (?,?,?,?, 'spot', ?,?,?,?, 'on_delivery', 'matched', 'ORDERED', ?,?,?)`
+  ).bind(contractRef, bid.created_by, String(bid.commodity), 'crop', volume, ['KG', 'MT'].includes(String(b.volume_unit)) ? String(b.volume_unit) : 'KG', numberVal(bid.price, 0), bid.currency || 'KES', numOrNull(bid.buyer_tenant_id), numOrNull(bid.intake_site_id), String(user.id)).run()
+  const cid = r.meta.last_row_id
+  await c.env.DB.prepare(`UPDATE cashboard_bids SET status='accepted', accepted_by=?, contract_id=? WHERE id=?`).bind(String(user.id), cid, id).run()
+  await audit(c, user.id, 'accept_bid', 'cashboard_bid', `${bid.bid_ref} → contract ${contractRef}`)
+  return c.json({ ok: true, contract_id: cid, contract_ref: contractRef })
+})
+
+// ---- Closed-loop settlement (RCTI + split-settlement routing engine) -------
+// Net Payout = Gross − (Input Loan Offset + Platform Fee + Freight Deductions).
+app.post('/api/produce/settlement', requireAuth, requireFeature('closed_loop_settlement'), async (c) => {
+  const user = c.get('user') as SessionUser
+  if (!(hasPermission(user, 'manage_settlement') || ['admin', 'super_admin', 'operations_finance'].includes(user.role))) return c.json({ error: 'Forbidden' }, 403)
+  const b = await c.req.json().catch(() => ({})) as any
+  const gross = numberVal(b.gross_value, 0)
+  if (!(gross > 0)) return c.json({ error: 'A gross produce value greater than zero is required' }, 400)
+  // Resolve the farmer's outstanding input loan offset (best-effort): sum of
+  // outstanding on their murabaha contracts, capped at the gross value.
+  let loanOffset = numberVal(b.input_loan_offset, -1)
+  if (loanOffset < 0 && b.farmer_id) {
+    const row = await withAdminContext(c, async () => await c.env.DB.prepare(
+      `SELECT COALESCE(SUM(outstanding),0) AS due FROM murabaha_contracts WHERE customer_id = (SELECT id FROM customers WHERE user_id=? LIMIT 1)`
+    ).bind(b.farmer_id).first<any>())
+    loanOffset = numberVal(row?.due, 0)
+  }
+  if (loanOffset < 0) loanOffset = 0
+  loanOffset = Math.min(loanOffset, gross)
+  const platformFee = b.platform_fee != null ? numberVal(b.platform_fee, 0) : roundMoney(gross * (numberVal(b.platform_fee_pct, 0) / 100))
+  const freight = numberVal(b.freight_deduction, 0)
+  const net = roundMoney(Math.max(0, gross - (loanOffset + platformFee + freight)))
+  const settlementRef = ref('SET')
+  const rctiRef = ref('RCTI')
+  const r = await c.env.DB.prepare(
+    `INSERT INTO settlement_records (settlement_ref,contract_id,movement_id,farmer_id,gross_value,input_loan_offset,platform_fee,freight_deduction,net_payout,rcti_ref,payout_target,status,created_by) VALUES (?,?,?,?,?,?,?,?,?,?,?, 'rcti_issued', ?)`
+  ).bind(settlementRef, numOrNull(b.contract_id), numOrNull(b.movement_id), b.farmer_id || null, gross, loanOffset, platformFee, freight, net, rctiRef, b.payout_target || 'mobile', String(user.id)).run()
+  await audit(c, user.id, 'settle', 'settlement_record', `${settlementRef} gross ${gross} net ${net} (offset ${loanOffset})`)
+  return c.json({ ok: true, id: r.meta.last_row_id, settlement_ref: settlementRef, rcti_ref: rctiRef, gross_value: gross, input_loan_offset: loanOffset, platform_fee: platformFee, freight_deduction: freight, net_payout: net })
+})
+app.get('/api/produce/settlement', requireAuth, requireFeature('closed_loop_settlement'), async (c) => {
+  const user = c.get('user') as SessionUser
+  const systemwide = ['admin', 'super_admin', 'operations_finance'].includes(user.role) || hasPermission(user, 'manage_settlement')
+  let q = `SELECT * FROM settlement_records`
+  const binds: any[] = []
+  if (!systemwide) { q += ` WHERE farmer_id=? OR created_by=?`; binds.push(String(user.id), String(user.id)) }
+  q += ` ORDER BY created_at DESC LIMIT 300`
+  const { results } = await withAdminContext(c, async () => await c.env.DB.prepare(q).bind(...binds).all())
+  return c.json({ settlements: results || [] })
+})
+app.put('/api/produce/settlement/:id/pay', requireAuth, requireFeature('closed_loop_settlement'), async (c) => {
+  const user = c.get('user') as SessionUser
+  if (!(hasPermission(user, 'manage_settlement') || ['admin', 'super_admin', 'operations_finance'].includes(user.role))) return c.json({ error: 'Forbidden' }, 403)
+  const id = c.req.param('id')
+  await c.env.DB.prepare(`UPDATE settlement_records SET status='settled' WHERE id=?`).bind(id).run()
+  await audit(c, user.id, 'settle_pay', 'settlement_record', `${id} → settled`)
+  return c.json({ ok: true, status: 'settled' })
+})
+
+// ---- Container packing (export ops) ----------------------------------------
+app.get('/api/produce/containers', requireAuth, requireFeature('container_packing'), async (c) => {
+  const { results } = await withAdminContext(c, async () => await c.env.DB.prepare(`SELECT * FROM container_packs ORDER BY created_at DESC LIMIT 200`).all())
+  return c.json({ containers: results || [] })
+})
+app.post('/api/produce/containers', requireAuth, requireFeature('container_packing'), async (c) => {
+  const user = c.get('user') as SessionUser
+  if (!(hasPermission(user, 'manage_orders') || ['admin', 'super_admin'].includes(user.role))) return c.json({ error: 'Forbidden' }, 403)
+  const b = await c.req.json().catch(() => ({})) as any
+  const packRef = ref('PACK')
+  const r = await c.env.DB.prepare(
+    `INSERT INTO container_packs (pack_ref,contract_id,container_no,commodity,net_weight,status,export_docs,created_by) VALUES (?,?,?,?,?, 'packing', ?, ?)`
+  ).bind(packRef, numOrNull(b.contract_id), b.container_no || null, b.commodity || null, numberVal(b.net_weight, 0), b.export_docs ? JSON.stringify(b.export_docs) : null, String(user.id)).run()
+  await audit(c, user.id, 'create', 'container_pack', `${packRef}`)
+  return c.json({ ok: true, id: r.meta.last_row_id, pack_ref: packRef })
+})
+
 // ----------------------------------------------------------------------------
 // CENTRAL PAYMENT GATEWAY (shared by equipment / feed / input marketplaces)
 // Public endpoint URL:  https://equipment.farmsky.africa/api/v1/payments/*

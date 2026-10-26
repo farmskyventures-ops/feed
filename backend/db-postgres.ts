@@ -40,7 +40,11 @@ const TABLES_WITH_NUMERIC_ID = new Set([
   // Offtake / traceability / logistics (migration 0044) + governance tables.
   'offtake_contracts', 'offtake_matches', 'aggregation_batches', 'traceability_events',
   'logistics_vehicles', 'logistics_shipments', 'telemetry_pings',
-  'feature_flags', 'feature_flag_users', 'payment_channels', 'payment_channel_users'
+  'feature_flags', 'feature_flag_users', 'payment_channels', 'payment_channel_users',
+  // Produce Sourcing & Contracting module (migration 0048/0046/0039).
+  'buyer_tenants', 'intake_sites', 'delivery_slots', 'freight_orders', 'commodity_movements',
+  'freight_trucks', 'stock_ledger', 'cashboard_bids', 'settlement_records', 'cor_declarations',
+  'container_packs'
 ])
 
 function convertPlaceholders(sql: string): string {

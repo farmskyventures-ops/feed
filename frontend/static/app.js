@@ -1284,6 +1284,14 @@ function navItems() {
   const aggregationNav = featureOn('agent_aggregation') ? [{ k: 'aggregation', i: 'fa-weight-scale', t: 'Produce Aggregation' }] : []
   const logisticsNav = featureOn('logistics_telemetry') ? [{ k: 'logistics', i: 'fa-truck-fast', t: 'Logistics & Tracking' }] : []
   const traceNav = featureOn('traceability_ledger') ? [{ k: 'traceability', i: 'fa-qrcode', t: 'Traceability' }] : []
+  const buyerNav = featureOn('buyer_portal') ? [{ k: 'buyers', i: 'fa-industry', t: 'Buyer Portal & Sites' }] : []
+  const cashboardNav = featureOn('cashboards_bidding') ? [{ k: 'cashboards', i: 'fa-chart-line', t: 'Cashboards & Bids' }] : []
+  const slottingNav = featureOn('time_slotting') ? [{ k: 'slotting', i: 'fa-calendar-check', t: 'Time Slotting' }] : []
+  const ordersNav = featureOn('order_management') ? [{ k: 'produce_orders', i: 'fa-clipboard-list', t: 'Orders & Freight' }] : []
+  const movementsNav = featureOn('movement_tracking') ? [{ k: 'movements', i: 'fa-route', t: 'Movements' }] : []
+  const settlementNav = featureOn('closed_loop_settlement') ? [{ k: 'settlement', i: 'fa-money-bill-transfer', t: 'Settlement & RCTI' }] : []
+  const stocksNav = featureOn('stock_ledger') ? [{ k: 'stocks', i: 'fa-warehouse', t: 'Stocks & Ledger' }] : []
+  const produceNav = [...buyerNav, ...cashboardNav, ...slottingNav, ...ordersNav, ...movementsNav, ...settlementNav, ...stocksNav]
   if (r === 'super_admin' || r === 'admin') return withAccount([...common,
     { k: 'approvals', i: 'fa-clipboard-check', t: 'Approvals' },
     { k: 'inventory', i: 'fa-boxes-stacked', t: 'Inventory' },
@@ -1294,6 +1302,7 @@ function navItems() {
     transactions,
     { k: 'contracts', i: 'fa-file-signature', t: 'Purchases' },
     ...offtakeNav, ...matchingNav, ...aggregationNav, ...logisticsNav, ...traceNav,
+    ...produceNav,
     { k: 'agents', i: 'fa-user-tie', t: 'Agents' },
     { k: 'users', i: 'fa-user-gear', t: 'User Accounts' },
     { k: 'amendments', i: 'fa-id-card-clip', t: 'Pending Amendments' },
@@ -1384,9 +1393,9 @@ function renderApp() {
 }
 window.go = (r) => { state.route = r; toggleSidebar(false); renderApp() }
 function route() {
-  const titles = { dashboard: 'Dashboard', approvals: 'Financing Approvals', inventory: 'Inventory', finance_queue: 'Finance Approval Queue', customers: 'Customers', field_visits: 'Field Visits & Conversion', transactions: 'Bank Transfers & Transactions', crm: 'Sales & Support CRM', contracts: 'Purchases & Contracts', agents: 'Agent Management', users: 'User Accounts & Access', amendments: 'Pending Profile Amendments', ledger: 'Unified Payment Ledger', repayments: 'Repayment Performance', onboard: 'Farmer Onboarding', shop: 'Shop', marketplace: 'Equipment Marketplace', exports: 'Data Export & Reports', imports: 'Bulk User Data Upload', backups: 'Automated System Backups', settings: 'Financing & Markup Settings', profile: 'My Account', wallet: 'My Wallet', wallets: 'Wallets & Payouts', api_access: 'API Access', api_management: 'API Management', tenants: 'Payment Tenants', channels: 'Payment Channel Management', features: 'Feature Management & QA', offtake: 'Offtake Contracts', matching: 'Match Buyers & Outgrowers', aggregation: 'Produce Aggregation', logistics: 'Logistics & Tracking', traceability: 'Traceability' }
+  const titles = { dashboard: 'Dashboard', approvals: 'Financing Approvals', inventory: 'Inventory', finance_queue: 'Finance Approval Queue', customers: 'Customers', field_visits: 'Field Visits & Conversion', transactions: 'Bank Transfers & Transactions', crm: 'Sales & Support CRM', contracts: 'Purchases & Contracts', agents: 'Agent Management', users: 'User Accounts & Access', amendments: 'Pending Profile Amendments', ledger: 'Unified Payment Ledger', repayments: 'Repayment Performance', onboard: 'Farmer Onboarding', shop: 'Shop', marketplace: 'Equipment Marketplace', exports: 'Data Export & Reports', imports: 'Bulk User Data Upload', backups: 'Automated System Backups', settings: 'Financing & Markup Settings', profile: 'My Account', wallet: 'My Wallet', wallets: 'Wallets & Payouts', api_access: 'API Access', api_management: 'API Management', tenants: 'Payment Tenants', channels: 'Payment Channel Management', features: 'Feature Management & QA', offtake: 'Offtake Contracts', matching: 'Match Buyers & Outgrowers', aggregation: 'Produce Aggregation', logistics: 'Logistics & Tracking', traceability: 'Traceability', buyers: 'Buyer Portal & Intake Sites', cashboards: 'Cashboards & Live Bids', slotting: 'Time Slotting', produce_orders: 'Orders & Freight', movements: 'Commodity Movements', settlement: 'Closed-Loop Settlement & RCTI', stocks: 'Stocks & Ledger' }
   $('pageTitle').textContent = titles[state.route] || 'Dashboard'
-  const map = { dashboard: viewDashboard, approvals: viewApprovals, inventory: viewInventory, finance_queue: viewFinanceQueue, customers: viewCustomers, field_visits: viewFieldVisits, transactions: viewTransactions, crm: viewCrm, contracts: viewContracts, agents: viewAgents, users: viewUsers, amendments: viewAmendments, ledger: viewLedger, repayments: viewRepayments, onboard: viewOnboard, shop: viewShop, marketplace: viewMarketplace, exports: viewExports, imports: viewImports, backups: viewBackups, settings: viewSettings, profile: viewProfile, wallet: viewMyWallet, wallets: viewWallets, api_access: viewApiAccess, api_management: viewApiManagement, tenants: viewTenants, channels: viewChannels, features: viewFeatures, offtake: viewOfftake, matching: viewMatching, aggregation: viewAggregation, logistics: viewLogistics, traceability: viewTraceability }
+  const map = { dashboard: viewDashboard, approvals: viewApprovals, inventory: viewInventory, finance_queue: viewFinanceQueue, customers: viewCustomers, field_visits: viewFieldVisits, transactions: viewTransactions, crm: viewCrm, contracts: viewContracts, agents: viewAgents, users: viewUsers, amendments: viewAmendments, ledger: viewLedger, repayments: viewRepayments, onboard: viewOnboard, shop: viewShop, marketplace: viewMarketplace, exports: viewExports, imports: viewImports, backups: viewBackups, settings: viewSettings, profile: viewProfile, wallet: viewMyWallet, wallets: viewWallets, api_access: viewApiAccess, api_management: viewApiManagement, tenants: viewTenants, channels: viewChannels, features: viewFeatures, offtake: viewOfftake, matching: viewMatching, aggregation: viewAggregation, logistics: viewLogistics, traceability: viewTraceability, buyers: viewBuyers, cashboards: viewCashboards, slotting: viewSlotting, produce_orders: viewProduceOrders, movements: viewMovements, settlement: viewSettlement, stocks: viewStocks }
   ;(map[state.route] || viewDashboard)()
 }
 
@@ -7669,4 +7678,201 @@ window.lookupTrace = async () => {
         <div class="text-[11px] text-slate-400">${esc(String(e.recorded_at||''))}</div>
         ${e.payload ? `<div class="text-[11px] text-slate-500 mt-0.5 font-mono break-all">${esc(typeof e.payload==='string'?e.payload:JSON.stringify(e.payload))}</div>` : ''}</li>`).join('')}</ol>`
   } catch (err) { $('tr_result').innerHTML = `<div class="text-sm text-red-600">${esc(err.response?.data?.error || 'No provenance record found')}</div>` }
+}
+
+// ===========================================================================
+// PRODUCE SOURCING & CONTRACTING — frontend views (gated by Feature Mgmt).
+// Each view is reachable only when its feature flag is available to the user
+// (sandbox → Super-Admin only). Admin-grouped produce menu entries.
+// ===========================================================================
+function _prodErr(id, err) { const el = $(id); if (el) el.innerHTML = `<div class="card p-6 text-red-600 text-sm">${esc(err.response?.data?.error || 'Failed to load')}</div>` }
+function _prodBanner(label) {
+  return `<div class="bg-amber-50 border border-amber-200 rounded-lg p-3 mb-4 text-xs text-amber-800"><i class="fas fa-flask mr-1"></i><b>${esc(label)}</b> is part of the Produce Sourcing module under <b>Feature Management & QA</b>. It is in Sandbox/Testing until promoted to Live.</div>`
+}
+
+async function viewBuyers() {
+  $('content').innerHTML = `<div id="buyersWrap">Loading…</div>`
+  let data; try { data = (await api.get('/produce/buyer-tenants')).data } catch (err) { return _prodErr('buyersWrap', err) }
+  let sites = []; try { sites = (await api.get('/produce/intake-sites')).data.sites || [] } catch (_) {}
+  const tenants = data.tenants || []
+  $('content').innerHTML = `${_prodBanner('Buyer Portal & Intake Sites')}
+    <div class="flex gap-2 mb-4">
+      <button onclick="newBuyerModal()" class="btn brand-bg text-white px-4 py-2 rounded-lg text-sm"><i class="fas fa-plus mr-1"></i>New Buyer Enterprise</button>
+      <button onclick="newSiteModal()" class="btn bg-slate-100 px-4 py-2 rounded-lg text-sm"><i class="fas fa-map-location-dot mr-1"></i>New Intake Site</button>
+    </div>
+    <div class="grid md:grid-cols-2 gap-4">
+      <div class="card p-4"><h3 class="font-bold mb-2 text-sm">Buyer Enterprises (${tenants.length})</h3>
+        ${tenants.length ? tenants.map(t => `<div class="border-b border-slate-100 py-2 text-sm"><b>${esc(t.name)}</b> <span class="text-xs text-slate-400 font-mono">${esc(t.tenant_ref)}</span><div class="text-xs text-slate-500">${esc(t.contact_phone || '')} ${esc(t.contact_email || '')}</div></div>`).join('') : '<div class="text-slate-400 text-sm">No buyer enterprises yet.</div>'}</div>
+      <div class="card p-4"><h3 class="font-bold mb-2 text-sm">Intake Sites (${sites.length})</h3>
+        ${sites.length ? sites.map(s => `<div class="border-b border-slate-100 py-2 text-sm"><b>${esc(s.name)}</b> <span class="text-xs text-slate-400 font-mono">${esc(s.site_ref)}</span><div class="text-xs text-slate-500">${esc(s.location || '')}${s.requires_slot ? ' · slot required' : ''}</div></div>`).join('') : '<div class="text-slate-400 text-sm">No intake sites yet.</div>'}</div>
+    </div>`
+}
+window.newBuyerModal = () => showModal(`<h3 class="font-bold mb-3"><i class="fas fa-industry mr-2"></i>New Buyer Enterprise</h3>
+  <input id="bt_name" placeholder="Company name" class="w-full mb-2 px-3 py-2 border rounded-lg">
+  <input id="bt_phone" placeholder="Contact phone" class="w-full mb-2 px-3 py-2 border rounded-lg">
+  <input id="bt_email" placeholder="Contact email" class="w-full mb-3 px-3 py-2 border rounded-lg">
+  <div class="flex gap-2"><button onclick="createBuyer()" class="btn brand-bg text-white flex-1 py-2 rounded-lg text-sm">Create</button><button onclick="closeModal()" class="btn bg-slate-100 px-4 rounded-lg text-sm">Cancel</button></div>`)
+window.createBuyer = async () => {
+  try { await api.post('/produce/buyer-tenants', { name: $('bt_name').value, contact_phone: $('bt_phone').value, contact_email: $('bt_email').value }); toast('Buyer enterprise created'); closeModal(); viewBuyers() }
+  catch (err) { toast(err.response?.data?.error || 'Failed', false) }
+}
+window.newSiteModal = async () => {
+  let tenants = []; try { tenants = (await api.get('/produce/buyer-tenants')).data.tenants || [] } catch (_) {}
+  showModal(`<h3 class="font-bold mb-3"><i class="fas fa-map-location-dot mr-2"></i>New Intake Site</h3>
+  <select id="st_tenant" class="w-full mb-2 px-3 py-2 border rounded-lg"><option value="">— Buyer enterprise (optional) —</option>${tenants.map(t => `<option value="${t.id}">${esc(t.name)}</option>`).join('')}</select>
+  <input id="st_name" placeholder="Site name" class="w-full mb-2 px-3 py-2 border rounded-lg">
+  <input id="st_loc" placeholder="Location" class="w-full mb-2 px-3 py-2 border rounded-lg">
+  <label class="flex items-center gap-2 text-sm mb-3"><input type="checkbox" id="st_slot" checked> Require slot booking before tipping</label>
+  <div class="flex gap-2"><button onclick="createSite()" class="btn brand-bg text-white flex-1 py-2 rounded-lg text-sm">Create</button><button onclick="closeModal()" class="btn bg-slate-100 px-4 rounded-lg text-sm">Cancel</button></div>`)
+}
+window.createSite = async () => {
+  try { await api.post('/produce/intake-sites', { buyer_tenant_id: $('st_tenant').value || null, name: $('st_name').value, location: $('st_loc').value, requires_slot: $('st_slot').checked }); toast('Intake site created'); closeModal(); viewBuyers() }
+  catch (err) { toast(err.response?.data?.error || 'Failed', false) }
+}
+
+async function viewCashboards() {
+  $('content').innerHTML = `<div id="cbWrap">Loading…</div>`
+  let data; try { data = (await api.get('/produce/cashboard')).data } catch (err) { return _prodErr('cbWrap', err) }
+  const bids = data.bids || []
+  $('content').innerHTML = `${_prodBanner('Cashboards & Live Bidding')}
+    <button onclick="newBidModal()" class="btn brand-bg text-white px-4 py-2 rounded-lg text-sm mb-4"><i class="fas fa-plus mr-1"></i>Post Live Bid</button>
+    <div class="card p-4"><h3 class="font-bold mb-2 text-sm">Live Bids (${bids.length})</h3>
+    ${bids.length ? `<table class="w-full text-sm"><thead class="text-slate-400 text-xs"><tr><th class="text-left">Ref</th><th class="text-left">Commodity</th><th class="text-left">Grade</th><th class="text-right">Price</th><th></th></tr></thead><tbody>
+      ${bids.map(b => `<tr class="border-t border-slate-100"><td class="font-mono text-xs">${esc(b.bid_ref)}</td><td>${esc(b.commodity)}</td><td>${esc(b.grade || '—')}</td><td class="text-right">${fmt(b.price)}${b.price_max ? '–' + fmt(b.price_max) : ''}</td><td class="text-right"><button onclick="acceptBidModal(${b.id})" class="text-emerald-600 text-xs hover:underline">Accept</button></td></tr>`).join('')}
+    </tbody></table>` : '<div class="text-slate-400 text-sm">No live bids.</div>'}</div>`
+}
+window.newBidModal = () => showModal(`<h3 class="font-bold mb-3"><i class="fas fa-chart-line mr-2"></i>Post Live Bid</h3>
+  <input id="bd_commodity" placeholder="Commodity (e.g. Maize)" class="w-full mb-2 px-3 py-2 border rounded-lg">
+  <input id="bd_grade" placeholder="Grade (optional)" class="w-full mb-2 px-3 py-2 border rounded-lg">
+  <input id="bd_price" type="number" step="0.01" placeholder="Price per KG" class="w-full mb-3 px-3 py-2 border rounded-lg">
+  <div class="flex gap-2"><button onclick="createBid()" class="btn brand-bg text-white flex-1 py-2 rounded-lg text-sm">Post</button><button onclick="closeModal()" class="btn bg-slate-100 px-4 rounded-lg text-sm">Cancel</button></div>`)
+window.createBid = async () => {
+  try { await api.post('/produce/cashboard', { commodity: $('bd_commodity').value, grade: $('bd_grade').value, price: Number($('bd_price').value) }); toast('Live bid posted'); closeModal(); viewCashboards() }
+  catch (err) { toast(err.response?.data?.error || 'Failed', false) }
+}
+window.acceptBidModal = (id) => showModal(`<h3 class="font-bold mb-3"><i class="fas fa-handshake mr-2"></i>Accept Bid → Execute Contract</h3>
+  <p class="text-xs text-slate-500 mb-2">Accepting converts this live bid into an executed offtake contract.</p>
+  <input id="ab_vol" type="number" step="0.01" placeholder="Target volume" class="w-full mb-2 px-3 py-2 border rounded-lg">
+  <select id="ab_unit" class="w-full mb-3 px-3 py-2 border rounded-lg"><option value="KG">KG</option><option value="MT">MT</option></select>
+  <div class="flex gap-2"><button onclick="acceptBid(${id})" class="btn bg-emerald-600 text-white flex-1 py-2 rounded-lg text-sm">Accept & Execute</button><button onclick="closeModal()" class="btn bg-slate-100 px-4 rounded-lg text-sm">Cancel</button></div>`)
+window.acceptBid = async (id) => {
+  try { const { data } = await api.post(`/produce/cashboard/${id}/accept`, { target_volume: Number($('ab_vol').value), volume_unit: $('ab_unit').value }); toast('Contract executed: ' + data.contract_ref); closeModal(); viewCashboards() }
+  catch (err) { toast(err.response?.data?.error || 'Failed', false) }
+}
+
+async function viewSlotting() {
+  $('content').innerHTML = `<div id="slWrap">Loading…</div>`
+  let data, sites = []; try { data = (await api.get('/produce/slots')).data; sites = (await api.get('/produce/intake-sites')).data.sites || [] } catch (err) { return _prodErr('slWrap', err) }
+  const slots = data.slots || []
+  $('content').innerHTML = `${_prodBanner('Time Slotting')}
+    <button onclick="newSlotModal()" class="btn brand-bg text-white px-4 py-2 rounded-lg text-sm mb-4"><i class="fas fa-plus mr-1"></i>Book Slot</button>
+    <div class="card p-4"><h3 class="font-bold mb-2 text-sm">Delivery Slots (${slots.length})</h3>
+    ${slots.length ? slots.map(s => `<div class="border-b border-slate-100 py-2 text-sm flex justify-between"><div><b>${esc(s.commodity || 'Load')}</b> ${esc(s.grade || '')} <span class="text-xs text-slate-400">${esc(s.slot_start || '')}</span></div><span class="badge bg-slate-100 text-xs">${esc(s.status)}</span></div>`).join('') : '<div class="text-slate-400 text-sm">No slots booked.</div>'}</div>`
+  window._prodSites = sites
+}
+window.newSlotModal = () => { const sites = window._prodSites || []; showModal(`<h3 class="font-bold mb-3"><i class="fas fa-calendar-check mr-2"></i>Book Delivery Slot</h3>
+  <select id="sl_site" class="w-full mb-2 px-3 py-2 border rounded-lg"><option value="">— Intake site —</option>${sites.map(s => `<option value="${s.id}">${esc(s.name)}</option>`).join('')}</select>
+  <input id="sl_commodity" placeholder="Commodity" class="w-full mb-2 px-3 py-2 border rounded-lg">
+  <input id="sl_start" type="datetime-local" class="w-full mb-2 px-3 py-2 border rounded-lg">
+  <select id="sl_type" class="w-full mb-3 px-3 py-2 border rounded-lg"><option value="inload">Inload</option><option value="outload">Outload</option></select>
+  <div class="flex gap-2"><button onclick="createSlot()" class="btn brand-bg text-white flex-1 py-2 rounded-lg text-sm">Book</button><button onclick="closeModal()" class="btn bg-slate-100 px-4 rounded-lg text-sm">Cancel</button></div>`) }
+window.createSlot = async () => {
+  try { await api.post('/produce/slots', { intake_site_id: $('sl_site').value || null, commodity: $('sl_commodity').value, slot_start: $('sl_start').value, load_type: $('sl_type').value }); toast('Slot booked'); closeModal(); viewSlotting() }
+  catch (err) { toast(err.response?.data?.error || 'Failed', false) }
+}
+
+async function viewProduceOrders() {
+  $('content').innerHTML = `<div id="poWrap">Loading…</div>`
+  let data; try { data = (await api.get('/produce/orders')).data } catch (err) { return _prodErr('poWrap', err) }
+  const orders = data.orders || []
+  $('content').innerHTML = `${_prodBanner('Orders & Freight')}
+    <button onclick="newProduceOrderModal()" class="btn brand-bg text-white px-4 py-2 rounded-lg text-sm mb-4"><i class="fas fa-plus mr-1"></i>New Order</button>
+    <div class="card p-4"><h3 class="font-bold mb-2 text-sm">Orders (${orders.length})</h3>
+    ${orders.length ? orders.map(o => `<div class="border-b border-slate-100 py-2 text-sm flex justify-between"><div><b>${esc(o.commodity || o.order_type)}</b> <span class="text-xs text-slate-400 font-mono">${esc(o.order_ref)}</span><div class="text-xs text-slate-500">${esc(o.origin || '')} → ${esc(o.destination || '')} · ${o.tonnage || 0}t</div></div><span class="badge bg-slate-100 text-xs">${esc(o.status)}</span></div>`).join('') : '<div class="text-slate-400 text-sm">No orders.</div>'}</div>`
+}
+window.newProduceOrderModal = () => showModal(`<h3 class="font-bold mb-3"><i class="fas fa-clipboard-list mr-2"></i>New Order</h3>
+  <select id="po_type" class="w-full mb-2 px-3 py-2 border rounded-lg"><option value="freight">Freight</option><option value="call_on_grain">Call-on-Grain</option><option value="request">Request</option><option value="pack">Pack</option></select>
+  <input id="po_commodity" placeholder="Commodity" class="w-full mb-2 px-3 py-2 border rounded-lg">
+  <input id="po_origin" placeholder="Origin" class="w-full mb-2 px-3 py-2 border rounded-lg">
+  <input id="po_dest" placeholder="Destination" class="w-full mb-2 px-3 py-2 border rounded-lg">
+  <input id="po_tonnage" type="number" step="0.01" placeholder="Tonnage" class="w-full mb-3 px-3 py-2 border rounded-lg">
+  <div class="flex gap-2"><button onclick="createProduceOrder()" class="btn brand-bg text-white flex-1 py-2 rounded-lg text-sm">Create</button><button onclick="closeModal()" class="btn bg-slate-100 px-4 rounded-lg text-sm">Cancel</button></div>`)
+window.createProduceOrder = async () => {
+  try { await api.post('/produce/orders', { order_type: $('po_type').value, commodity: $('po_commodity').value, origin: $('po_origin').value, destination: $('po_dest').value, tonnage: Number($('po_tonnage').value) }); toast('Order created'); closeModal(); viewProduceOrders() }
+  catch (err) { toast(err.response?.data?.error || 'Failed', false) }
+}
+
+async function viewMovements() {
+  $('content').innerHTML = `<div id="mvWrap">Loading…</div>`
+  let data; try { data = (await api.get('/produce/movements')).data } catch (err) { return _prodErr('mvWrap', err) }
+  const movs = data.movements || []
+  $('content').innerHTML = `${_prodBanner('Commodity Movements')}
+    <button onclick="newMovementModal()" class="btn brand-bg text-white px-4 py-2 rounded-lg text-sm mb-4"><i class="fas fa-plus mr-1"></i>Log Movement</button>
+    <div class="card p-4"><h3 class="font-bold mb-2 text-sm">Movements (${movs.length})</h3>
+    ${movs.length ? `<table class="w-full text-sm"><thead class="text-slate-400 text-xs"><tr><th class="text-left">Ref</th><th class="text-left">Commodity</th><th class="text-right">Net (KG)</th><th class="text-left">Status</th></tr></thead><tbody>
+      ${movs.map(m => `<tr class="border-t border-slate-100"><td class="font-mono text-xs">${esc(m.movement_ref)}</td><td>${esc(m.commodity || '')}</td><td class="text-right">${Number(m.net_weight||0).toLocaleString()}</td><td>${esc(m.status)}</td></tr>`).join('')}
+    </tbody></table>` : '<div class="text-slate-400 text-sm">No movements logged.</div>'}</div>`
+}
+window.newMovementModal = () => showModal(`<h3 class="font-bold mb-3"><i class="fas fa-route mr-2"></i>Log Movement</h3>
+  <input id="mv_commodity" placeholder="Commodity" class="w-full mb-2 px-3 py-2 border rounded-lg">
+  <input id="mv_gross" type="number" step="0.01" placeholder="Gross weight (KG)" class="w-full mb-2 px-3 py-2 border rounded-lg">
+  <input id="mv_tare" type="number" step="0.01" placeholder="Tare weight (KG)" class="w-full mb-2 px-3 py-2 border rounded-lg">
+  <input id="mv_moist" type="number" step="0.01" placeholder="Moisture %" class="w-full mb-3 px-3 py-2 border rounded-lg">
+  <div class="flex gap-2"><button onclick="createMovement()" class="btn brand-bg text-white flex-1 py-2 rounded-lg text-sm">Log</button><button onclick="closeModal()" class="btn bg-slate-100 px-4 rounded-lg text-sm">Cancel</button></div>`)
+window.createMovement = async () => {
+  try { const { data } = await api.post('/produce/movements', { commodity: $('mv_commodity').value, gross_weight: Number($('mv_gross').value), tare_weight: Number($('mv_tare').value), moisture_pct: Number($('mv_moist').value) }); toast('Movement logged · net ' + data.net_weight + 'KG'); closeModal(); viewMovements() }
+  catch (err) { toast(err.response?.data?.error || 'Failed', false) }
+}
+
+async function viewSettlement() {
+  $('content').innerHTML = `<div id="seWrap">Loading…</div>`
+  let data; try { data = (await api.get('/produce/settlement')).data } catch (err) { return _prodErr('seWrap', err) }
+  const rows = data.settlements || []
+  $('content').innerHTML = `${_prodBanner('Closed-Loop Settlement & RCTI')}
+    <button onclick="newSettlementModal()" class="btn brand-bg text-white px-4 py-2 rounded-lg text-sm mb-4"><i class="fas fa-calculator mr-1"></i>Run Settlement</button>
+    <div class="card p-4"><h3 class="font-bold mb-2 text-sm">Settlements (${rows.length})</h3>
+    ${rows.length ? `<table class="w-full text-sm"><thead class="text-slate-400 text-xs"><tr><th class="text-left">RCTI</th><th class="text-right">Gross</th><th class="text-right">Loan Offset</th><th class="text-right">Fee</th><th class="text-right">Freight</th><th class="text-right">Net</th><th>Status</th></tr></thead><tbody>
+      ${rows.map(s => `<tr class="border-t border-slate-100"><td class="font-mono text-xs">${esc(s.rcti_ref||'')}</td><td class="text-right">${fmt(s.gross_value)}</td><td class="text-right text-amber-700">${fmt(s.input_loan_offset)}</td><td class="text-right">${fmt(s.platform_fee)}</td><td class="text-right">${fmt(s.freight_deduction)}</td><td class="text-right font-semibold text-emerald-700">${fmt(s.net_payout)}</td><td>${s.status === 'settled' ? '<span class="badge bg-emerald-100 text-emerald-700 text-xs">settled</span>' : `<button onclick="paySettlement(${s.id})" class="text-emerald-600 text-xs hover:underline">Pay</button>`}</td></tr>`).join('')}
+    </tbody></table>` : '<div class="text-slate-400 text-sm">No settlements yet.</div>'}</div>`
+}
+window.newSettlementModal = () => showModal(`<h3 class="font-bold mb-3"><i class="fas fa-calculator mr-2"></i>Run Closed-Loop Settlement</h3>
+  <p class="text-xs text-slate-500 mb-2">Net = Gross − (Input Loan Offset + Platform Fee + Freight).</p>
+  <input id="se_farmer" placeholder="Farmer user id (optional — auto loan offset)" class="w-full mb-2 px-3 py-2 border rounded-lg">
+  <input id="se_gross" type="number" step="0.01" placeholder="Gross produce value" class="w-full mb-2 px-3 py-2 border rounded-lg">
+  <input id="se_feepct" type="number" step="0.01" placeholder="Platform fee %" class="w-full mb-2 px-3 py-2 border rounded-lg">
+  <input id="se_freight" type="number" step="0.01" placeholder="Freight deduction" class="w-full mb-3 px-3 py-2 border rounded-lg">
+  <div class="flex gap-2"><button onclick="createSettlement()" class="btn brand-bg text-white flex-1 py-2 rounded-lg text-sm">Generate RCTI & Settle</button><button onclick="closeModal()" class="btn bg-slate-100 px-4 rounded-lg text-sm">Cancel</button></div>`)
+window.createSettlement = async () => {
+  try { const { data } = await api.post('/produce/settlement', { farmer_id: $('se_farmer').value || null, gross_value: Number($('se_gross').value), platform_fee_pct: Number($('se_feepct').value) || 0, freight_deduction: Number($('se_freight').value) || 0 }); toast('RCTI ' + data.rcti_ref + ' · net ' + fmt(data.net_payout)); closeModal(); viewSettlement() }
+  catch (err) { toast(err.response?.data?.error || 'Failed', false) }
+}
+window.paySettlement = async (id) => { try { await api.put(`/produce/settlement/${id}/pay`, {}); toast('Net paid to farmer'); viewSettlement() } catch (err) { toast(err.response?.data?.error || 'Failed', false) } }
+
+async function viewStocks() {
+  $('content').innerHTML = `<div id="skWrap">Loading…</div>`
+  let data, cor = [], containers = []
+  try { data = (await api.get('/produce/stock')).data } catch (err) { return _prodErr('skWrap', err) }
+  try { cor = (await api.get('/produce/cor')).data.declarations || [] } catch (_) {}
+  try { containers = (await api.get('/produce/containers')).data.containers || [] } catch (_) {}
+  const ledger = data.ledger || []
+  $('content').innerHTML = `${_prodBanner('Stocks & Ledger')}
+    <button onclick="newStockModal()" class="btn brand-bg text-white px-4 py-2 rounded-lg text-sm mb-4"><i class="fas fa-plus mr-1"></i>Stock Entry</button>
+    <div class="grid md:grid-cols-2 gap-4">
+      <div class="card p-4"><h3 class="font-bold mb-2 text-sm">Stock Ledger (${ledger.length})</h3>
+        ${ledger.length ? ledger.map(l => `<div class="border-b border-slate-100 py-2 text-sm flex justify-between"><div><b>${esc(l.commodity || '')}</b> ${esc(l.grade || '')}<div class="text-xs text-slate-400">${esc(l.movement_kind)}</div></div><span>${Number(l.quantity_kg||0).toLocaleString()} KG</span></div>`).join('') : '<div class="text-slate-400 text-sm">No stock entries.</div>'}</div>
+      <div class="card p-4"><h3 class="font-bold mb-2 text-sm">CoR Declarations (${cor.length}) · Containers (${containers.length})</h3>
+        ${cor.slice(0,8).map(d => `<div class="border-b border-slate-100 py-1.5 text-xs">${esc(d.declaration_ref)} · ${d.mass_kg}/${d.mass_limit_kg}kg ${d.overweight ? '<span class="text-red-600 font-semibold">OVERWEIGHT</span>' : '<span class="text-emerald-600">OK</span>'}</div>`).join('') || '<div class="text-slate-400 text-xs">No CoR declarations.</div>'}
+        ${containers.slice(0,6).map(c => `<div class="border-b border-slate-100 py-1.5 text-xs">${esc(c.pack_ref)} · ${esc(c.container_no || '')} · ${esc(c.status)}</div>`).join('')}
+      </div>
+    </div>`
+}
+window.newStockModal = () => showModal(`<h3 class="font-bold mb-3"><i class="fas fa-warehouse mr-2"></i>Stock Ledger Entry</h3>
+  <input id="sk_commodity" placeholder="Commodity" class="w-full mb-2 px-3 py-2 border rounded-lg">
+  <input id="sk_grade" placeholder="Grade" class="w-full mb-2 px-3 py-2 border rounded-lg">
+  <input id="sk_qty" type="number" step="0.01" placeholder="Quantity (KG)" class="w-full mb-2 px-3 py-2 border rounded-lg">
+  <select id="sk_kind" class="w-full mb-3 px-3 py-2 border rounded-lg"><option value="inload">Inload</option><option value="outload">Outload</option><option value="regrade">Regrade</option><option value="reseason">Reseason</option></select>
+  <div class="flex gap-2"><button onclick="createStock()" class="btn brand-bg text-white flex-1 py-2 rounded-lg text-sm">Save</button><button onclick="closeModal()" class="btn bg-slate-100 px-4 rounded-lg text-sm">Cancel</button></div>`)
+window.createStock = async () => {
+  try { await api.post('/produce/stock', { commodity: $('sk_commodity').value, grade: $('sk_grade').value, quantity_kg: Number($('sk_qty').value), movement_kind: $('sk_kind').value }); toast('Stock entry saved'); closeModal(); viewStocks() }
+  catch (err) { toast(err.response?.data?.error || 'Failed', false) }
 }
