@@ -208,6 +208,28 @@ export class PostgresD1 implements D1Like {
   async setSessionConfig(name: string, value: string): Promise<void> {
     await this.pool.query('SELECT set_config($1, $2, false)', [name, value == null ? '' : String(value)])
   }
+
+  /**
+   * Run a callback on a SINGLE pinned connection under ADMIN Row-Level-Security
+   * context. CRITICAL for privileged server-internal writes that must pass a
+   * table's FORCE RLS WITH CHECK policy when there is NO authenticated caller
+   * yet (e.g. public self sign-up inserting into the RLS-forced `customers`
+   * table). One dedicated connection guarantees the admin GUC and the write
+   * share the same session.
+   */
+  async runAsAdmin(fn) {
+    const client = await this.pool.connect()
+    try {
+      await client.query(`SELECT set_config('app.current_role', 'admin', false)`)
+      await client.query(`SELECT set_config('app.user_can_finance', 'true', false)`)
+      const exec = (sql, params = []) => client.query(sql, params)
+      return await fn(exec)
+    } finally {
+      try { await client.query(`SELECT set_config('app.current_role', '', false)`) } catch (_e) {}
+      try { await client.query(`SELECT set_config('app.user_can_finance', 'false', false)`) } catch (_e) {}
+      client.release()
+    }
+  }
 }
 
 export async function openDatabase(connectionString: string): Promise<{ d1: PostgresD1; raw: Pool }> {

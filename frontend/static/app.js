@@ -1266,6 +1266,30 @@ window.logout = logout
 // ---------------------------------------------------------------------------
 // APP SHELL + NAV
 // ---------------------------------------------------------------------------
+// Render a single sidebar entry — either a flat nav-link or a collapsible group
+// (dropdown) whose children are the authorized sub-modules. A group auto-expands
+// when the active route is one of its children.
+function renderNavItem(it) {
+  if (!it.group) {
+    return `<div class="nav-link px-5 py-3 flex items-center gap-3 text-sm hover:bg-white/10 ${state.route === it.k ? 'active' : ''}" onclick="go('${it.k}')"><i class="fas ${it.i} w-5"></i>${it.t}</div>`
+  }
+  const childKeys = (it.children || []).map(ch => ch.k)
+  const activeChild = childKeys.includes(state.route)
+  const expanded = activeChild || _openNavGroups.has(it.group)
+  const chevron = expanded ? 'fa-chevron-down' : 'fa-chevron-right'
+  const header = `<div class="nav-link nav-group-header px-5 py-3 flex items-center gap-3 text-sm hover:bg-white/10 cursor-pointer ${activeChild ? 'active' : ''}" onclick="toggleNavGroup('${it.group}')">
+      <i class="fas ${it.i} w-5"></i><span class="flex-1">${esc(it.t)}</span><i class="fas ${chevron} text-xs opacity-70"></i></div>`
+  const children = `<div class="nav-group-children ${expanded ? '' : 'hidden'}">
+      ${(it.children || []).map(ch => `<div class="nav-link pl-12 pr-5 py-2.5 flex items-center gap-3 text-sm hover:bg-white/10 ${state.route === ch.k ? 'active' : ''}" onclick="go('${ch.k}')"><i class="fas ${ch.i} w-5"></i>${esc(ch.t)}</div>`).join('')}</div>`
+  return header + children
+}
+let _openNavGroups = new Set()
+window.toggleNavGroup = (g) => {
+  if (_openNavGroups.has(g)) _openNavGroups.delete(g); else _openNavGroups.add(g)
+  // Re-render just the sidebar nav in place (cheap) by re-rendering the shell nav.
+  const nav = document.querySelector('#appSidebar nav')
+  if (nav) nav.innerHTML = navItems().map(it => renderNavItem(it)).join('')
+}
 function navItems() {
   const r = state.user.role
   const account = { k: 'profile', i: 'fa-id-card', t: 'My Account' }
@@ -1277,21 +1301,38 @@ function navItems() {
   const crm = { k: 'crm', i: 'fa-headset', t: 'Sales & Support CRM' }
   const fieldVisits = { k: 'field_visits', i: 'fa-clipboard-user', t: 'Field Visits' }
   const transactions = { k: 'transactions', i: 'fa-building-columns', t: 'Transactions' }
-  // Governed (Feature Management & QA) nav entries — hidden until the feature is
-  // available to this user (sandbox→Super-Admin only; testing→whitelist; live).
-  const offtakeNav = featureOn('offtake_contracting') ? [{ k: 'offtake', i: 'fa-handshake', t: 'Offtake Contracts' }] : []
-  const matchingNav = featureOn('admin_matching_engine') ? [{ k: 'matching', i: 'fa-people-arrows', t: 'Match Buyers & Outgrowers' }] : []
-  const aggregationNav = featureOn('agent_aggregation') ? [{ k: 'aggregation', i: 'fa-weight-scale', t: 'Produce Aggregation' }] : []
-  const logisticsNav = featureOn('logistics_telemetry') ? [{ k: 'logistics', i: 'fa-truck-fast', t: 'Logistics & Tracking' }] : []
-  const traceNav = featureOn('traceability_ledger') ? [{ k: 'traceability', i: 'fa-qrcode', t: 'Traceability' }] : []
-  const buyerNav = featureOn('buyer_portal') ? [{ k: 'buyers', i: 'fa-industry', t: 'Buyer Portal & Sites' }] : []
-  const cashboardNav = featureOn('cashboards_bidding') ? [{ k: 'cashboards', i: 'fa-chart-line', t: 'Cashboards & Bids' }] : []
-  const slottingNav = featureOn('time_slotting') ? [{ k: 'slotting', i: 'fa-calendar-check', t: 'Time Slotting' }] : []
-  const ordersNav = featureOn('order_management') ? [{ k: 'produce_orders', i: 'fa-clipboard-list', t: 'Orders & Freight' }] : []
-  const movementsNav = featureOn('movement_tracking') ? [{ k: 'movements', i: 'fa-route', t: 'Movements' }] : []
-  const settlementNav = featureOn('closed_loop_settlement') ? [{ k: 'settlement', i: 'fa-money-bill-transfer', t: 'Settlement & RCTI' }] : []
-  const stocksNav = featureOn('stock_ledger') ? [{ k: 'stocks', i: 'fa-warehouse', t: 'Stocks & Ledger' }] : []
-  const produceNav = [...buyerNav, ...cashboardNav, ...slottingNav, ...ordersNav, ...movementsNav, ...settlementNav, ...stocksNav]
+  // ---- OFFTAKE CONTRACTING: a single collapsible sidebar group. -------------
+  // Every sub-module is both FEATURE-gated (featureOn → sandbox/testing/live
+  // availability per user) AND, for non-super-admins, RBAC-gated by the matching
+  // permission. The group renders only the sub-modules the user may actually
+  // access; if none are available the whole group is hidden. Super-Admin sees
+  // every available sub-module. This delivers dynamic, granular RBAC filtering.
+  const isSuper = r === 'super_admin'
+  // sub-module: { k, i, t, f: featureKey, p: [permissions that grant it] }
+  const OFFTAKE_SUBMODULES = [
+    { k: 'offtake',        i: 'fa-handshake',          t: 'Offtake Contracts',        f: 'offtake_contracting',    p: ['manage_offtake', 'match_outgrowers'] },
+    { k: 'matching',       i: 'fa-people-arrows',      t: 'Match Buyers & Outgrowers',f: 'admin_matching_engine',  p: ['match_outgrowers'] },
+    { k: 'aggregation',    i: 'fa-weight-scale',       t: 'Produce Aggregation',      f: 'agent_aggregation',      p: ['aggregate_produce'] },
+    { k: 'logistics',      i: 'fa-truck-fast',         t: 'Logistics & Tracking',     f: 'logistics_telemetry',    p: ['manage_logistics'] },
+    { k: 'traceability',   i: 'fa-qrcode',             t: 'Traceability',             f: 'traceability_ledger',    p: ['view_traceability'] },
+    { k: 'buyers',         i: 'fa-industry',           t: 'Buyer Portal & Sites',     f: 'buyer_portal',           p: ['manage_buyer_tenant', 'manage_intake_sites'] },
+    { k: 'cashboards',     i: 'fa-chart-line',         t: 'Cashboards & Bids',        f: 'cashboards_bidding',     p: ['manage_cashboards', 'accept_bids'] },
+    { k: 'slotting',       i: 'fa-calendar-check',     t: 'Time Slotting',            f: 'time_slotting',          p: ['manage_slots', 'book_slots'] },
+    { k: 'produce_orders', i: 'fa-clipboard-list',     t: 'Orders & Freight',         f: 'order_management',       p: ['manage_orders', 'manage_freight'] },
+    { k: 'movements',      i: 'fa-route',              t: 'Movements',                f: 'movement_tracking',      p: ['log_movements'] },
+    { k: 'settlement',     i: 'fa-money-bill-transfer',t: 'Settlement & RCTI',        f: 'closed_loop_settlement', p: ['manage_settlement'] },
+    { k: 'stocks',         i: 'fa-warehouse',          t: 'Stocks & Ledger',          f: 'stock_ledger',           p: ['manage_stock_ledger'] }
+  ]
+  const offtakeChildren = OFFTAKE_SUBMODULES.filter(m =>
+    featureOn(m.f) && (isSuper || r === 'admin' || !m.p || m.p.length === 0 || m.p.some(perm => canDo(perm)))
+  ).map(m => ({ k: m.k, i: m.i, t: m.t }))
+  // The collapsible group — omitted entirely when the user has no sub-modules.
+  const offtakeGroup = offtakeChildren.length
+    ? [{ group: 'offtake_contracting', i: 'fa-seedling', t: 'Offtake Contracting', children: offtakeChildren }]
+    : []
+  // Back-compat spreads so existing per-role nav lines keep working; the group
+  // supersedes the individual entries (we inject offtakeGroup instead).
+  const offtakeNav = [], matchingNav = [], aggregationNav = [], logisticsNav = [], traceNav = [], produceNav = []
   if (r === 'super_admin' || r === 'admin') return withAccount([...common,
     { k: 'approvals', i: 'fa-clipboard-check', t: 'Approvals' },
     { k: 'inventory', i: 'fa-boxes-stacked', t: 'Inventory' },
@@ -1301,8 +1342,7 @@ function navItems() {
     crm,
     transactions,
     { k: 'contracts', i: 'fa-file-signature', t: 'Purchases' },
-    ...offtakeNav, ...matchingNav, ...aggregationNav, ...logisticsNav, ...traceNav,
-    ...produceNav,
+    ...offtakeGroup,
     { k: 'agents', i: 'fa-user-tie', t: 'Agents' },
     { k: 'users', i: 'fa-user-gear', t: 'User Accounts' },
     { k: 'amendments', i: 'fa-id-card-clip', t: 'Pending Amendments' },
@@ -1332,13 +1372,13 @@ function navItems() {
     ...(canDo('can_manage_inventory') ? [{ k: 'inventory', i: 'fa-boxes-stacked', t: 'My Inventory' }] : []),
     ...(canDo('manage_transactions') ? [transactions] : []),
     { k: 'contracts', i: 'fa-file-signature', t: 'Purchases and Contracts' },
-    ...aggregationNav, ...logisticsNav,
+    ...offtakeGroup,
     { k: 'shop', i: 'fa-store', t: 'Shop' },
     myWallet])
   if (r === 'customer') return withAccount([...common,
     { k: 'shop', i: 'fa-store', t: 'Shop' },
     ...(canDo('manage_transactions') ? [transactions] : []),
-    ...offtakeNav, ...traceNav,
+    ...offtakeGroup,
     { k: 'contracts', i: 'fa-file-signature', t: 'My Purchases' }])
   if (r === 'support') return withAccount([...common,
     { k: 'customers', i: 'fa-users', t: 'Customers' },
@@ -1363,7 +1403,7 @@ function renderApp() {
         <img src="/static/farmsky-logo.png" alt="Farmsky" class="h-16 mx-auto object-contain">
       </div>
       <nav class="flex-1 py-4 overflow-y-auto">
-        ${items.map(it => `<div class="nav-link px-5 py-3 flex items-center gap-3 text-sm hover:bg-white/10 ${state.route === it.k ? 'active' : ''}" onclick="go('${it.k}')"><i class="fas ${it.i} w-5"></i>${it.t}</div>`).join('')}
+        ${items.map(it => renderNavItem(it)).join('')}
       </nav>
       <div class="p-4 border-t border-white/10">
         <div class="text-sm font-medium">${esc(state.user.full_name)}</div>
@@ -7613,28 +7653,72 @@ window.newShipmentModal = () => {
       <div><label class="field-label">Origin hub</label><input id="sh_origin" class="px-3 py-2 border rounded-lg w-full"></div>
       <div><label class="field-label">Destination</label><input id="sh_dest" class="px-3 py-2 border rounded-lg w-full"></div>
       <div><label class="field-label">ETA (minutes)</label><input id="sh_eta" type="number" class="px-3 py-2 border rounded-lg w-full"></div>
+      <div><label class="field-label">Destination lat</label><input id="sh_dlat" type="number" step="any" placeholder="e.g. -1.0432" class="px-3 py-2 border rounded-lg w-full"></div>
+      <div><label class="field-label">Destination lng</label><input id="sh_dlng" type="number" step="any" placeholder="e.g. 37.0833" class="px-3 py-2 border rounded-lg w-full"></div>
     </div>
+    <p class="text-[11px] text-slate-400 mt-2">Destination coordinates power the live Uber-style ETA & map. Leave blank to track by GPS breadcrumb only.</p>
     <div class="flex gap-2 mt-4"><button onclick="createShipment()" class="btn flex-1 brand-bg text-white py-2.5 rounded-lg text-sm">Create</button><button onclick="closeModal()" class="btn px-4 bg-slate-100 rounded-lg text-sm">Cancel</button></div>`)
 }
 window.createShipment = async () => {
-  try { await api.post('/logistics/shipments', { contract_id: $('sh_cid').value||null, driver_name: $('sh_driver').value, origin_hub: $('sh_origin').value, destination: $('sh_dest').value, eta_minutes: $('sh_eta').value||null }); toast('Shipment created'); closeModal(); viewLogistics() }
+  try { await api.post('/logistics/shipments', { contract_id: $('sh_cid').value||null, driver_name: $('sh_driver').value, origin_hub: $('sh_origin').value, destination: $('sh_dest').value, eta_minutes: $('sh_eta').value||null, dest_lat: $('sh_dlat').value||null, dest_lng: $('sh_dlng').value||null }); toast('Shipment created'); closeModal(); viewLogistics() }
   catch (err) { toast(err.response?.data?.error || 'Failed', false) }
 }
 let _trackTimer = null
+// Draw an Uber-like live breadcrumb map on a canvas: route polyline, the live
+// vehicle marker, and the destination pin. Works with NO external API key; if a
+// Maps API key is configured, a "Open in Google Maps" deep-link is also shown.
+function drawTrackMap(canvas, route, dest) {
+  if (!canvas) return
+  const ctx = canvas.getContext('2d'); const W = canvas.width, H = canvas.height
+  ctx.clearRect(0, 0, W, H); ctx.fillStyle = '#0f172a'; ctx.fillRect(0, 0, W, H)
+  const pts = (route || []).filter(p => p.lat != null && p.lng != null)
+  const all = dest && dest.lat != null ? pts.concat([dest]) : pts
+  if (!all.length) { ctx.fillStyle = '#64748b'; ctx.font = '12px sans-serif'; ctx.fillText('Awaiting first GPS ping…', 16, H / 2); return }
+  const lats = all.map(p => p.lat), lngs = all.map(p => p.lng)
+  let minLat = Math.min(...lats), maxLat = Math.max(...lats), minLng = Math.min(...lngs), maxLng = Math.max(...lngs)
+  if (maxLat - minLat < 0.01) { minLat -= 0.01; maxLat += 0.01 }
+  if (maxLng - minLng < 0.01) { minLng -= 0.01; maxLng += 0.01 }
+  const pad = 24
+  const X = lng => pad + (lng - minLng) / (maxLng - minLng) * (W - 2 * pad)
+  const Y = lat => H - pad - (lat - minLat) / (maxLat - minLat) * (H - 2 * pad)
+  // route polyline
+  if (pts.length > 1) {
+    ctx.strokeStyle = '#2dd4bf'; ctx.lineWidth = 3; ctx.beginPath()
+    pts.forEach((p, i) => { const x = X(p.lng), y = Y(p.lat); i ? ctx.lineTo(x, y) : ctx.moveTo(x, y) }); ctx.stroke()
+  }
+  // destination pin
+  if (dest && dest.lat != null) { ctx.fillStyle = '#f59e0b'; ctx.beginPath(); ctx.arc(X(dest.lng), Y(dest.lat), 7, 0, 7); ctx.fill(); ctx.fillStyle = '#fde68a'; ctx.font = '10px sans-serif'; ctx.fillText('Destination', X(dest.lng) + 9, Y(dest.lat) + 3) }
+  // live vehicle marker (latest ping)
+  const cur = pts[pts.length - 1]
+  if (cur) { ctx.fillStyle = '#22c55e'; ctx.beginPath(); ctx.arc(X(cur.lng), Y(cur.lat), 6, 0, 7); ctx.fill(); ctx.strokeStyle = '#86efac'; ctx.lineWidth = 2; ctx.beginPath(); ctx.arc(X(cur.lng), Y(cur.lat), 11, 0, 7); ctx.stroke() }
+}
+let _trackMapKey = undefined
 window.trackShipment = async (id) => {
+  if (_trackMapKey === undefined) { try { _trackMapKey = (await api.get('/logistics/map-config')).data.maps_api_key || null } catch (_) { _trackMapKey = null } }
   const render = async () => {
     let d; try { d = (await api.get('/logistics/shipments/' + id + '/track')).data } catch (_) { return }
     const s = d.shipment, last = (d.pings||[])[0] || {}
-    const eta = s.eta_minutes ? `${Math.floor(s.eta_minutes/60)}h ${s.eta_minutes%60}m` : '—'
+    const etaMin = d.eta_minutes != null ? d.eta_minutes : s.eta_minutes
+    const eta = etaMin != null ? `${Math.floor(etaMin/60)}h ${etaMin%60}m` : '—'
+    const dist = d.distance_remaining_km != null ? `${d.distance_remaining_km} km` : '—'
     const box = $('trk_box')
     if (!box) return
-    box.innerHTML = `<div class="font-mono text-xs bg-slate-900 text-emerald-300 p-4 rounded-lg leading-relaxed">
-      Driver: ${esc(s.driver_name||'—')}  |  Speed: ${last.speed_kmh!=null?last.speed_kmh+' km/h':'—'}  |  Cold Chain: ${last.temp_c!=null?last.temp_c+'°C':'—'}<br>
-      Route: ${esc(s.origin_hub||'origin')} ---[======>------]---> ${esc(s.destination||'destination')}<br>
-      Status: ${esc((s.status||'').toUpperCase())}  |  ETA: ${eta}  |  Last ping: ${last.recorded_at?esc(String(last.recorded_at)):'—'}</div>
-      <div class="text-[11px] text-slate-400 mt-2">${(d.pings||[]).length} telemetry ping(s) · live GPS + BLE cold-chain stream (10s cadence)</div>`
+    const dest = (s.dest_lat != null && s.dest_lng != null) ? { lat: s.dest_lat, lng: s.dest_lng } : null
+    const gmapLink = (_trackMapKey && last.lat != null) ? `<a href="https://www.google.com/maps?q=${last.lat},${last.lng}" target="_blank" class="text-teal-600 text-xs hover:underline"><i class="fas fa-up-right-from-square mr-1"></i>Open live position in Google Maps</a>` : ''
+    box.innerHTML = `<canvas id="trk_canvas" width="440" height="200" class="w-full rounded-lg border border-slate-200 mb-2"></canvas>
+      <div class="grid grid-cols-3 gap-2 text-center mb-2">
+        <div class="bg-emerald-50 rounded-lg p-2"><div class="text-[10px] text-slate-500 uppercase">ETA</div><div class="font-bold text-emerald-700">${eta}</div></div>
+        <div class="bg-slate-50 rounded-lg p-2"><div class="text-[10px] text-slate-500 uppercase">Distance left</div><div class="font-bold">${dist}</div></div>
+        <div class="bg-sky-50 rounded-lg p-2"><div class="text-[10px] text-slate-500 uppercase">Cold chain</div><div class="font-bold text-sky-700">${last.temp_c!=null?last.temp_c+'°C':'—'}</div></div>
+      </div>
+      <div class="font-mono text-[11px] bg-slate-900 text-emerald-300 p-3 rounded-lg leading-relaxed">
+        Driver: ${esc(s.driver_name||'—')}  |  Speed: ${last.speed_kmh!=null?last.speed_kmh+' km/h':'—'}<br>
+        Route: ${esc(s.origin_hub||'origin')} → ${esc(s.destination||'destination')}<br>
+        Status: ${esc((s.status||'').toUpperCase())}  |  Last ping: ${last.recorded_at?esc(String(last.recorded_at)):'—'}</div>
+      <div class="text-[11px] text-slate-400 mt-2">${(d.pings||[]).length} telemetry ping(s) · live GPS + BLE cold-chain stream (10s cadence) ${gmapLink}</div>`
+    drawTrackMap($('trk_canvas'), d.route, dest)
   }
-  showModal(`<h3 class="text-lg font-bold mb-3"><i class="fas fa-location-crosshairs text-teal-600 mr-2"></i>In-Transit Freight Tracking</h3>
+  showModal(`<h3 class="text-lg font-bold mb-3"><i class="fas fa-location-crosshairs text-teal-600 mr-2"></i>Live Freight Tracking</h3>
     <div id="trk_box" class="mb-3"><div class="text-sm text-slate-400 py-6 text-center"><i class="fas fa-spinner fa-spin mr-1"></i>Loading telemetry…</div></div>
     ${(canDo('manage_logistics') || ['admin','super_admin','operations_finance'].includes(state.user.role)) ? `<div class="flex gap-2">
       <button onclick="simulatePing(${id})" class="btn bg-slate-700 text-white px-3 py-2 rounded-lg text-sm"><i class="fas fa-satellite-dish mr-1"></i>Send Test Ping</button>

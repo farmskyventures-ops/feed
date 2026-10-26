@@ -1467,10 +1467,12 @@ app.post('/api/signup/verify', async (c) => {
     // Create the customer profile with the SAME full field set an agent captures
     // when onboarding a farmer (Personal / Location / Farming / Financial).
     // KYC stays 'not_started' until ID documents are uploaded (required before financing).
-    await c.env.DB.prepare(
-      `INSERT INTO customers (user_id, onboarded_by, full_name, national_id, date_of_birth, gender, mobile, alt_mobile, county, sub_county, ward, village, latitude, longitude, value_chain_type, value_chain, acreage, herd_size, farm_experience, annual_production, existing_loans, sacco_membership, kyc_status)
-       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?, 'not_started')`
-    ).bind(
+    // RLS FIX: the FORCE RLS WITH CHECK policy on `customers` would reject this
+    // INSERT because self sign-up has no authenticated caller. Run it on a pinned
+    // admin connection (runAsAdmin) so the GUC + write share one session, which
+    // pool.query() cannot guarantee. Falls back to the plain path on SQLite/D1.
+    const custCols = `(user_id, onboarded_by, full_name, national_id, date_of_birth, gender, mobile, alt_mobile, county, sub_county, ward, village, latitude, longitude, value_chain_type, value_chain, acreage, herd_size, farm_experience, annual_production, existing_loans, sacco_membership, kyc_status)`
+    const custVals = [
       uid, uid,
       String(full_name).trim(), national_id, b.date_of_birth || null, b.gender || null, p, b.alt_mobile || null,
       county, b.sub_county || null, b.ward || null, b.village || null,
@@ -1478,7 +1480,18 @@ app.post('/api/signup/verify', async (c) => {
       b.value_chain_type || null, b.value_chain || null,
       b.acreage || null, b.herd_size || null, b.farm_experience || null, b.annual_production || null,
       b.existing_loans || null, saccoMember ? 'yes' : 'no'
-    ).run()
+    ]
+    const _runAsAdmin = (c.env.DB as any)?.runAsAdmin
+    if (typeof _runAsAdmin === 'function') {
+      const ph = custVals.map((_, i) => `$${i + 1}`).join(',')
+      await _runAsAdmin.call(c.env.DB, async (exec: any) =>
+        exec(`INSERT INTO customers ${custCols} VALUES (${ph}, 'not_started')`, custVals)
+      )
+    } else {
+      await c.env.DB.prepare(
+        `INSERT INTO customers ${custCols} VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?, 'not_started')`
+      ).bind(...custVals).run()
+    }
     return uid
   })
   } catch (err: any) {
@@ -4375,8 +4388,8 @@ app.post('/api/logistics/shipments', requireAuth, requireFeature('logistics_tele
   const b = await c.req.json().catch(() => ({})) as any
   const shipmentRef = ref('SHP')
   const r = await c.env.DB.prepare(
-    `INSERT INTO logistics_shipments (shipment_ref,contract_id,vehicle_id,driver_id,driver_name,origin_hub,destination,status,eta_minutes) VALUES (?,?,?,?,?,?,?,?,?)`
-  ).bind(shipmentRef, b.contract_id || null, b.vehicle_id || null, b.driver_id || null, b.driver_name || null, b.origin_hub || null, b.destination || null, 'scheduled', numOrNull(b.eta_minutes)).run()
+    `INSERT INTO logistics_shipments (shipment_ref,contract_id,vehicle_id,driver_id,driver_name,origin_hub,destination,status,eta_minutes,origin_lat,origin_lng,dest_lat,dest_lng) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`
+  ).bind(shipmentRef, b.contract_id || null, b.vehicle_id || null, b.driver_id || null, b.driver_name || null, b.origin_hub || null, b.destination || null, 'scheduled', numOrNull(b.eta_minutes), numOrNull(b.origin_lat), numOrNull(b.origin_lng), numOrNull(b.dest_lat), numOrNull(b.dest_lng)).run()
   if (b.contract_id) await c.env.DB.prepare(`UPDATE offtake_contracts SET status='in_transit', milestone='IN_TRANSIT', updated_at=CURRENT_TIMESTAMP WHERE id=?`).bind(b.contract_id).run()
   await audit(c, user.id, 'create', 'shipment', shipmentRef)
   return c.json({ ok: true, id: r.meta.last_row_id, shipment_ref: shipmentRef })
@@ -4399,7 +4412,33 @@ app.get('/api/logistics/shipments/:id/track', requireAuth, requireFeature('logis
   const shipment = await withAdminContext(c, async () => await c.env.DB.prepare(`SELECT * FROM logistics_shipments WHERE id=?`).bind(id).first<any>())
   if (!shipment) return c.json({ error: 'Not found' }, 404)
   const pings = await withAdminContext(c, async () => (await c.env.DB.prepare(`SELECT lat,lng,speed_kmh,heading,temp_c,humidity_pct,recorded_at FROM telemetry_pings WHERE shipment_id=? ORDER BY id DESC LIMIT 100`).bind(id).all()).results)
-  return c.json({ shipment, pings })
+  // Uber-like live ETA: remaining distance (haversine) from the last known
+  // position to the destination ÷ current speed. route = ordered breadcrumb of
+  // pings (oldest→newest) for the map polyline.
+  const haversineKm = (aLat: number, aLng: number, bLat: number, bLng: number) => {
+    const toRad = (d: number) => d * Math.PI / 180
+    const dLatR = toRad(bLat - aLat), dLngR = toRad(bLng - aLng)
+    const h = Math.sin(dLatR / 2) ** 2 + Math.cos(toRad(aLat)) * Math.cos(toRad(bLat)) * Math.sin(dLngR / 2) ** 2
+    return 6371 * 2 * Math.atan2(Math.sqrt(h), Math.sqrt(1 - h))
+  }
+  let eta_minutes: number | null = null, distance_remaining_km: number | null = null
+  const dLat = numOrNull(shipment.dest_lat), dLng = numOrNull(shipment.dest_lng)
+  const cLat = numOrNull(shipment.last_lat), cLng = numOrNull(shipment.last_lng)
+  if (dLat != null && dLng != null && cLat != null && cLng != null) {
+    distance_remaining_km = Math.round(haversineKm(cLat, cLng, dLat, dLng) * 10) / 10
+    const speed = numberVal(shipment.last_speed_kmh, 0)
+    eta_minutes = speed > 1 ? Math.round((distance_remaining_km / speed) * 60) : null
+  }
+  if (eta_minutes == null && shipment.eta_minutes != null) eta_minutes = numberVal(shipment.eta_minutes, 0)
+  const route = [...(pings as any[])].reverse().map((p: any) => ({ lat: p.lat, lng: p.lng }))
+  return c.json({ shipment, pings, route, eta_minutes, distance_remaining_km })
+})
+// Map config for the live tracker UI. Returns the configured Maps API key
+// (Google Maps / any provider) so the SPA can render a live map; when unset the
+// client falls back to a built-in canvas breadcrumb renderer (no key needed).
+app.get('/api/logistics/map-config', requireAuth, requireFeature('logistics_telemetry'), async (c) => {
+  const key = String((c.env as any).GOOGLE_MAPS_API_KEY || (c.env as any).MAPS_API_KEY || '').trim()
+  return c.json({ provider: key ? 'google' : 'none', maps_api_key: key || null })
 })
 // Proof of Delivery sign-off → marks delivered and triggers escrow release.
 app.post('/api/logistics/shipments/:id/pod', requireAuth, requireFeature('logistics_telemetry'), async (c) => {
@@ -4766,6 +4805,83 @@ app.post('/api/produce/containers', requireAuth, requireFeature('container_packi
   ).bind(packRef, numOrNull(b.contract_id), b.container_no || null, b.commodity || null, numberVal(b.net_weight, 0), b.export_docs ? JSON.stringify(b.export_docs) : null, String(user.id)).run()
   await audit(c, user.id, 'create', 'container_pack', `${packRef}`)
   return c.json({ ok: true, id: r.meta.last_row_id, pack_ref: packRef })
+})
+
+// ----------------------------------------------------------------------------
+// SYSTEM-WIDE AUTOMATED TESTING, QA & SELF-HEALING PIPELINE
+// Liveness probe + admin self-test that detects runtime errors / regressions,
+// logs root-cause diagnostics and auto-remediates known failure modes
+// (sequence desync realignment). Paired with scripts/self_healing_qa.mjs.
+// ----------------------------------------------------------------------------
+app.get('/api/health', async (c) => {
+  // Liveness probe (no auth) — fast DB round-trip.
+  try { await c.env.DB.prepare('SELECT 1 AS ok').first(); return c.json({ status: 'ok', ts: new Date().toISOString() }) }
+  catch (e: any) { return c.json({ status: 'down', error: String(e?.message || e) }, 503) }
+})
+app.post('/api/admin/self-test', requireAuth, requireRole('admin', 'super_admin'), async (c) => {
+  const checks: Array<{ name: string; ok: boolean; detail?: string; remediation?: string }> = []
+  const add = (name: string, ok: boolean, detail?: string, remediation?: string) => checks.push({ name, ok, detail, remediation })
+  const b = await c.req.json().catch(() => ({})) as any
+  const autoHeal = b.auto_heal !== false // default on
+
+  // 1. DB connectivity.
+  try { await c.env.DB.prepare('SELECT 1').first(); add('db_connectivity', true) }
+  catch (e: any) { add('db_connectivity', false, String(e?.message || e)) }
+
+  // 2. customers RLS INSERT capability (the sign-up path) — probe via runAsAdmin
+  //    with a transactional rollback so nothing is persisted.
+  const runAsAdmin = (c.env.DB as any)?.runAsAdmin
+  if (typeof runAsAdmin === 'function') {
+    try {
+      await runAsAdmin.call(c.env.DB, async (exec: any) => {
+        await exec('BEGIN')
+        try {
+          await exec(`INSERT INTO customers (user_id, onboarded_by, full_name, national_id, mobile, kyc_status) VALUES ($1,$1,$2,$3,$4,'pending')`,
+            [999999999, 'self-test probe', 'ST' + Date.now(), '+2547' + String(Date.now()).slice(-8)])
+          add('customers_rls_insert', true, 'sign-up INSERT passes RLS (rolled back)')
+        } finally { await exec('ROLLBACK') }
+      })
+    } catch (e: any) {
+      const msg = String(e?.message || e)
+      add('customers_rls_insert', false, msg, /row-level security/i.test(msg) ? 'Re-assert ownership_customers policy (migration 0047) and use runAsAdmin for signup.' : undefined)
+    }
+  } else { add('customers_rls_insert', true, 'no RLS engine (SQLite/D1) — N/A') }
+
+  // 3. Feature Management present + offtake/produce flags registered.
+  try {
+    const n = await c.env.DB.prepare(`SELECT COUNT(*)::int AS n FROM feature_flags`).first<any>()
+    add('feature_management', Number(n?.n || 0) > 0, `${n?.n || 0} feature flags registered`)
+  } catch (e: any) { add('feature_management', false, String(e?.message || e)) }
+
+  // 4. Core tables readable under admin context.
+  for (const t of ['users', 'products', 'murabaha_contracts', 'offtake_contracts']) {
+    try { await withAdminContext(c, async () => await c.env.DB.prepare(`SELECT COUNT(*) FROM "${t}"`).first()); add('read_' + t, true) }
+    catch (e: any) { add('read_' + t, false, String(e?.message || e)) }
+  }
+
+  // 5. Payment gateway config presence (SasaPay / M-Pesa / KCB-Buni).
+  const env: any = c.env
+  add('payment_mpesa', true, mpesaConfigured(env) ? 'live' : 'simulation')
+  add('payment_sasapay', true, (env.SASAPAY_CLIENT_ID || env.SASAPAY_API_KEY) ? 'configured' : 'simulation')
+  add('payment_kcb_buni', true, (env.BUNI_API_KEY || env.KCB_BUNI_KEY || env.BUNI_CLIENT_ID) ? 'configured' : 'simulation')
+
+  // ---- SELF-HEALING: realign sequences when an INSERT-class failure is seen.
+  let healed: string[] = []
+  const insertFailed = checks.some(ch => !ch.ok && /duplicate key|sequence|pkey|already exists/i.test(ch.detail || ''))
+  if (autoHeal && insertFailed && typeof runAsAdmin === 'function') {
+    try {
+      await runAsAdmin.call(c.env.DB, async (exec: any) => {
+        for (const t of ['customers', 'users', 'murabaha_contracts', 'offtake_contracts', 'transactions']) {
+          await exec(`SELECT setval(pg_get_serial_sequence($1,'id'), GREATEST(COALESCE((SELECT MAX(id) FROM "${t}"),1),1), true)`, [t])
+          healed.push(t)
+        }
+      })
+    } catch (_) {}
+  }
+  const failed = checks.filter(ch => !ch.ok)
+  const status = failed.length === 0 ? 'healthy' : 'degraded'
+  await audit(c, c.get('user').id, 'self_test', 'system', `${status}: ${checks.length - failed.length}/${checks.length} ok${healed.length ? ' · healed ' + healed.join(',') : ''}`)
+  return c.json({ status, checks, failed_count: failed.length, healed, ts: new Date().toISOString() }, failed.length ? 503 : 200)
 })
 
 // ----------------------------------------------------------------------------
