@@ -1776,11 +1776,64 @@ async function viewShop() {
   // Cart button (Feed marketplace only — the Equipment tab uses the cross-app flow).
   const cartBtn = (_shopMarket === 'feed' && canUseCart()) ? `<button onclick="openCart()" class="btn ml-auto bg-slate-100 hover:bg-slate-200 px-4 py-2 rounded-lg text-sm relative"><i class="fas fa-shopping-cart mr-1"></i>Cart <span id="cartCount" class="badge bg-teal-600 text-white ml-1">${_cart.length}</span></button>` : ''
   $('content').innerHTML = `${buyForBanner}
+    <!-- Cross-marketplace global search: one keyword box returning matching
+         products aggregated across all marketplaces this app can see. -->
+    <div class="mb-4">
+      <div class="relative max-w-2xl">
+        <i class="fas fa-magnifying-glass absolute left-4 top-1/2 -translate-y-1/2 text-slate-400"></i>
+        <input id="globalSearch" type="search" value="${esc(_shopSearch)}" oninput="onGlobalSearchInput(this.value)" onkeydown="if(event.key==='Enter')runGlobalSearch(this.value)"
+          placeholder="Search all marketplaces (Feed, Equipment, Crop Inputs)…"
+          class="w-full pl-11 pr-24 py-3 border border-slate-300 rounded-xl text-sm focus:ring-2 focus:ring-emerald-400 focus:border-emerald-400">
+        <button onclick="runGlobalSearch(document.getElementById('globalSearch').value)" class="absolute right-2 top-1/2 -translate-y-1/2 btn brand-bg text-white px-4 py-1.5 rounded-lg text-xs">Search</button>
+      </div>
+    </div>
     <div class="flex items-center gap-2 mb-4 flex-wrap">${tabBar}${cartBtn}</div>
     <div id="shopGrid"><div class="text-sm text-slate-400 p-4">Loading…</div></div>`
+  if (_shopSearch) return runGlobalSearch(_shopSearch)
   if (_shopMarket === 'equipment') return renderShopEquipment()
   return renderShopFeed()
 }
+// Debounced cross-marketplace search. Empty query restores the marketplace view.
+let _shopSearch = ''
+let _searchResults = null
+let _searchTimer = null
+window.onGlobalSearchInput = (v) => {
+  if (_searchTimer) clearTimeout(_searchTimer)
+  _searchTimer = setTimeout(() => runGlobalSearch(v), 350)
+}
+window.runGlobalSearch = async (v) => {
+  const q = String(v || '').trim()
+  _shopSearch = q
+  if (!q) { _searchResults = null; return (_shopMarket === 'equipment' ? renderShopEquipment() : renderShopFeed()) }
+  setHTML('shopGrid', `<div class="text-sm text-slate-400 p-4"><i class="fas fa-magnifying-glass mr-1"></i>Searching all marketplaces for “${esc(q)}”…</div>`)
+  try { _searchResults = (await api.get('/shop/search?q=' + encodeURIComponent(q))).data.products || [] }
+  catch (_) { _searchResults = [] }
+  renderSearchGrid(q)
+}
+function renderSearchGrid(q) {
+  const items = _searchResults || []
+  const header = `<div class="text-sm text-slate-500 mb-3"><i class="fas fa-magnifying-glass text-teal-600 mr-1"></i>${items.length} result(s) for “${esc(q)}” across all marketplaces · <button onclick="clearGlobalSearch()" class="text-teal-600 hover:underline">clear search</button></div>`
+  const grid = items.map(p => `
+    <div class="card overflow-hidden fade-in flex flex-col">
+      <div class="cursor-pointer relative" onclick="productDetail(${p.id})">${prodImg(p, 'w-full h-44')}
+        <span class="absolute top-2 left-2 badge bg-slate-800/80 text-white text-[10px]">${(typeof MARKETPLACE_LABELS !== 'undefined' && MARKETPLACE_LABELS[(p.marketplace||'').toLowerCase()]) || (p.marketplace || 'Feeds')}</span></div>
+      <div class="p-4 flex flex-col flex-1">
+        <div class="flex justify-between items-start"><h3 class="font-bold text-slate-800">${esc(p.name)}</h3>${badge(p.stock_status)}</div>
+        <p class="text-xs text-slate-500 mb-3">${esc(p.category || '')}${p.subcategory ? ' › ' + esc(p.subcategory) : ''} · ${p.quantity} ${esc(p.unit)} in stock</p>
+        <div class="space-y-1 text-sm mt-auto">
+          <div class="flex justify-between"><span class="text-slate-500">Cash Price</span><span class="font-semibold text-emerald-600">${fmt(p.cash_price)}</span></div>
+          <div class="flex justify-between"><span class="text-slate-500">Pay Later Price</span><span class="font-semibold text-blue-600">${fmt(p.credit_price)}</span></div>
+        </div>
+        <div class="flex gap-2 mt-4">
+          <button onclick="productDetail(${p.id})" class="btn flex-1 bg-slate-100 hover:bg-slate-200 py-2 rounded-lg text-sm"><i class="fas fa-circle-info mr-1"></i>Details</button>
+          ${canUseCart() ? `<button onclick="addToCart(${p.id})" ${p.quantity <= 0 ? 'disabled' : ''} class="btn bg-slate-100 hover:bg-slate-200 py-2 px-3 rounded-lg text-sm disabled:opacity-40" title="Add to cart"><i class="fas fa-cart-plus"></i></button>` : ''}
+          <button onclick="buyModal(${p.id})" ${p.quantity <= 0 ? 'disabled' : ''} class="btn flex-1 brand-bg text-white py-2 rounded-lg text-sm disabled:opacity-40"><i class="fas fa-bolt mr-1"></i>Buy</button>
+        </div>
+      </div>
+    </div>`).join('') || '<div class="col-span-full text-center py-12 text-slate-400">No products match your search across any marketplace.</div>'
+  setHTML('shopGrid', `${header}<div class="grid grid-cols-1 md:grid-cols-3 gap-5">${grid}</div>`)
+}
+window.clearGlobalSearch = () => { _shopSearch = ''; _searchResults = null; const el = document.getElementById('globalSearch'); if (el) el.value = ''; (_shopMarket === 'equipment' ? renderShopEquipment() : renderShopFeed()) }
 // Who may use the multi-product cart: a farmer (customer) or an agent in an
 // active Buy-For session (parity with the Equipment app).
 function canUseCart() { return state.user.role === 'customer' || (state.user.role === 'agent' && !!_buyFor) }
@@ -1868,32 +1921,100 @@ window.saveCartItem = (id, editIndex) => {
   openCart()
 }
 window.removeFromCart = (index) => { _cart.splice(index, 1); openCart() }
-window.openCart = () => {
-  const who = _buyFor ? ` for ${esc(_buyFor.name)}` : ''
-  if (!_cart.length) return showModal(`<h3 class="font-bold mb-3"><i class="fas fa-shopping-cart mr-2"></i>Your Order${who}</h3><p class="text-slate-400 text-sm mb-4">No products added yet. Add items from the shop — each item keeps its own payment terms.</p><button onclick="closeModal()" class="btn bg-slate-100 px-4 py-2 rounded-lg text-sm">Close</button>`)
-  const cashTotal = _cart.filter(x => x.payment_type === 'cash').reduce((s, x) => s + Number(x.cash_price) * x.qty, 0)
-  const finTotal = _cart.filter(x => x.payment_type === 'financing').reduce((s, x) => s + Number(x.credit_price) * x.qty, 0)
-  const rows = _cart.map((x, i) => `<div class="flex items-center justify-between py-2 border-b border-slate-100">
-    <div class="min-w-0">
-      <div class="font-medium text-sm truncate">${esc(x.name)}</div>
-      <div class="text-[11px] text-slate-400">x${x.qty} · ${x.payment_type === 'cash' ? 'Cash' : `Financing ${x.term_months}mo`}</div>
-    </div>
-    <div class="flex items-center gap-3">
-      <span class="font-semibold text-sm">${fmt((x.payment_type === 'cash' ? x.cash_price : x.credit_price) * x.qty)}</span>
-      <button onclick="cartItemModal(${x.id}, ${i})" class="text-slate-500 text-xs hover:underline">edit</button>
-      <button onclick="removeFromCart(${i})" class="text-red-500 text-xs hover:underline">remove</button>
-    </div>
-  </div>`).join('')
-  showModal(`<h3 class="font-bold mb-1"><i class="fas fa-shopping-cart mr-2"></i>Your Order${who}</h3>
-    <p class="text-xs text-slate-400 mb-3">${_cart.length} item(s) · each item keeps its own payment terms</p>
-    ${rows}
-    ${cashTotal ? `<div class="flex justify-between text-sm mt-3"><span class="text-slate-500">Cash items total</span><span class="font-semibold">${fmt(cashTotal)}</span></div>` : ''}
-    ${finTotal ? `<div class="flex justify-between text-sm"><span class="text-slate-500">Financing items total</span><span class="font-semibold">${fmt(finTotal)}</span></div>` : ''}
-    <div class="flex gap-2 mt-4">
-      <button onclick="checkoutCart()" class="btn flex-1 brand-bg text-white py-2 rounded-lg text-sm"><i class="fas fa-cash-register mr-1"></i>Place an Order</button>
-      <button onclick="closeModal()" class="btn px-4 bg-slate-100 rounded-lg text-sm">Close</button>
-    </div>`)
+window.changeCartQty = (index, delta) => {
+  const it = _cart[index]; if (!it) return
+  it.qty = Math.max(1, Number(it.qty || 1) + delta)
+  openCart()
 }
+// Authoritative cart totals from /checkout/quote-bundle (SAME figures booked).
+let _cartQuote = null
+async function fetchCartQuote() {
+  if (!_cart.length) { _cartQuote = null; return null }
+  const items = _cart.map(x => ({ product_id: x.id, quantity: x.qty, payment_type: x.payment_type, term_months: x.term_months }))
+  try { _cartQuote = (await api.post('/checkout/quote-bundle', { items })).data }
+  catch (_) { _cartQuote = null }
+  return _cartQuote
+}
+window.openCart = async () => {
+  const who = _buyFor ? ` for ${esc(_buyFor.name)}` : ''
+  if (!_cart.length) return showModal(`<h3 class="font-bold mb-3"><i class="fas fa-shopping-cart mr-2"></i>Your Order${who}</h3><p class="text-slate-400 text-sm mb-4">No products added yet. Add items from the shop — each item keeps its own payment terms.</p>
+    <div class="flex gap-2"><button onclick="addMoreItems()" class="btn flex-1 brand-bg text-white py-2 rounded-lg text-sm"><i class="fas fa-plus mr-1"></i>Add Items</button><button onclick="closeModal()" class="btn px-4 bg-slate-100 rounded-lg text-sm">Cancel</button></div>`)
+  showModal(`<div id="cartModalBody"><div class="py-10 text-center text-slate-400 text-sm"><i class="fas fa-spinner fa-spin mr-1"></i>Calculating your order…</div></div>`)
+  await fetchCartQuote()
+  renderCartModal()
+}
+function cartLineByIndex(i) {
+  const x = _cart[i]; if (!_cartQuote || !_cartQuote.lines) return null
+  return _cartQuote.lines.find(l => l.product_id === x.id && l.payment_type === x.payment_type && Number(l.term_months || 0) === Number(x.term_months || 0) && Number(l.quantity) === Number(x.qty)) || null
+}
+function renderCartModal() {
+  const who = _buyFor ? ` for ${esc(_buyFor.name)}` : ''
+  const q = _cartQuote || { lines: [], total_cash: 0, total_financed: 0, grand_total: 0 }
+  const rows = _cart.map((x, i) => {
+    const line = cartLineByIndex(i)
+    const lineTotal = line && line.line_total != null ? line.line_total : (x.payment_type === 'cash' ? x.cash_price : x.credit_price) * x.qty
+    const err = line && line.error
+    return `<div class="flex items-center justify-between gap-2 py-3 border-b border-slate-100">
+      <div class="min-w-0 flex-1">
+        <div class="font-medium text-sm truncate">${esc(x.name)}</div>
+        <div class="text-[11px] text-slate-400">${(typeof MARKETPLACE_LABELS !== 'undefined' && MARKETPLACE_LABELS[x.marketplace]) || 'Feeds'} · ${x.payment_type === 'cash' ? 'Cash' : `Financing ${x.term_months}mo`}</div>
+        <div class="flex items-center gap-2 mt-1">
+          <button onclick="changeCartQty(${i}, -1)" class="w-6 h-6 rounded border border-slate-300 text-slate-600 text-xs leading-none hover:bg-slate-100">−</button>
+          <span class="text-sm font-medium w-6 text-center">${x.qty}</span>
+          <button onclick="changeCartQty(${i}, 1)" class="w-6 h-6 rounded border border-slate-300 text-slate-600 text-xs leading-none hover:bg-slate-100">+</button>
+          <button onclick="cartItemModal(${x.id}, ${i})" class="text-slate-500 text-xs hover:underline ml-2"><i class="fas fa-pen mr-0.5"></i>edit</button>
+          <button onclick="removeFromCart(${i})" class="text-red-500 text-xs hover:underline"><i class="fas fa-trash mr-0.5"></i>remove</button>
+        </div>
+        ${err ? `<div class="text-[11px] text-red-600 mt-1"><i class="fas fa-triangle-exclamation mr-1"></i>${esc(err)}</div>` : ''}
+      </div>
+      <div class="text-right shrink-0">
+        <div class="font-semibold text-sm ${err ? 'text-red-400 line-through' : ''}">${fmt(lineTotal)}</div>
+        ${line && line.payment_type === 'financing' && !err ? `<div class="text-[10px] text-slate-400">${fmt(line.installment_amount)}/mo · dep ${fmt(line.deposit_amount)}</div>` : ''}
+      </div>
+    </div>`
+  }).join('')
+  const hasErr = (q.lines || []).some(l => l.error)
+  const totalsBox = `<div class="mt-4 rounded-xl border border-slate-200 overflow-hidden text-sm">
+      <div class="flex justify-between px-4 py-2 bg-slate-50"><span class="text-slate-600">Total Cash</span><span class="font-semibold">${fmt(q.total_cash)}</span></div>
+      <div class="flex justify-between px-4 py-2 bg-slate-50 border-t border-slate-100"><span class="text-slate-600">Total Financed</span><span class="font-semibold">${fmt(q.total_financed)}</span></div>
+      <div class="flex justify-between px-4 py-3 bg-red-600 text-white border-t-2 border-red-700"><span class="font-bold uppercase tracking-wide"><i class="fas fa-receipt mr-1"></i>Grand Total</span><span class="font-extrabold text-base">${fmt(q.grand_total)}</span></div>
+    </div>`
+  document.getElementById('cartModalBody').innerHTML = `
+    <h3 class="font-bold mb-1"><i class="fas fa-shopping-cart mr-2"></i>Your Order${who}</h3>
+    <p class="text-xs text-slate-400 mb-2">${_cart.length} item(s) · each item keeps its own payment terms · figures match the booked contract</p>
+    <div class="max-h-[42vh] overflow-y-auto pr-1">${rows}</div>
+    ${totalsBox}
+    <div id="freqRow" class="mt-4"></div>
+    <div class="flex flex-col sm:flex-row gap-2 mt-4">
+      <button onclick="checkoutCart()" ${hasErr ? 'disabled' : ''} class="btn flex-1 brand-bg text-white py-2.5 rounded-lg text-sm ${hasErr ? 'opacity-50 cursor-not-allowed' : ''}"><i class="fas fa-cash-register mr-1"></i>Place Order</button>
+      <button onclick="addMoreItems()" class="btn flex-1 bg-emerald-50 border border-emerald-300 text-emerald-700 py-2.5 rounded-lg text-sm hover:bg-emerald-100"><i class="fas fa-plus mr-1"></i>Add More Items</button>
+      <button onclick="closeModal()" class="btn px-4 bg-slate-100 py-2.5 rounded-lg text-sm hover:bg-slate-200">Cancel</button>
+    </div>
+    ${hasErr ? `<p class="text-[11px] text-red-600 mt-2 text-center">Some items are not fully configured for sale. Remove or re-configure them to place the order.</p>` : ''}`
+  loadFrequentIntoCart()
+}
+window.addMoreItems = () => { closeModal(); if (state.route !== 'shop') go('shop'); else route() }
+async function loadFrequentIntoCart() {
+  const box = document.getElementById('freqRow'); if (!box) return
+  let items = []
+  try { items = (await api.get('/shop/frequent?limit=10')).data.products || [] } catch (_) { items = [] }
+  const inCart = new Set(_cart.map(x => x.id))
+  items = items.filter(p => !inCart.has(p.id)).slice(0, 10)
+  if (!items.length) return
+  box.innerHTML = `<div class="flex items-center justify-between mb-2"><h4 class="text-sm font-semibold text-slate-700"><i class="fas fa-fire text-orange-500 mr-1"></i>Frequently Purchased</h4></div>
+    <div class="flex gap-3 overflow-x-auto pb-2">
+      ${items.map(p => `<div class="shrink-0 w-32 border border-slate-200 rounded-lg p-2 bg-white">
+        <div class="h-16 rounded bg-slate-100 mb-1 overflow-hidden flex items-center justify-center">${p.image ? `<img src="${esc(p.image)}" class="h-full w-full object-cover">` : `<i class="fas fa-box text-slate-300 text-xl"></i>`}</div>
+        <div class="text-[11px] font-medium truncate" title="${esc(p.name)}">${esc(p.name)}</div>
+        <div class="text-[11px] text-emerald-700 font-semibold">${fmt(p.cash_price)}</div>
+        <button onclick="addToCart(${p.id})" class="btn w-full mt-1 bg-emerald-600 text-white text-[11px] py-1 rounded">Add</button>
+      </div>`).join('')}
+      <div class="shrink-0 w-24 flex items-center justify-center">
+        <button onclick="seeMoreShop()" class="btn bg-slate-100 hover:bg-slate-200 text-slate-700 text-xs px-3 py-2 rounded-lg h-full w-full"><i class="fas fa-arrow-right mb-1 block"></i>See More</button>
+      </div>
+    </div>`
+}
+window.seeMoreShop = () => { closeModal(); if (state.route !== 'shop') go('shop'); else route() }
 // Submit the whole cart as ONE bundled order. Each item keeps its own terms; a
 // sequential cash-deposit prompt is raised per cash item (directed to the farmer
 // when an agent is buying on their behalf).

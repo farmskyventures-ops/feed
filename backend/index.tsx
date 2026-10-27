@@ -603,12 +603,30 @@ function normalizeProductPayload(b: any) {
     financing_type_key: financingTypeKey
   }
 }
+// Raised when a required pricing/financing parameter was never explicitly
+// configured by the Super-Admin / authorized lister. Checkout surfaces this as a
+// 422 so NO silent fallback value can ever be booked.
+class QuoteConfigError extends Error {
+  code = 'quote_config_missing'
+  product_name?: string
+  constructor(message: string, productName?: string) { super(message); this.product_name = productName }
+}
+function requiredNum(value: any, label: string, productName?: string): number {
+  if (value === null || value === undefined || value === '') {
+    throw new QuoteConfigError(`"${productName || 'This product'}" is missing a required setting: ${label}. Configure it in the product listing / financing settings before it can be sold.`, productName)
+  }
+  const n = Number(value)
+  if (!Number.isFinite(n)) throw new QuoteConfigError(`"${productName || 'This product'}" has an invalid ${label}.`, productName)
+  return n
+}
 function financingQuote(p: any, quantity: any, paymentType: string, termMonths: any, processingFeeCfg?: any) {
   const qty = Math.max(1, numberVal(quantity, 1))
   const supplier_cost = roundMoney(numberVal(p.buying_price) * qty)
   if (paymentType === 'cash') {
-    const total = roundMoney(numberVal(p.cash_price) * qty)
-    const deposit_pct = numberVal(p.cash_deposit_pct, 100)
+    // Cash price and deposit % must both be explicitly configured — no defaults.
+    const unitCash = requiredNum(p.cash_price, 'cash price', p.name)
+    const total = roundMoney(unitCash * qty)
+    const deposit_pct = requiredNum(p.cash_deposit_pct, 'cash deposit %', p.name)
     const amount_due_now = roundMoney(total * deposit_pct / 100)
     return {
       quantity: qty,
@@ -632,8 +650,10 @@ function financingQuote(p: any, quantity: any, paymentType: string, termMonths: 
       terms_document_url: p.cash_terms_doc_url || null
     }
   }
-  const principalBase = roundMoney(numberVal(p.credit_price || p.cash_price) * qty)
-  const deposit_pct = numberVal(p.financing_deposit_pct, 10)
+  // Financed (credit) price and deposit % must both be explicitly configured.
+  const unitCredit = requiredNum(p.credit_price, 'financed (credit) price', p.name)
+  const principalBase = roundMoney(unitCredit * qty)
+  const deposit_pct = requiredNum(p.financing_deposit_pct, 'financing deposit %', p.name)
   const deposit_amount = roundMoney(principalBase * deposit_pct / 100)
   const finance_principal = roundMoney(principalBase - deposit_amount)
   // FEED policy: financing is offered ONLY as Sharia-compliant Murabaha
@@ -2150,11 +2170,98 @@ const checkoutQuoteHandler = async (c: any) => {
   if (payment_type === 'cash' && !p.cash_enabled) return c.json({ error: 'Cash purchase is not enabled for this equipment' }, 400)
   if (payment_type !== 'cash' && !p.financing_enabled) return c.json({ error: 'Financing is not enabled for this equipment' }, 400)
   const feeCfg = await getSetting(c, 'processing_fee', DEFAULT_PROCESSING_FEE)
-  const q = financingQuote(p, quantity, payment_type === 'cash' ? 'cash' : 'financing', term_months, feeCfg)
+  let q
+  try { q = financingQuote(p, quantity, payment_type === 'cash' ? 'cash' : 'financing', term_months, feeCfg) }
+  catch (e: any) { if (e instanceof QuoteConfigError) return c.json({ error: 'quote_config_missing', message: e.message, product_name: e.product_name }, 422); throw e }
   return c.json({ product: p.name, show_buyer: Number(p.show_buyer) ? 1 : 0, ...q })
 }
 app.post('/api/checkout/quote', requireAuth, checkoutQuoteHandler)
 app.post('/api/murabaha/quote', requireAuth, checkoutQuoteHandler)
+
+// ---------------------------------------------------------------------------
+// CART / CHECKOUT OVERHAUL — authoritative bundle quote + shop discovery.
+// quote-bundle prices EVERY cart line with the SAME financingQuote() the booking
+// path uses, so the cart/order modal shows the EXACT figures booked under
+// Contracts. Pricing/terms derive entirely from each item's own listing.
+// ---------------------------------------------------------------------------
+const quoteBundleHandler = async (c: any) => {
+  const body = await c.req.json().catch(() => ({})) as any
+  const items = Array.isArray(body.items) ? body.items : []
+  if (!items.length) return c.json({ lines: [], total_cash: 0, total_financed: 0, grand_total: 0 })
+  if (items.length > 50) return c.json({ error: 'Too many items in a single order' }, 400)
+  const feeCfg = await getSetting(c, 'processing_fee', DEFAULT_PROCESSING_FEE)
+  const lines: any[] = []
+  let total_cash = 0, total_financed = 0
+  for (const raw of items) {
+    const p = await withAdminContext(c, async () => await c.env.DB.prepare(`SELECT * FROM products WHERE id=?`).bind(raw?.product_id).first<any>())
+    if (!p) { lines.push({ product_id: raw?.product_id, error: 'Product not found' }); continue }
+    const ptype = raw?.payment_type === 'cash' ? 'cash' : 'financing'
+    const qty = Math.max(1, Number(raw?.quantity) || 1)
+    let q
+    try { q = financingQuote(p, qty, ptype, raw?.term_months, feeCfg) }
+    catch (e: any) {
+      if (e instanceof QuoteConfigError) { lines.push({ product_id: p.id, name: p.name, marketplace: p.marketplace || 'feeds', payment_type: ptype, quantity: qty, error: e.message }); continue }
+      throw e
+    }
+    const line_total = roundMoney(numberVal(q.total_payable, 0))
+    if (ptype === 'cash') total_cash = roundMoney(total_cash + line_total)
+    else total_financed = roundMoney(total_financed + line_total)
+    lines.push({
+      product_id: p.id, name: p.name, marketplace: p.marketplace || 'feeds',
+      quantity: qty, payment_type: ptype, term_months: q.term_months,
+      unit_cash_price: roundMoney(numberVal(p.cash_price, 0)),
+      unit_credit_price: roundMoney(numberVal(p.credit_price || p.cash_price, 0)),
+      line_subtotal: roundMoney(numberVal(ptype === 'cash' ? p.cash_price : (p.credit_price || p.cash_price), 0) * qty),
+      deposit_pct: q.deposit_pct, deposit_amount: q.deposit_amount, amount_due_now: q.amount_due_now,
+      finance_principal: q.finance_principal, financing_charge: q.financing_charge || 0,
+      processing_fee: q.processing_fee || 0, installment_amount: q.installment_amount || 0,
+      installment_count: q.installment_count || 0, payment_frequency: q.payment_frequency,
+      interest_rate_pct: q.interest_rate_pct || 0, financing_model: q.financing_model,
+      line_total
+    })
+  }
+  return c.json({ lines, total_cash, total_financed, grand_total: roundMoney(total_cash + total_financed) })
+}
+app.post('/api/checkout/quote-bundle', requireAuth, quoteBundleHandler)
+
+// Frequently purchased: top published products by booked sales volume.
+app.get('/api/shop/frequent', requireAuth, async (c) => {
+  const limit = Math.min(20, Math.max(1, Number(c.req.query('limit')) || 10))
+  const mkt = String(c.req.query('marketplace') || '').trim().toLowerCase()
+  const appType = String(c.env.APP_TYPE || 'equipment').toLowerCase() === 'feed' ? 'feed' : 'equipment'
+  const rows = await withAdminContext(c, async () => {
+    const binds: any[] = []
+    let where = `p.finance_status = 'published' AND p.app_scope IN ('${appType}', 'both')`
+    if (['equipment', 'feeds', 'inputs'].includes(mkt)) { where += ` AND p.marketplace = ?`; binds.push(mkt) }
+    const sql = `SELECT p.*, COALESCE(SUM(mc.quantity), 0) AS sales_volume, COUNT(mc.id) AS order_count
+                 FROM products p LEFT JOIN murabaha_contracts mc ON mc.product_id = p.id
+                 WHERE ${where} GROUP BY p.id ORDER BY sales_volume DESC, p.id DESC LIMIT ${limit}`
+    const { results } = await c.env.DB.prepare(sql).bind(...binds).all()
+    return results
+  })
+  const out = (rows as any[]).map((p: any) => ({ ...p, stock_status: p.quantity <= 0 ? 'out_of_stock' : p.quantity <= p.reorder_threshold ? 'low_stock' : 'in_stock' }))
+  return c.json({ products: out })
+})
+
+// Cross-marketplace global search: keyword match aggregated across every
+// marketplace this app can see, in one grid.
+app.get('/api/shop/search', requireAuth, async (c) => {
+  const qRaw = String(c.req.query('q') || '').trim()
+  if (!qRaw) return c.json({ products: [], query: '' })
+  const limit = Math.min(60, Math.max(1, Number(c.req.query('limit')) || 40))
+  const appType = String(c.env.APP_TYPE || 'equipment').toLowerCase() === 'feed' ? 'feed' : 'equipment'
+  const like = `%${qRaw.toLowerCase().replace(/[%_]/g, (m) => '\\' + m)}%`
+  const rows = await withAdminContext(c, async () => {
+    const sql = `SELECT * FROM products
+                 WHERE finance_status = 'published' AND app_scope IN (?, 'both')
+                   AND (LOWER(name) LIKE ? OR LOWER(COALESCE(category,'')) LIKE ? OR LOWER(COALESCE(subcategory,'')) LIKE ? OR LOWER(COALESCE(description,'')) LIKE ? OR LOWER(COALESCE(marketplace,'')) LIKE ?)
+                 ORDER BY (LOWER(name) LIKE ?) DESC, name LIMIT ${limit}`
+    const { results } = await c.env.DB.prepare(sql).bind(appType, like, like, like, like, like, like).all()
+    return results
+  })
+  const out = (rows as any[]).map((p: any) => ({ ...p, stock_status: p.quantity <= 0 ? 'out_of_stock' : p.quantity <= p.reorder_threshold ? 'low_stock' : 'in_stock' }))
+  return c.json({ products: out, query: qRaw })
+})
 // Unified checkout APPLY handler (cash + financing). Registered on the clean
 // /api/checkout/apply path AND the legacy /api/murabaha/apply path. A CASH
 // checkout skips every financing-only branch (KYC gate, installment math) and
@@ -2192,7 +2299,9 @@ const checkoutApplyHandler = async (c: any) => {
     }, 412)
   }
   const feeCfg = await getSetting(c, 'processing_fee', DEFAULT_PROCESSING_FEE)
-  const q = financingQuote(p, qty, normalizedPaymentType, term_months, feeCfg)
+  let q
+  try { q = financingQuote(p, qty, normalizedPaymentType, term_months, feeCfg) }
+  catch (e: any) { if (e instanceof QuoteConfigError) return c.json({ error: 'quote_config_missing', message: e.message, product_name: e.product_name }, 422); throw e }
   const contractRef = ref(normalizedPaymentType === 'cash' ? 'CSH' : (q.financing_model === 'paygo' ? 'PGO' : 'FIN'))
   const status = normalizedPaymentType === 'cash'
     ? (q.amount_due_now > 0 ? 'pending_payment' : 'awaiting_cash_balance')
@@ -2339,7 +2448,9 @@ app.post('/api/murabaha/apply-bundle', requireAuth, async (c) => {
         product_name: p.name
       }, 412)
     }
-    const q = financingQuote(p, qty, ptype, raw?.term_months, feeCfg)
+    let q
+    try { q = financingQuote(p, qty, ptype, raw?.term_months, feeCfg) }
+    catch (e: any) { if (e instanceof QuoteConfigError) return c.json({ error: 'quote_config_missing', message: e.message, product_name: e.product_name }, 422); throw e }
     prepared.push({ p, qty, ptype, q })
   }
 
@@ -5402,7 +5513,9 @@ app.post('/api/cross/purchase', requireAuth, async (c) => {
   // scoped to the owning platform, so a Feed-side cross purchase settles the full
   // cash price through the central gateway. Values are computed server-side.
   const feeCfg = await getSetting(c, 'processing_fee', DEFAULT_PROCESSING_FEE)
-  const quote = financingQuote(p, qty, 'cash', 0, feeCfg)
+  let quote
+  try { quote = financingQuote(p, qty, 'cash', 0, feeCfg) }
+  catch (e: any) { if (e instanceof QuoteConfigError) return c.json({ error: 'quote_config_missing', message: e.message, product_name: e.product_name }, 422); throw e }
   const contractRef = ref('XMP')  // XMP = cross-marketplace purchase
   const status = quote.amount_due_now > 0 ? 'pending_payment' : 'awaiting_cash_balance'
 
