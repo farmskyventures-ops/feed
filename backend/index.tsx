@@ -1622,16 +1622,34 @@ app.post('/api/products', requireAuth, requirePermission('can_manage_inventory')
   const dup = await withAdminContext(c, async () => await c.env.DB.prepare(`SELECT id FROM products WHERE sku = ?`).bind(p.sku).first<any>())
   if (dup) return c.json({ error: `A product with SKU "${p.sku}" already exists. Use a unique SKU.` }, 409)
   // Enforce the split at the app layer too (defence-in-depth alongside the RLS trigger).
+  // EXPLICIT PRODUCT STATE MACHINE (Part 1.2):
+  //   CASH_ONLY_ACTIVE          — live for cash; no financing requested.
+  //   FINANCE_PENDING_APPROVAL  — a financing LINK was requested by an
+  //       unauthorized lister; the requested loan-product key is PARKED in
+  //       finance_pending_type_key (NOT promoted into financing_type_key) so no
+  //       financing price is quotable until approved, while cash stays active.
+  //   FINANCE_APPROVED          — financing authorized; financing + cash unlocked.
   let financeStatus = 'published'
+  let financeState = 'CASH_ONLY_ACTIVE'
+  let pendingTypeKey: string | null = null
+  const wantsFinance = p.financing_enabled || p.financing_type_key
   if (!canFinance) {
+    if (wantsFinance) {
+      // Park the requested link; keep the product cash-only + active meanwhile.
+      pendingTypeKey = p.financing_type_key || null
+      financeStatus = 'pending_finance'
+      financeState = 'FINANCE_PENDING_APPROVAL'
+    }
     p.credit_markup_pct = 0
     p.credit_price = p.cash_price
     p.financing_enabled = false
+    p.financing_type_key = null          // not live until approved
     p.financing_interest_pct = 0
     p.financing_terms_text = null
     p.financing_terms_doc_url = null
     p.payment_option_mode = 'cash'
-    financeStatus = 'pending_finance'
+  } else if (wantsFinance) {
+    financeState = 'FINANCE_APPROVED'
   }
   const financeSetBy = canFinance ? user.id : null
   // Merchant inventory users: if the creating user was flagged as a Merchant
@@ -1641,14 +1659,14 @@ app.post('/api/products', requireAuth, requirePermission('can_manage_inventory')
   const sourcePlatform = user.inventory_is_merchant ? 'merchant' : 'feed'
   try {
     const r = await c.env.DB.prepare(
-      `INSERT INTO products (sku,name,category,source_platform,description,product_type,supplier_id,buying_price,cash_markup_pct,credit_markup_pct,cash_price,credit_price,cash_price_mode,cash_markup_amount,credit_price_mode,credit_markup_amount,quantity,unit,reorder_threshold,image,cash_enabled,financing_enabled,payment_option_mode,show_buyer,financing_model,financing_type_key,financing_interest_pct,financing_frequency,financing_term_min_months,financing_term_max_months,financing_tenure_unit,financing_rate_per_cycle,financing_amount_per_cycle,financing_cycle_count,financing_cycle_length_days,cash_deposit_pct,financing_deposit_pct,cash_terms_text,financing_terms_text,cash_terms_doc_url,financing_terms_doc_url,cash_agreement_source,financing_agreement_source,created_by,finance_status,finance_set_by)
-       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
+      `INSERT INTO products (sku,name,category,source_platform,description,product_type,supplier_id,buying_price,cash_markup_pct,credit_markup_pct,cash_price,credit_price,cash_price_mode,cash_markup_amount,credit_price_mode,credit_markup_amount,quantity,unit,reorder_threshold,image,cash_enabled,financing_enabled,payment_option_mode,show_buyer,financing_model,financing_type_key,financing_interest_pct,financing_frequency,financing_term_min_months,financing_term_max_months,financing_tenure_unit,financing_rate_per_cycle,financing_amount_per_cycle,financing_cycle_count,financing_cycle_length_days,cash_deposit_pct,financing_deposit_pct,cash_terms_text,financing_terms_text,cash_terms_doc_url,financing_terms_doc_url,cash_agreement_source,financing_agreement_source,created_by,finance_status,finance_set_by,finance_state,finance_pending_type_key)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
     ).bind(
       p.sku, p.name, p.category, sourcePlatform, p.description, p.product_type, p.supplier_id, p.buying_price, p.cash_markup_pct, p.credit_markup_pct,
       p.cash_price, p.credit_price, p.cash_price_mode, p.cash_markup_amount, p.credit_price_mode, p.credit_markup_amount, p.quantity, p.unit, p.reorder_threshold, p.image, p.cash_enabled, p.financing_enabled,
       p.payment_option_mode, p.show_buyer, p.financing_model, p.financing_type_key, p.financing_interest_pct, p.financing_frequency, p.financing_term_min_months,
       p.financing_term_max_months, p.financing_tenure_unit, p.financing_rate_per_cycle, p.financing_amount_per_cycle, p.financing_cycle_count, p.financing_cycle_length_days, p.cash_deposit_pct, p.financing_deposit_pct, p.cash_terms_text, p.financing_terms_text,
-      p.cash_terms_doc_url, p.financing_terms_doc_url, p.cash_agreement_source, p.financing_agreement_source, user.id, financeStatus, financeSetBy
+      p.cash_terms_doc_url, p.financing_terms_doc_url, p.cash_agreement_source, p.financing_agreement_source, user.id, financeStatus, financeSetBy, financeState, pendingTypeKey
     ).run()
     await audit(c, user.id, 'create', 'product', `${p.name} (${financeStatus}, ${sourcePlatform})`)
     return c.json({ id: r.meta.last_row_id, finance_status: financeStatus, source_platform: sourcePlatform })
@@ -1770,40 +1788,52 @@ app.get('/api/products/finance-queue', requireAuth, requirePermission('can_manag
   })
   return c.json({ products: rows })
 })
-// Authorized finance user supplies the finance components and publishes.
+// CONSOLIDATION (Part 1.1): the Finance Approval Queue approves/rejects the
+// LINKING request only. It NO LONGER authors any financing rules inline — all
+// financing parameters live on the mapped Loan/Financing Product (financing_types).
+// On approve: promote the parked finance_pending_type_key -> financing_type_key,
+//   flip finance_state to FINANCE_APPROVED and unlock financing (cash stays on).
+// On reject: clear the parked key and return the product to CASH_ONLY_ACTIVE.
 app.put('/api/products/:id/finance', requireAuth, requirePermission('can_manage_finance_settings'), async (c) => {
   const user = c.get('user') as SessionUser
   const id = c.req.param('id')
-  const b = await c.req.json()
-  const publish = b.finance_status !== 'pending_finance'
+  const b = await c.req.json().catch(() => ({} as any))
+  const action = String(b.action || '').toLowerCase()
+  if (action !== 'approve' && action !== 'reject') {
+    return c.json({ error: "action must be 'approve' or 'reject'" }, 400)
+  }
+  const p = await withAdminContext(c, async () =>
+    await c.env.DB.prepare(`SELECT * FROM products WHERE id=?`).bind(id).first<any>())
+  if (!p) return c.json({ error: 'Product not found' }, 404)
+
+  if (action === 'reject') {
+    await c.env.DB.prepare(
+      `UPDATE products SET finance_state='CASH_ONLY_ACTIVE', finance_status='published',
+         financing_enabled=0, finance_pending_type_key=NULL,
+         finance_notes=COALESCE(?, finance_notes),
+         finance_set_by=?, finance_set_at=CURRENT_TIMESTAMP WHERE id=?`
+    ).bind(b.finance_notes ?? null, user.id, id).run()
+    await audit(c, user.id, 'finance_reject_link', 'product', `product ${id} financing link rejected (cash only)`)
+    return c.json({ ok: true, finance_state: 'CASH_ONLY_ACTIVE', finance_status: 'published' })
+  }
+
+  // approve: determine the loan product key to link. Prefer an explicit key in the
+  // request (admin can choose/override), else the parked pending key.
+  const key = cleanText(b.financing_type_key, 60) || p.finance_pending_type_key || null
+  if (!key) return c.json({ error: 'No financing product selected to link' }, 400)
+  const lp = await withAdminContext(c, async () =>
+    await c.env.DB.prepare(`SELECT * FROM financing_types WHERE type_key=? AND active=1`).bind(key).first<any>())
+  if (!lp) return c.json({ error: 'Selected financing product does not exist or is inactive' }, 400)
+
   await c.env.DB.prepare(
-    `UPDATE products SET
-        credit_markup_pct = COALESCE(?, credit_markup_pct),
-        credit_price = COALESCE(?, credit_price),
-        financing_enabled = COALESCE(?, financing_enabled),
-        financing_model = COALESCE(?, financing_model),
-        financing_interest_pct = COALESCE(?, financing_interest_pct),
-        financing_frequency = COALESCE(?, financing_frequency),
-        financing_term_min_months = COALESCE(?, financing_term_min_months),
-        financing_term_max_months = COALESCE(?, financing_term_max_months),
-        financing_deposit_pct = COALESCE(?, financing_deposit_pct),
-        financing_terms_text = COALESCE(?, financing_terms_text),
-        financing_terms_doc_url = COALESCE(?, financing_terms_doc_url),
-        payment_option_mode = COALESCE(?, payment_option_mode),
-        finance_notes = COALESCE(?, finance_notes),
-        finance_status = ?, finance_set_by = ?, finance_set_at = CURRENT_TIMESTAMP
-      WHERE id = ?`
-  ).bind(
-    b.credit_markup_pct ?? null, b.credit_price ?? null,
-    b.financing_enabled === undefined ? null : (boolInt(b.financing_enabled, true) ? 1 : 0),
-    b.financing_model ?? null, b.financing_interest_pct ?? null, b.financing_frequency ?? null,
-    b.financing_term_min_months ?? null, b.financing_term_max_months ?? null, b.financing_deposit_pct ?? null,
-    b.financing_terms_text ?? null, b.financing_terms_doc_url ?? null,
-    b.payment_option_mode ?? (publish ? 'both' : null), b.finance_notes ?? null,
-    publish ? 'published' : 'pending_finance', user.id, id
-  ).run()
-  await audit(c, user.id, 'finance_authorize', 'product', `product ${id} ${publish ? 'published' : 'saved'}`)
-  return c.json({ ok: true, finance_status: publish ? 'published' : 'pending_finance' })
+    `UPDATE products SET finance_state='FINANCE_APPROVED', finance_status='published',
+       financing_enabled=1, financing_type_key=?, finance_pending_type_key=NULL,
+       payment_option_mode=CASE WHEN payment_option_mode='cash' THEN 'both' ELSE COALESCE(payment_option_mode,'both') END,
+       finance_notes=COALESCE(?, finance_notes),
+       finance_set_by=?, finance_set_at=CURRENT_TIMESTAMP WHERE id=?`
+  ).bind(key, b.finance_notes ?? null, user.id, id).run()
+  await audit(c, user.id, 'finance_approve_link', 'product', `product ${id} linked to loan product ${key}`)
+  return c.json({ ok: true, finance_state: 'FINANCE_APPROVED', finance_status: 'published', financing_type_key: key })
 })
 // ---- Admin audit: products hidden from storefront for lack of finance -----
 // Diagnostic + reminder feed for authorized finance personnel.
@@ -2169,9 +2199,12 @@ const checkoutQuoteHandler = async (c: any) => {
   if (!p) return c.json({ error: 'Product not found' }, 404)
   if (payment_type === 'cash' && !p.cash_enabled) return c.json({ error: 'Cash purchase is not enabled for this equipment' }, 400)
   if (payment_type !== 'cash' && !p.financing_enabled) return c.json({ error: 'Financing is not enabled for this equipment' }, 400)
-  const feeCfg = await getSetting(c, 'processing_fee', DEFAULT_PROCESSING_FEE)
+  // CONSOLIDATION: for a financed quote, resolve the mapped loan product so the
+  // financing rules come from the single source of truth (financing_types).
+  const rp = payment_type === 'cash' ? p : await resolveLoanProductForProduct(c, p)
+  const feeCfg = rp?._loan_product_processing_fee || await getSetting(c, 'processing_fee', DEFAULT_PROCESSING_FEE)
   let q
-  try { q = financingQuote(p, quantity, payment_type === 'cash' ? 'cash' : 'financing', term_months, feeCfg) }
+  try { q = financingQuote(rp, quantity, payment_type === 'cash' ? 'cash' : 'financing', term_months, feeCfg) }
   catch (e: any) { if (e instanceof QuoteConfigError) return c.json({ error: 'quote_config_missing', message: e.message, product_name: e.product_name }, 422); throw e }
   return c.json({ product: p.name, show_buyer: Number(p.show_buyer) ? 1 : 0, ...q })
 }
@@ -2197,8 +2230,10 @@ const quoteBundleHandler = async (c: any) => {
     if (!p) { lines.push({ product_id: raw?.product_id, error: 'Product not found' }); continue }
     const ptype = raw?.payment_type === 'cash' ? 'cash' : 'financing'
     const qty = Math.max(1, Number(raw?.quantity) || 1)
+    const rp = ptype === 'cash' ? p : await resolveLoanProductForProduct(c, p)
+    const lineFee = rp?._loan_product_processing_fee || feeCfg
     let q
-    try { q = financingQuote(p, qty, ptype, raw?.term_months, feeCfg) }
+    try { q = financingQuote(rp, qty, ptype, raw?.term_months, lineFee) }
     catch (e: any) {
       if (e instanceof QuoteConfigError) { lines.push({ product_id: p.id, name: p.name, marketplace: p.marketplace || 'feeds', payment_type: ptype, quantity: qty, error: e.message }); continue }
       throw e
@@ -2298,9 +2333,10 @@ const checkoutApplyHandler = async (c: any) => {
       customer_id: custId
     }, 412)
   }
-  const feeCfg = await getSetting(c, 'processing_fee', DEFAULT_PROCESSING_FEE)
+  const rp = normalizedPaymentType === 'cash' ? p : await resolveLoanProductForProduct(c, p)
+  const feeCfg = rp?._loan_product_processing_fee || await getSetting(c, 'processing_fee', DEFAULT_PROCESSING_FEE)
   let q
-  try { q = financingQuote(p, qty, normalizedPaymentType, term_months, feeCfg) }
+  try { q = financingQuote(rp, qty, normalizedPaymentType, term_months, feeCfg) }
   catch (e: any) { if (e instanceof QuoteConfigError) return c.json({ error: 'quote_config_missing', message: e.message, product_name: e.product_name }, 422); throw e }
   const contractRef = ref(normalizedPaymentType === 'cash' ? 'CSH' : (q.financing_model === 'paygo' ? 'PGO' : 'FIN'))
   const status = normalizedPaymentType === 'cash'
@@ -2448,8 +2484,10 @@ app.post('/api/murabaha/apply-bundle', requireAuth, async (c) => {
         product_name: p.name
       }, 412)
     }
+    const pq = ptype === 'cash' ? p : await resolveLoanProductForProduct(c, p)
+    const bundleFee = pq?._loan_product_processing_fee || feeCfg
     let q
-    try { q = financingQuote(p, qty, ptype, raw?.term_months, feeCfg) }
+    try { q = financingQuote(pq, qty, ptype, raw?.term_months, bundleFee) }
     catch (e: any) { if (e instanceof QuoteConfigError) return c.json({ error: 'quote_config_missing', message: e.message, product_name: e.product_name }, 422); throw e }
     prepared.push({ p, qty, ptype, q })
   }
@@ -6012,6 +6050,12 @@ app.put('/api/settings/processing-fee', requireAuth, requirePermission('manage_p
   await audit(c, c.get('user').id, 'update', 'settings', `processing_fee:${cfg.enabled ? cfg.mode : 'disabled'} products:${cfg.product_ids.length || 'all'}`)
   return c.json({ ok: true, processing_fee: cfg })
 })
+// Read-only processing-fee config for the SYNCHRONOUS client pricing engine so a
+// buyer's cart/checkout shows an instant itemized total that matches the server.
+app.get('/api/settings/processing-fee-public', requireAuth, async (c) => {
+  const processing_fee = normalizeProcessingFee(await getSetting(c, 'processing_fee', DEFAULT_PROCESSING_FEE))
+  return c.json({ processing_fee })
+})
 
 // ---------------------------------------------------------------------------
 // INVOICE / RECEIPT CONFIGURATION  (Super-Admin configurable)
@@ -6071,6 +6115,56 @@ app.put('/api/settings/markup', requireAuth, requirePermission('manage_markup_pc
 function canManageFinanceConfig(user: SessionUser) {
   return user.role === 'admin' || user.role === 'super_admin' ||
     hasPermission(user, 'can_manage_finance_settings') || hasPermission(user, 'manage_markup_pct')
+}
+// Normalize the full loan-product parameter set authored on the Loan/Financing
+// Products module (financing_types) — the SOLE authoring tool for financing
+// rules. Every value is nullable so an admin can author incrementally; the
+// pricing engine (financingQuote) enforces that the MAPPED loan product carries
+// what it needs (no silent fallbacks).
+function normalizeLoanProductFields(b: any) {
+  const n = (v: any) => (v === null || v === undefined || v === '' ? null : (Number.isFinite(Number(v)) ? Number(v) : null))
+  const tenure = ['monthly', 'yearly', 'custom'].includes(String(b?.tenure_unit)) ? String(b.tenure_unit) : null
+  const freq = ['daily', 'weekly', 'monthly'].includes(String(b?.frequency)) ? String(b.frequency) : null
+  let feeJson: string | null = null
+  if (b?.processing_fee && typeof b.processing_fee === 'object') { try { feeJson = JSON.stringify(normalizeProcessingFee(b.processing_fee)) } catch { feeJson = null } }
+  else if (typeof b?.processing_fee_json === 'string' && b.processing_fee_json.trim()) feeJson = b.processing_fee_json
+  return {
+    interest_pct: n(b?.interest_pct), markup_pct: n(b?.markup_pct), deposit_pct: n(b?.deposit_pct),
+    term_min_months: n(b?.term_min_months), term_max_months: n(b?.term_max_months), tenure_unit: tenure,
+    rate_per_cycle: n(b?.rate_per_cycle), amount_per_cycle: n(b?.amount_per_cycle),
+    cycle_count: n(b?.cycle_count), cycle_length_days: n(b?.cycle_length_days), frequency: freq,
+    processing_fee_json: feeJson, terms_text: cleanText(b?.terms_text, 4000), terms_doc_url: b?.terms_doc_url || null
+  }
+}
+// Load the mapped loan product (financing_types row) for a product, returning its
+// parameters merged onto a product-shaped object so financingQuote reads them as
+// if they were product columns. Makes the loan product the SOLE source of
+// financing rules while the product only supplies prices + the mapping key.
+async function resolveLoanProductForProduct(c: any, p: any): Promise<any> {
+  if (!p) return p
+  const key = p.financing_type_key
+  if (!key) return p
+  let lp: any = null
+  try { lp = await withAdminContext(c, async () => await c.env.DB.prepare(`SELECT * FROM financing_types WHERE type_key=? AND active=1`).bind(key).first<any>()) } catch { lp = null }
+  if (!lp) return p
+  const pick = (lpVal: any, pVal: any) => (lpVal === null || lpVal === undefined ? pVal : lpVal)
+  return {
+    ...p,
+    financing_model: lp.type_key || p.financing_model,
+    financing_interest_pct: pick(lp.interest_pct, p.financing_interest_pct),
+    financing_deposit_pct: pick(lp.deposit_pct, p.financing_deposit_pct),
+    financing_term_min_months: pick(lp.term_min_months, p.financing_term_min_months),
+    financing_term_max_months: pick(lp.term_max_months, p.financing_term_max_months),
+    financing_tenure_unit: pick(lp.tenure_unit, p.financing_tenure_unit),
+    financing_rate_per_cycle: pick(lp.rate_per_cycle, p.financing_rate_per_cycle),
+    financing_amount_per_cycle: pick(lp.amount_per_cycle, p.financing_amount_per_cycle),
+    financing_cycle_count: pick(lp.cycle_count, p.financing_cycle_count),
+    financing_cycle_length_days: pick(lp.cycle_length_days, p.financing_cycle_length_days),
+    financing_frequency: pick(lp.frequency, p.financing_frequency),
+    financing_terms_text: pick(lp.terms_text, p.financing_terms_text),
+    financing_terms_doc_url: pick(lp.terms_doc_url, p.financing_terms_doc_url),
+    _loan_product_processing_fee: (() => { try { return lp.processing_fee_json ? JSON.parse(lp.processing_fee_json) : null } catch { return null } })()
+  }
 }
 // Super-Admins and any user granted the delegated permission may reassign a
 // customer/user from one agent to another.
@@ -6580,7 +6674,10 @@ app.delete('/api/field-visits/:id', requireAuth, async (c) => {
 app.get('/api/financing-types', requireAuth, async (c) => {
   const includeAll = c.req.query('all') === '1'
   const { results } = await c.env.DB.prepare(
-    `SELECT id, type_key, label, description, charge_mode, is_system, active, sort_order
+    `SELECT id, type_key, label, description, charge_mode, is_system, active, sort_order,
+            interest_pct, markup_pct, deposit_pct, term_min_months, term_max_months, tenure_unit,
+            rate_per_cycle, amount_per_cycle, cycle_count, cycle_length_days, frequency,
+            processing_fee_json, terms_text, terms_doc_url
        FROM financing_types ${includeAll ? '' : 'WHERE active = 1'}
       ORDER BY sort_order, label`
   ).all()
@@ -6602,10 +6699,17 @@ app.post('/api/financing-types', requireAuth, async (c) => {
   const active = boolInt(b.active, true) ? 1 : 0
   const dup = await c.env.DB.prepare(`SELECT id FROM financing_types WHERE type_key=?`).bind(type_key).first<any>()
   if (dup) return c.json({ error: `A financing type with key "${type_key}" already exists.` }, 409)
+  // Full loan-product parameters — authored HERE (sole authoring tool), never
+  // inline on the product form.
+  const lp = normalizeLoanProductFields(b)
   const r = await c.env.DB.prepare(
-    `INSERT INTO financing_types (type_key,label,description,charge_mode,is_system,active,sort_order,created_by)
-     VALUES (?,?,?,?,0,?,?,?)`
-  ).bind(type_key, label, description, charge_mode, active, sort_order, String(user.id)).run()
+    `INSERT INTO financing_types (type_key,label,description,charge_mode,is_system,active,sort_order,created_by,
+       interest_pct,markup_pct,deposit_pct,term_min_months,term_max_months,tenure_unit,rate_per_cycle,amount_per_cycle,cycle_count,cycle_length_days,frequency,processing_fee_json,terms_text,terms_doc_url)
+     VALUES (?,?,?,?,0,?,?,?, ?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
+  ).bind(type_key, label, description, charge_mode, active, sort_order, String(user.id),
+    lp.interest_pct, lp.markup_pct, lp.deposit_pct, lp.term_min_months, lp.term_max_months, lp.tenure_unit,
+    lp.rate_per_cycle, lp.amount_per_cycle, lp.cycle_count, lp.cycle_length_days, lp.frequency,
+    lp.processing_fee_json, lp.terms_text, lp.terms_doc_url).run()
   try {
     await c.env.DB.prepare(
       `INSERT INTO agreement_templates (path_key,title,overview_html,body_html,updated_by)
@@ -6631,9 +6735,31 @@ app.put('/api/financing-types/:id', requireAuth, async (c) => {
   const description = b.description !== undefined ? cleanText(b.description, 400) : existing.description
   const sort_order = b.sort_order !== undefined ? Math.round(numberVal(b.sort_order, existing.sort_order)) : existing.sort_order
   const active = b.active !== undefined ? (boolInt(b.active, true) ? 1 : 0) : existing.active
+  // Full loan-product parameters — only overwrite a field when the request
+  // explicitly provides it, so a partial PUT does not wipe existing config.
+  const has = (k: string) => b[k] !== undefined
+  const lp = normalizeLoanProductFields(b)
   await c.env.DB.prepare(
-    `UPDATE financing_types SET label=?, description=?, charge_mode=?, active=?, sort_order=?, updated_at=CURRENT_TIMESTAMP WHERE id=?`
-  ).bind(label, description, charge_mode, active, sort_order, id).run()
+    `UPDATE financing_types SET label=?, description=?, charge_mode=?, active=?, sort_order=?,
+       interest_pct=?, markup_pct=?, deposit_pct=?, term_min_months=?, term_max_months=?, tenure_unit=?,
+       rate_per_cycle=?, amount_per_cycle=?, cycle_count=?, cycle_length_days=?, frequency=?,
+       processing_fee_json=?, terms_text=?, terms_doc_url=?, updated_at=CURRENT_TIMESTAMP WHERE id=?`
+  ).bind(label, description, charge_mode, active, sort_order,
+    has('interest_pct') ? lp.interest_pct : existing.interest_pct,
+    has('markup_pct') ? lp.markup_pct : existing.markup_pct,
+    has('deposit_pct') ? lp.deposit_pct : existing.deposit_pct,
+    has('term_min_months') ? lp.term_min_months : existing.term_min_months,
+    has('term_max_months') ? lp.term_max_months : existing.term_max_months,
+    has('tenure_unit') ? lp.tenure_unit : existing.tenure_unit,
+    has('rate_per_cycle') ? lp.rate_per_cycle : existing.rate_per_cycle,
+    has('amount_per_cycle') ? lp.amount_per_cycle : existing.amount_per_cycle,
+    has('cycle_count') ? lp.cycle_count : existing.cycle_count,
+    has('cycle_length_days') ? lp.cycle_length_days : existing.cycle_length_days,
+    has('frequency') ? lp.frequency : existing.frequency,
+    (has('processing_fee') || has('processing_fee_json')) ? lp.processing_fee_json : existing.processing_fee_json,
+    has('terms_text') ? lp.terms_text : existing.terms_text,
+    has('terms_doc_url') ? lp.terms_doc_url : existing.terms_doc_url,
+    id).run()
   await audit(c, user.id, 'update', 'financing_type', `${label} (${existing.type_key})`)
   return c.json({ ok: true })
 })

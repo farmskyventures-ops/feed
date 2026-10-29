@@ -280,3 +280,50 @@ input:-webkit-autofill:focus {
 .btn-icon-only { width: 44px; padding: 0; }
 
 [role="button"], button { touch-action: manipulation; }
+
+/* ===========================================================================
+   ASSET & MEDIA SECURITY (Part 3) — view-only protection + responsive display.
+   Product/storefront images render at their NATIVE aspect ratio (no crop/
+   truncation) and are hardened against casual download (drag, long-press,
+   context menu, selection). This is UI-level deterrence, not DRM.
+   =========================================================================== */
+.protected-media {
+  -webkit-user-select: none;
+  -moz-user-select: none;
+  -ms-user-select: none;
+  user-select: none;
+  -webkit-user-drag: none;
+  -khtml-user-drag: none;
+  -moz-user-drag: none;
+  -o-user-drag: none;
+  user-drag: none;
+  -webkit-touch-callout: none;   /* disable iOS long-press save menu */
+  pointer-events: none;          /* clicks pass to the wrapper, not the img */
+}
+/* Wrapper carries an invisible overlay so a right-click / drag lands on the
+   overlay (a transparent div) instead of the underlying <img>. */
+.media-frame {
+  position: relative;
+  display: block;
+  overflow: hidden;
+  background: #f1f5f9;           /* slate-100 placeholder while loading */
+}
+.media-frame .media-shield {
+  position: absolute;
+  inset: 0;
+  z-index: 2;
+  background: transparent;
+}
+/* Native aspect ratio: the image is contained (never cropped/stretched). */
+.media-frame img.media-contain {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;          /* show the whole image at its native ratio */
+  display: block;
+}
+/* Progressive load: fade the image in once it has decoded. */
+img.media-fade {
+  opacity: 0;
+  transition: opacity .35s ease;
+}
+img.media-fade.media-loaded { opacity: 1; }
